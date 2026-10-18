@@ -1,0 +1,21 @@
+[package]
+name = "rdm-fixture-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic local HTTP fixture server for RDM integration tests and benchmarks"
+
+[lib]
+name = "rdm_fixture_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rdm-fixture-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "rdm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RDM segmented multi-connection download engine"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true
+rand.workspace = true
+httpdate.workspace = true
+percent-encoding.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+rdm-fixture-server = { path = "../rdm-fixture-server" }

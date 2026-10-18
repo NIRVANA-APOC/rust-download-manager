@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Downloaded / test artifacts
+/downloads/
+*.part
+*.part.json
+/tmp/
+/bench-out/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local runtime state
+/run/

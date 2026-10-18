@@ -1,0 +1,13 @@
+[package]
+name = "rdm-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Local IPC protocol between the RDM GUI and the Firefox native host"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rdm-core.workspace = true

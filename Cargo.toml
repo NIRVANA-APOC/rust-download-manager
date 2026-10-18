@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rdm-core",
+    "crates/rdm-ipc",
+    "crates/rdm-cli",
+    "crates/rdm-gui",
+    "crates/rdm-native",
+    "crates/rdm-fixture-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["RDM Contributors"]
+repository = "https://github.com/rdm-download/rdm"
+
+[workspace.dependencies]
+# --- shared libraries ---
+rdm-core = { path = "crates/rdm-core" }
+rdm-ipc = { path = "crates/rdm-ipc" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "stream",
+] }
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
+rand = "0.8"
+httpdate = "1"
+percent-encoding = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+
+# --- GUI ---
+# Zed's GPU-accelerated UI framework. Default features enable Linux-only
+# backends (wayland/x11) and the Windows manifest resource; both are disabled
+# here so the crate builds on Windows with a plain GNU toolchain.
+gpui = { version = "0.2.2", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

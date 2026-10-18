@@ -1,0 +1,18 @@
+[package]
+name = "rdm-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Firefox native messaging host that hands downloads to the RDM GUI"
+
+[[bin]]
+name = "rdm-native"
+path = "src/main.rs"
+
+[dependencies]
+rdm-core.workspace = true
+rdm-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
