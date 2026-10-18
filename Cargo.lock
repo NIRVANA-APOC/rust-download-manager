@@ -3704,11 +3704,13 @@ dependencies = [
 name = "rdm-agent"
 version = "0.1.0"
 dependencies = [
+ "rand 0.8.8",
  "rdm-core",
  "rdm-ipc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "url",
 ]
 
 [[package]]
@@ -3717,12 +3719,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "rdm-agent",
  "rdm-core",
+ "rdm-fixture-server",
+ "rdm-ipc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -3802,6 +3810,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -230,6 +230,21 @@
 - 关键状态变化发 `notifications/message`（level info/warning/error），消息脱敏。
 - 所有工具调用产生审计事件（task store events + MCP 日志）。
 
+### 3.5 协议代际（legacy + modern）
+
+- **legacy（默认支持）**：MCP `2025-06-18`（兼容 `2025-03-26`/`2024-11-05`）——
+  `initialize` 握手 + `notifications/initialized` + `ping` + `logging/setLevel`；
+  `rdm-mcp` 以此为主路径，通过 QA harness。
+- **modern（已实现基础兼容层）**：MCP `2026-07-28` 的 `server/discover`
+  （`supportedVersions:["2026-07-28"]`、`resultType:"complete"`、`capabilities`、
+  `instructions`、`ttlMs`/`cacheScope`）、每请求 `_meta` 校验（缺失 → `-32602`，版本不支持 →
+  `-32022` + `data.supported`）、modern 结果 `result.resultType`、列表缓存字段；
+  modern 下 `ping`/`logging.setLevel` 返回 `-32601`。legacy 行为保持不变。
+- **P1 未做**：MRTR `input_required`（人工审批）、官方 Tasks 扩展、modern 每请求
+  logLevel opt-in、`subscriptions/listen`。在完成前对外只承诺 "legacy 全兼容 + modern
+  discover/resultType 基础兼容"。
+- 两者共享同一套 tools/resources/prompts 与 `rdm.agent/v1` 输出契约。
+
 ## 4. 策略与审批（安全边界）
 
 `%LOCALAPPDATA%\RDM\agent\policy.json`（可选；缺失时用安全默认）：
@@ -243,15 +258,24 @@
   "require_approval_over_bytes": 1073741824,
   "max_concurrent_tasks": 3,
   "default_connections": 8,
-  "allow_private_hosts": true,
+  "allow_private_hosts": false,
   "allow_overwrite": false
 }
 ```
 
 - 默认（无 policy 文件）：`allowed_hosts=["*"]`、`allowed_dirs=[用户 Downloads]`、`max_bytes_per_task=10GiB`、
-  `require_approval_over_bytes=1GiB`、`max_concurrent_tasks=3`、`allow_overwrite=false`。
+  `require_approval_over_bytes=1GiB`、`max_concurrent_tasks=3`、`default_connections=8`、
+  `allow_overwrite=false`、**`allow_private_hosts=false`**。
+- **SSRF/内网防护（默认开启）**：host 解析到私有/回环/链路本地/云 metadata（含
+  `169.254.169.254`）时拒绝，除非 `allow_private_hosts=true` 且 host 在 `allowed_hosts`；
+  probe 后对**重定向后的 final_url** 再做一次 host 校验；未知 Content-Length 时按
+  `max_bytes_per_task` 流式监控并取消（超过即 `policy_denied`）。
+- **凭据**：Cookie/Authorization 在内存与本机 task store 中可用（供续传），但任何 agent 可见
+  输出、事件 journal、日志都脱敏；secret handle（外部注入凭据、agent 不接触明文）为 P1。
 - `rdm_download` 在 probe 后判断：超审批阈值 → 返回 `needs_approval`（`details.plan` 与
   `details.approval_token`），调用 `rdm_apply_plan` 才执行；token 10 分钟过期、单次使用。
+  注意：v1 的 token 由 server 返回给调用方，因此它是**两步确认/防误触**，**不是人工审批**；
+  `approval_mode=human`（外部 CLI/GUI 签发、agent 不可自批）为 P1。
 - host/目录越界 → `policy_denied`（不可用 token 绕过，只能改 policy 文件）。
 - 目标文件已存在且 `allow_overwrite=false` → `conflict`；agent 需显式改名或请求人工处理。
 
@@ -289,6 +313,18 @@ rdm probe <url> --output json
 
 输出 `data`: `{ "tasks": [Task...], "failed": 0, "completed": 2 }`；`--wait` 时等待全部结束并附 result。
 
+### 5.1 退出码（CLI，稳定）
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 成功（含 `--wait` 下全部任务完成） |
+| `2` | 一般失败（`error.code` 见 §2.3；JSON 信封仍会输出） |
+| `3` | 控制流：被暂停 / 被取消（`paused`/`cancelled`） |
+| `4` | 未执行：策略拒绝 / 需要审批 / 目标冲突（`policy_denied`/`needs_approval`/`conflict`） |
+
+`--output json` 时无论成功失败都输出且只输出**一个**信封到 stdout（进度/诊断写 stderr）；
+`--output ndjson` 输出事件流，控制流/失败事件后进程退出码同表。
+
 ## 6. SKILL
 
 `skills/rdm/SKILL.md`（YAML frontmatter：`name: rdm`、`description`、触发条件；正文：决策树、
@@ -299,7 +335,8 @@ MCP 工具速查、CLI 配方、错误处理、策略/审批、验收清单）�
 
 | 能力 | 说明 | 状态 |
 |---|---|---|
-| 策略/审批 token | 限 host/目录/大小/并发 + plan→apply | **P0** |
+| 策略/审批 token | 限 host/目录/大小/并发 + plan→apply（token 为两步确认，非人工审批） | **P0** |
+| SSRF 防护 | 默认拒绝私有/回环/链路本地/云 metadata；重定向 final_url 复检；未知长度按预算流式取消 | **P0** |
 | 幂等键 | 重试不重复下载 | **P0** |
 | 持久 task + 事件 journal | 重启后仍可查/恢复 | **P0** |
 | 结构化错误 + retryable/hint | agent 可自动决策重试/降级 | **P0** |
@@ -312,6 +349,8 @@ MCP 工具速查、CLI 配方、错误处理、策略/审批、验收清单）�
 | 问题诊断包 `rdm report` | 一键生成脱敏诊断 zip（版本/日志/状态/环境） | P1 |
 | GUI 展示 agent 任务 | GUI 读取同一 task store | P1 |
 | HITL elicitation | MCP elicitation 弹审批 | P1 |
+| MCP 2026-07-28 dual-era | `server/discover`/per-request `_meta`/`resultType` 已实现基础兼容；MRTR/Tasks 扩展/subscriptions 未做 | **P0 部分 / P1 完整** |
+| secret handle（外部凭据） | agent 不接触 Cookie/Authorization 明文 | P1 |
 | 多源镜像/回退 | 失败块换源 | P1 |
 | 调度优先级/配额 | 多 agent 公平调度 | P1 |
 | 后处理 hooks | 解压/移动/通知 | P2 |
@@ -321,10 +360,15 @@ MCP 工具速查、CLI 配方、错误处理、策略/审批、验收清单）�
 
 1. `cargo build --workspace`、`cargo test --workspace`、`cargo fmt --check` 全绿。
 2. `rdm-mcp` 通过 MCP 协议测试：initialize / tools/list / tools/call / resources / prompts /
-   progress / cancelled / 错误码；工具 schema 可被标准 JSON Schema 校验器接受（允许子集）。
+   progress / cancelled / 错误码；工具 schema 可被标准 JSON Schema 校验器接受（允许子集）；
+   legacy 2025-06-18 与 modern 2026-07-28 的 `server/discover`/`resultType` 基础路径均通过。
 3. 通过 MCP 完成真实下载（fixture）：`rdm_selftest` → `rdm_probe` → `rdm_download` →
    `rdm_wait_task` → `rdm_verify_file`；覆盖 pause/resume/cancel、idempotency、policy 拒绝与
-   审批流程；输出无 Cookie/Authorization 泄漏。
-4. CLI `capabilities/schema/doctor/selftest/tasks/state/bench/run` 的 `--json` 输出符合 §2。
-5. `skills/rdm/SKILL.md` 能被 agent 按步骤执行（QA 以"只读 SKILL"方式跑通一次）。
-6. 独立 QA 报告：`docs/qa-report-agent.md`，含协议测试、e2e、回归 140+ 测试。
+   审批流程、SSRF 默认拒绝、未知长度预算；输出无 Cookie/Authorization 泄漏。
+4. CLI `capabilities/schema/doctor/selftest/tasks/state/bench/run` 的 `--json` 输出符合 §2；
+   退出码符合 §5.1。
+5. `skills/rdm/SKILL.md` 能被 agent 只读执行完成一次真实下载（QA 按"不读源码"方式评测）。
+6. 独立 QA 报告：`docs/qa-report-agent.md`，含协议测试、e2e、SKILL 评测、文档对照、回归
+   （既有 140 + 新增 agent 测试）。
+7. 本迭代已知残余风险（需在报告/README 明示）：引擎内部重定向无法逐跳回调校验、
+   modern MCP 仅基础兼容、跨进程 pause/cancel 仅 owner 有效、secret handle 未实现。

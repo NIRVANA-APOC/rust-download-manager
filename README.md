@@ -18,11 +18,12 @@
 - [05 · 实测数据](#05--实测数据)
 - [06 · 快速开始](#06--快速开始)
 - [07 · Firefox 集成](#07--firefox-集成)
-- [08 · 架构](#08--架构)
-- [09 · 测试与验收](#09--测试与验收)
-- [10 · 目录结构](#10--目录结构)
-- [11 · 已知限制与路线图](#11--已知限制与路线图)
-- [12 · 命名说明](#12--命名说明)
+- [08 · Agent 集成（MCP / CLI / SKILL）](#08--agent-集成mcp--cli--skill)
+- [09 · 架构](#09--架构)
+- [10 · 测试与验收](#10--测试与验收)
+- [11 · 目录结构](#11--目录结构)
+- [12 · 已知限制与路线图](#12--已知限制与路线图)
+- [13 · 命名说明](#13--命名说明)
 
 ## 01 · 这是什么
 
@@ -169,7 +170,69 @@ powershell -ExecutionPolicy Bypass -File scripts/install-firefox-host.ps1
 - 失败回退浏览器原生下载并防循环；右键菜单可手动「使用 RDM 下载」。
 - 上架 AMO 前需处理签名、`data_collection_permissions` 与开发文件排除（见扩展 README）。
 
-## 08 · 架构
+## 08 · Agent 集成（MCP / CLI / SKILL）
+
+RDM 不只是"给人用的下载器"：agent 可以通过三条稳定通道驱动它，而不必读源码猜参数。
+完整契约（工具 schema / 错误码 / 任务模型 / 策略）见
+[docs/agent-integration.md](docs/agent-integration.md)。
+
+**① MCP server（stdio，推荐）**
+
+```jsonc
+// mcp.json（DSH / Claude Code / Codex 等支持 stdio MCP 的运行时）
+{
+  "mcpServers": {
+    "rdm": {
+      "command": "C:\\Users\\you\\Documents\\RDM\\target\\debug\\rdm-mcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+16 个工具：`rdm_capabilities`、`rdm_probe`、`rdm_download`、`rdm_plan_download`、
+`rdm_apply_plan`、`rdm_list_tasks`、`rdm_get_task`、`rdm_wait_task`、`rdm_pause_task`、
+`rdm_resume_task`、`rdm_cancel_task`、`rdm_verify_file`、`rdm_doctor`、`rdm_selftest`、
+`rdm_bench`、`rdm_state_maintenance`；另有 resources（`rdm://capabilities`、`rdm://policy`、
+`rdm://schema`、`rdm://tasks`）与 prompts（`download`/`batch_download`/`diagnose_failure`）。
+支持 progress 通知、取消等待、结构化错误（`error.code` + `retryable` + `hint`）。
+
+**② CLI（任何能执行子进程的 agent）**
+
+```powershell
+rdm capabilities --output json          # 能力/限制/工具清单，自描述
+rdm probe https://example.com/f.iso --output json
+rdm download https://example.com/f.iso -d C:\Downloads --output json
+rdm run --input tasks.json --wait --output json
+rdm tasks --output json; rdm task <id> --events 50 --output json
+rdm doctor --url https://example.com/f.iso --output json
+rdm selftest --output json
+```
+
+- 所有命令共享一个 JSON 信封（`schema_version=rdm.agent/v1`、`ok`、`error.code`、`meta`）。
+- `--output ndjson` 输出带 `seq`/`ts` 的事件流（probe/progress/retry/completed/failed）。
+- 退出码：0 成功、2 失败、3 paused/cancelled、4 policy/approval/conflict。
+- 协议版本：legacy `2025-06-18`（兼容 2024-11-05/2025-03-26）完整支持；modern
+  `2026-07-28` 的 `server/discover`/每请求 `_meta`/`resultType` 基础兼容（MRTR/Tasks 扩展为 P1）。
+
+**③ SKILL**：[skills/rdm/SKILL.md](skills/rdm/SKILL.md)（决策树 + 工具速查 + 配方 + 错误处理），
+配合 [skills/rdm/reference.md](skills/rdm/reference.md) 与 [llms.txt](llms.txt)，
+agent 不读源码即可完成 90% 下载任务。
+
+**安全与可维护（agent 必需）**
+
+- **策略文件** `%LOCALAPPDATA%\RDM\agent\policy.json`：限制 host/目录/单任务字节/并发；
+  默认禁止私有地址与云 metadata（SSRF 防护），重定向后二次校验；未知长度也强制预算。
+- **审批**：超过阈值返回 `needs_approval` + plan，需 `rdm_apply_plan` 两步确认；
+  v1 token 为防误触，非人工审批（human-in-the-loop 为 P1）。
+- **幂等**：`idempotency_key` 重复调用返回同一 task；任务持久化在
+  `%LOCALAPPDATA%\RDM\agent`（每任务独立文件，CLI/MCP 可共存）。
+- **脱敏**：Cookie/Authorization 永不出现在 agent 可见输出、事件 journal 与日志中。
+- **自检/维护**：`rdm selftest`（引擎 readiness）、`rdm doctor`（环境/网络/策略/状态）、
+  `rdm bench`、`rdm state inspect|repair`（孤儿 `.part`、损坏状态；默认 dry-run）。
+- **可发现性**：`AGENTS.md`、`llms.txt`、`rdm schema --output json`。
+
+## 09 · 架构
 
 ```
 Firefox MV3 ──native messaging──► rdm-native ──JSONL+token──► rdm-gui (GPUI)
@@ -197,11 +260,12 @@ Firefox MV3 ──native messaging──► rdm-native ──JSONL+token──�
 完整契约见 [docs/architecture.md](docs/architecture.md)，浏览器协议见
 [docs/extension-protocol.md](docs/extension-protocol.md)。
 
-## 09 · 测试与验收
+## 10 · 测试与验收
 
 ```powershell
 cargo test -p rdm-core          # 18 单元 + 12 集成（fixture 故障矩阵）
 cargo test -p rdm-ipc -p rdm-native -p rdm-gui
+cargo test -p rdm-agent -p rdm-mcp -p rdm-cli   # agent 契约 / MCP / CLI
 node --test "extension/firefox/test/*.test.js"     # 20 项 JS 测试
 npx web-ext lint --source-dir extension/firefox
 ```
@@ -213,26 +277,39 @@ npx web-ext lint --source-dir extension/firefox
   pause/resume/cancel、单实例 URL 投递、截图证据。
 - 浏览器侧：53+5 项 Rust 测试、20 项 JS 测试、`web-ext lint` 0 errors / 0 warnings；
   native host → 真实 GUI 端到端 PASS（自动拉起 542ms、8MiB 下载、SHA-256 一致、日志脱敏）。
+- **Agent 接口**：`rdm-agent` 28 + `rdm-cli` 29+21 + `rdm-mcp` 34+3 项测试；MCP stdio
+  e2e 164 assertions / 0 failures（initialize/16 tools/下载/wait/verify/进度/取消/pause/resume/
+  审批/冲突/脱敏/dual-era/EOF）；QA 独立 conformance harness（`scripts/mcp_e2e.mjs`）。
+- 本机全量 `cargo test --workspace`：**255 passed / 0 failed**；`cargo fmt --check` 0 diff；
+  `rdm-agent/rdm-mcp/rdm-cli` clippy 0 warning。
 - 独立验收（commit b8dfc88）：**140/140 测试通过**，`cargo fmt --check` 0 diff，
   clippy 0 error/0 warning；引擎 release 行为 7/7、GUI e2e 22/22。详见
-  [docs/qa-report.md](docs/qa-report.md)。
-- 独立验收报告：[docs/qa-report.md](docs/qa-report.md)（QA 独立构建/基准/e2e/文档审计）。
+  [docs/qa-report.md](docs/qa-report.md)；agent 接口验收见 `docs/qa-report-agent.md`（单独 QA）。
 
-## 10 · 目录结构
+## 11 · 目录结构
 
 ```
 crates/rdm-core            下载引擎（库，唯一状态机）
-crates/rdm-cli             `rdm` 命令行（JSONL 事件/退出码）
+crates/rdm-agent           agent 共享契约（TaskStore/错误码/Policy/工具 schema）
+crates/rdm-mcp             MCP stdio server（16 工具 + resources + prompts，legacy/modern）
+crates/rdm-cli             `rdm` 命令行（agent 子命令/JSON 信封/退出码）
 crates/rdm-gui             GPUI 桌面端（同时是 IPC server）
 crates/rdm-ipc             GUI ↔ native host 本地协议
 crates/rdm-native          Firefox native messaging host
 crates/rdm-fixture-server  可控 HTTP fixture（测试/基准）
 extension/firefox          Firefox MV3 扩展
-docs/                      架构、协议、调研、验收、证据截图
-scripts/                   安装、基准、截图
+skills/rdm/                agent SKILL（决策树/工具速查/配方）
+docs/                      架构、协议、agent 契约、调研、验收、证据截图
+scripts/                   安装、基准、截图、MCP conformance harness
+AGENTS.md / llms.txt       给 coding agent 的仓库导航 / 机器可读索引
 ```
 
-## 11 · 已知限制与路线图
+**Agent 相关文档**：[agent-integration.md](docs/agent-integration.md)（契约）、
+[agent-cli-reference.md](docs/agent-cli-reference.md)、[agent-mcp-reference.md](docs/agent-mcp-reference.md)、
+[docs/research/agent-tool-design.md](docs/research/agent-tool-design.md)（MCP/工具设计调研）、
+[docs/research/mcp-dual-era-notes.md](docs/research/mcp-dual-era-notes.md)（MCP 2026-07-28 双代际）。
+
+## 12 · 已知限制与路线图
 
 - 仅 HTTP(S) 分段下载；BT、视频站点解析、HLS/DASH 不在核心范围（插件层规划）。
 - 服务器忽略 Range 时无法加速（协议硬限制，UI 会标记）；无 ETag/Last-Modified 时只能靠长度校验。
@@ -242,7 +319,7 @@ scripts/                   安装、基准、截图
   GPUI 着色器源。
 - 路线图：release 打包/签名、macOS/Linux 验证、多源镜像、调度队列、AMO 上架。
 
-## 12 · 命名说明
+## 13 · 命名说明
 
 RDM = **R**ust **D**ownload **M**anager。GitHub 上存在同名的 `rdm-dl/rdm` 等项目，"RDM"
 缩写也被 Remote Desktop Manager / Redis Desktop Manager 占用；本项目与其无关，对外请使用

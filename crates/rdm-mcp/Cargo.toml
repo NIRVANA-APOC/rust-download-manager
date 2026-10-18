@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 description = "MCP (Model Context Protocol) stdio server exposing RDM download capabilities to agents"
 
+[lib]
+name = "rdm_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rdm-mcp"
 path = "src/main.rs"
@@ -24,3 +28,4 @@ tracing-subscriber.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
+url.workspace = true

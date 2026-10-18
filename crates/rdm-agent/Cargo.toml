@@ -12,3 +12,5 @@ rdm-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+rand.workspace = true
+url.workspace = true
