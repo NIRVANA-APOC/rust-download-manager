@@ -16,3 +16,7 @@ rdm-ipc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+url.workspace = true
+
+# Integration test `tests/native_smoke.rs` drives the real binary over piped
+# stdio against an in-test mock IPC server; no extra dev-dependencies needed.

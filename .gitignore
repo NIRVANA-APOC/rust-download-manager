@@ -1,5 +1,10 @@
 # Rust build artifacts
 /target/
+/target-core/
+/target-native/
+/target-bench/
+/target-qa/
+/target-gui/
 **/*.rs.bk
 *.pdb
 

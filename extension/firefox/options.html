@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RDM 下载接管 — 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-head">
+        <img class="logo" src="icons/rdm-48.png" alt="RDM" width="48" height="48" />
+        <div>
+          <h1>RDM 下载接管 — 设置</h1>
+          <p class="subtle">
+            设置保存在本机 Firefox 中；转交下载时通过原生消息发送给 RDM。
+            <span id="version"></span>
+          </p>
+        </div>
+      </header>
+
+      <form id="settings-form" class="grid" autocomplete="off">
+        <section class="card">
+          <h2>基础</h2>
+          <label class="row">
+            <span class="label">启用下载接管</span>
+            <input id="enabled" type="checkbox" class="checkbox" />
+            <span class="hint">关闭后 Firefox 下载完全保持原生行为。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">自动启动 RDM GUI</span>
+            <input id="auto-start-gui" type="checkbox" class="checkbox" />
+            <span class="hint">转交时若 RDM 未运行，允许原生宿主启动 <code>rdm-gui.exe</code>。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">右键菜单「使用 RDM 下载」</span>
+            <input id="context-menu" type="checkbox" class="checkbox" />
+            <span class="hint">在链接 / 图片 / 音视频 / 选中文本的右键菜单中显示。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">转发 Cookie</span>
+            <input id="forward-cookies" type="checkbox" class="checkbox" />
+            <span class="hint">
+              需要登录态的下载（网盘、论坛附件等）通常必须开启。Cookie 只在浏览器 →
+              原生宿主 → RDM 进程内存中传递，不会写入日志。
+            </span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>过滤</h2>
+          <label class="row">
+            <span class="label">最小文件大小</span>
+            <input id="min-size-mb" type="number" min="0" step="0.1" placeholder="0（不限制）" />
+            <span class="hint">单位 MiB。小于该值的下载不接管，避免抢走小文件。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">仅接管扩展名</span>
+            <input id="allow-extensions" type="text" placeholder="iso, zip, 7z（留空表示全部）" />
+            <span class="hint">逗号 / 空格分隔，不带点。非空时只接管列表内的扩展名。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">永不接管扩展名</span>
+            <input id="block-extensions" type="text" placeholder="例如 htm, html" />
+            <span class="hint">优先级高于「仅接管扩展名」。对无扩展名或未知类型不生效。</span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>RDM 下载参数</h2>
+          <label class="row">
+            <span class="label">默认连接数</span>
+            <input id="connections" type="number" min="1" max="32" step="1" />
+            <span class="hint">1–32。服务器不支持 Range 时 RDM 会自动降级为单连接。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">保存目录</span>
+            <input id="output-dir" type="text" placeholder="留空使用 RDM 默认目录；或填绝对路径，如 D:\Downloads" />
+            <span class="hint">必须是绝对路径；相对路径会被忽略。</span>
+          </label>
+
+          <label class="row">
+            <span class="label">限速</span>
+            <input id="speed-limit" type="number" min="0" step="1" placeholder="0（不限速）" />
+            <span class="hint">单位 KiB/s，0 表示不限速。由 RDM 全局令牌桶执行。</span>
+          </label>
+        </section>
+
+        <div class="actions">
+          <button id="save" type="submit" class="btn primary">保存设置</button>
+          <button id="reset" type="button" class="btn">恢复默认</button>
+          <button id="test" type="button" class="btn">测试连接</button>
+          <span id="toast" class="toast" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+
+      <section class="card note">
+        <h2>关于原生宿主</h2>
+        <p>
+          扩展依赖原生消息宿主 <code>com.rdm.download</code>。首次使用请先构建 RDM 并运行
+          <code>scripts/install-firefox-host.ps1</code>，然后在
+          <code>about:debugging → 此 Firefox → 临时载入附加组件</code> 中加载本扩展。
+          安装完成建议重启 Firefox，让原生宿主注册表项生效。
+        </p>
+        <p>
+          权限说明：<code>downloads</code>（取消/清理被接管的下载）、<code>webRequest</code>
+          （只读观察请求/响应头，MV3 下无法阻塞请求）、<code>cookies</code>（透传登录态）、
+          <code>nativeMessaging</code>（与本机 RDM 通信）、<code>storage</code>（保存设置与最近记录）、
+          <code>contextMenus</code> / <code>alarms</code>（右键菜单与状态轮询）。
+        </p>
+        <p class="subtle">
+          已知限制：极小的文件可能在 <code>downloads.onCreated</code> 之前就已完成，此时扩展会删除
+          浏览器下载文件并改由 RDM 重新下载；被接管的下载在 RDM 中不会显示 Firefox 的来源标签。
+        </p>
+        <p id="debug-line" class="subtle"></p>
+      </section>
+    </main>
+
+    <script src="lib/pure.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

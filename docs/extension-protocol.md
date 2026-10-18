@@ -45,10 +45,11 @@
 // 结果
 {"type":"pong","id":1,"version":"0.1.0","gui_running":true,"protocol":1}
 
-// 转交下载
+// 转交下载（launch_gui 可选，默认 true：扩展设置里的"自动启动 GUI"）
 {
   "type":"enqueue",
   "id":2,
+  "launch_gui":true,
   "request":{
     "url":"https://example.com/big.iso",
     "file_name":"big.iso",
@@ -80,6 +81,24 @@
 3. 任何异常都回结构化 `error`，绝不静默退出（否则 Firefox 侧只看到断开）。
 
 spool 目录：`%LOCALAPPDATA%\RDM\queue\*.json`；GUI 启动时扫描并自动加入队列。
+
+spool 文件内容 = `rdm_ipc::EnqueueItem` 的 JSON 原样（**不包装**）：
+
+```json
+{
+  "download": { /* rdm_core::DownloadRequest */ },
+  "source": "firefox",
+  "source_page": "https://example.com/page"
+}
+```
+
+文件名：`{unix_ms}-{pid}-{seq}.json`；GUI 成功入队后删除文件，反序列化失败则移动到
+`queue/rejected/` 并记录日志。未知字段一律忽略。
+
+### 1.4 消息 id 与错误码
+
+- `id` 可缺省（后台主动 ping 等）；缺省时宿主响应 `id` 为 `0`。
+- 错误码只用 §5 的 5 个值；`launch_gui=false` 时 GUI 不存在返回 `gui_unavailable`（不启动）。
 
 ## 2. 宿主 ↔ GUI IPC（本机 TCP JSONL）
 

@@ -46,9 +46,11 @@ clap = { version = "4", features = ["derive"] }
 
 # --- GUI ---
 # Zed's GPU-accelerated UI framework. Default features enable Linux-only
-# backends (wayland/x11) and the Windows manifest resource; both are disabled
-# here so the crate builds on Windows with a plain GNU toolchain.
-gpui = { version = "0.2.2", default-features = false }
+# backends (wayland/x11) and the Windows manifest resource; the Linux backends
+# are disabled here. `windows-manifest` is kept because without it the Win32
+# loader binds comctl32 v5 and GPUI's TaskDialogIndirect import fails with
+# STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) at startup.
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
 
 [profile.release]
 lto = "thin"

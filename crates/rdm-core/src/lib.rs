@@ -20,6 +20,15 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub mod error;
 
+mod client;
+mod event;
+mod filename;
+mod plan;
+mod probe;
+mod rate;
+mod state;
+mod transfer;
+
 pub use error::DownloadError;
 
 /// Connections used when the caller does not specify a value.
@@ -123,6 +132,9 @@ pub struct RemoteMeta {
     /// Validator used to detect a changed file before resuming.
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// HTTP protocol actually used for the probe (`HTTP/1.1`, `HTTP/2.0`).
+    #[serde(default)]
+    pub http_version: Option<String>,
 }
 
 /// Progress / lifecycle events emitted to the UI layer.
@@ -172,6 +184,10 @@ pub struct DownloadSummary {
     pub sha256: Option<String>,
     pub resumed_chunks: u64,
     pub range_supported: bool,
+    /// HTTP protocol used by the transfer (`HTTP/1.1` for chunked mode —
+    /// forced so N range requests really use N TCP connections).
+    #[serde(default)]
+    pub http_version: Option<String>,
 }
 
 /// Controls a running download from another task (UI thread, signal handler…).
@@ -213,10 +229,8 @@ impl DownloadHandle {
 
 /// Inspect a remote resource without downloading it.
 pub async fn probe(request: &DownloadRequest) -> Result<RemoteMeta, DownloadError> {
-    let _ = request;
-    Err(DownloadError::Unsupported(
-        "download engine not implemented yet".into(),
-    ))
+    let client = client::build(request)?;
+    probe::probe_with(&client, request).await
 }
 
 /// Download a file with multiple connections.
@@ -237,8 +251,6 @@ pub async fn download_with_handle(
     events: Option<UnboundedSender<DownloadEvent>>,
     handle: DownloadHandle,
 ) -> Result<DownloadSummary, DownloadError> {
-    let _ = (request, events, handle);
-    Err(DownloadError::Unsupported(
-        "download engine not implemented yet".into(),
-    ))
+    let normalized = request.normalized();
+    transfer::run(normalized, event::EventSink::new(events), handle).await
 }

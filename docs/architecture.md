@@ -111,8 +111,10 @@ pub async fn download_with_handle(DownloadRequest, Option<UnboundedSender<Downlo
 
 ### 3.5 并发、限速与进度
 
-- 共享一个 `reqwest::Client`：连接池、HTTP/2 多路复用（服务器支持 h2 时 N 个 Range
-  流复用同一 TCP 连接，仍能并发）、超时（连接 15s，读 60s）。
+- 共享一个 `reqwest::Client`：连接池、超时（连接 15s，读 60s）。
+- **分段模式强制 HTTP/1.1**：HTTP/2 下 N 个 Range 流复用同一条 TCP 连接、共享同一拥塞窗口，
+  多连接吞吐增益≈0（会退化成"假多线程"）。因此分块传输统一使用 HTTP/1.1（每 worker 一条连接）；
+  单连接/降级模式可以使用 HTTP/2。`DownloadSummary` 中记录实际使用的协议版本，benchmark 做 h1/h2 对照。
 - 限速：全局令牌桶（`speed_limit_bps`），worker 在写盘前按字节数 `acquire`，
   多连接共享同一预算（不是每连接限速）。
 - 进度：原子计数（下载字节、活跃 worker、完成块）；单独 reporter 任务每 250ms

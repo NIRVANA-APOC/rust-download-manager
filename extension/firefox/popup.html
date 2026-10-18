@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RDM 下载接管</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="top">
+      <img class="logo" src="icons/rdm-32.png" alt="RDM" width="32" height="32" />
+      <div class="titles">
+        <h1>RDM 下载接管</h1>
+        <p id="version" class="subtle">加载中…</p>
+      </div>
+      <label class="switch" title="开启 / 关闭下载接管">
+        <input id="enabled" type="checkbox" />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="card">
+      <div class="status-line">
+        <span id="host-dot" class="dot unknown"></span>
+        <span id="host-text">原生宿主：检测中…</span>
+      </div>
+      <div class="status-line">
+        <span id="gui-dot" class="dot unknown"></span>
+        <span id="gui-text">RDM GUI：检测中…</span>
+      </div>
+      <p id="detail" class="detail"></p>
+      <div class="actions">
+        <button id="refresh" class="btn" type="button">重新检测</button>
+        <button id="options" class="btn" type="button">设置</button>
+      </div>
+    </section>
+
+    <section class="recent">
+      <div class="section-head">
+        <h2>最近转交</h2>
+        <button id="clear" class="link" type="button">清空</button>
+      </div>
+      <ul id="recent-list" class="list">
+        <li class="empty">暂无记录</li>
+      </ul>
+    </section>
+
+    <footer class="foot">
+      RDM · 多线程下载器 · 宿主 <span id="host-name">com.rdm.download</span>
+    </footer>
+
+    <script src="lib/pure.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
