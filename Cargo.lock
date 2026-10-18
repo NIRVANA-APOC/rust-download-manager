@@ -3701,6 +3701,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdm-agent"
+version = "0.1.0"
+dependencies = [
+ "rdm-core",
+ "rdm-ipc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rdm-cli"
 version = "0.1.0"
 dependencies = [
@@ -3772,6 +3783,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rdm-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "rand 0.8.8",
+ "rdm-agent",
+ "rdm-core",
+ "rdm-fixture-server",
+ "rdm-ipc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

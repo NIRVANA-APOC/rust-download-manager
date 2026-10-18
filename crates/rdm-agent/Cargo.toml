@@ -1,0 +1,14 @@
+[package]
+name = "rdm-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared agent-facing contracts for RDM: task store, errors, policy, tool schemas"
+
+[dependencies]
+rdm-core.workspace = true
+rdm-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
