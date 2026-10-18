@@ -59,7 +59,9 @@ pub fn run<R: Read, W: Write>(
                     logger.info("native messaging channel closed; exiting");
                     return Ok(());
                 }
-                logger.error(&format!("fatal error reading native messaging channel: {err}"));
+                logger.error(&format!(
+                    "fatal error reading native messaging channel: {err}"
+                ));
                 return Err(FrameError::Io(err));
             }
             Err(FrameError::TooLarge(len)) => {
@@ -86,11 +88,7 @@ fn handle_message(frame: &[u8], logger: &Logger, state_dir: &Path) -> Outgoing {
         Ok(value) => value,
         Err(err) => {
             logger.warn(&format!("invalid JSON from extension: {err}"));
-            return Outgoing::error(
-                0,
-                codes::INVALID_REQUEST,
-                format!("invalid JSON: {err}"),
-            );
+            return Outgoing::error(0, codes::INVALID_REQUEST, format!("invalid JSON: {err}"));
         }
     };
     let fallback_id = protocol::extract_id(&parsed);
@@ -113,7 +111,7 @@ fn handle_message(frame: &[u8], logger: &Logger, state_dir: &Path) -> Outgoing {
             launch_gui,
         } => handle_enqueue(
             id.unwrap_or(fallback_id),
-            request,
+            *request,
             launch_gui,
             logger,
             state_dir,
@@ -210,9 +208,13 @@ fn spool_and_reply(
     state_dir: &Path,
 ) -> Outgoing {
     match spool::spool_item(state_dir, item) {
-        Ok(path) => {
-            logger.info(&format!("spooled handoff to {}", path.display()));
-            Outgoing::queued(id, reason, &path)
+        Ok(spooled) => {
+            logger.info(&format!(
+                "spooled handoff to {} (credentials_stripped={})",
+                spooled.path.display(),
+                spooled.credentials_stripped
+            ));
+            Outgoing::queued(id, reason, &spooled.path, spooled.credentials_stripped)
         }
         Err(err) => {
             logger.error(&format!("failed to spool handoff: {err}"));

@@ -63,7 +63,7 @@ pub enum Incoming {
     Enqueue {
         #[serde(default)]
         id: Option<u64>,
-        request: ExtensionRequest,
+        request: Box<ExtensionRequest>,
         /// Extension option "自动启动 GUI"; default matches the documented
         /// host behaviour (try to launch RDM when it is not running).
         #[serde(default = "default_true")]
@@ -130,6 +130,9 @@ pub enum Outgoing {
         id: u64,
         reason: String,
         spool: String,
+        /// True when cookie/authorization material was removed before the
+        /// handoff was written to disk (privacy decision, see `spool` module).
+        credentials_stripped: bool,
     },
     Error {
         id: u64,
@@ -156,11 +159,17 @@ impl Outgoing {
         }
     }
 
-    pub fn queued(id: u64, reason: &str, spool_path: &std::path::Path) -> Self {
+    pub fn queued(
+        id: u64,
+        reason: &str,
+        spool_path: &std::path::Path,
+        credentials_stripped: bool,
+    ) -> Self {
         Outgoing::Queued {
             id,
             reason: reason.to_string(),
             spool: spool_path.display().to_string(),
+            credentials_stripped,
         }
     }
 
@@ -424,7 +433,9 @@ fn sanitize_headers(
     if dropped > 0 {
         // Log names never appear (they can be arbitrary page input); the count
         // is enough for diagnostics.
-        logger.warn(&format!("dropped {dropped} header(s) not on the allow-list"));
+        logger.warn(&format!(
+            "dropped {dropped} header(s) not on the allow-list"
+        ));
     }
     out
 }
@@ -489,8 +500,9 @@ mod tests {
 
     #[test]
     fn parses_minimal_enqueue_with_launch_gui_default() {
-        let msg = parse(r#"{"type":"enqueue","id":2,"request":{"url":"https://example.com/a.bin"}}"#)
-            .unwrap();
+        let msg =
+            parse(r#"{"type":"enqueue","id":2,"request":{"url":"https://example.com/a.bin"}}"#)
+                .unwrap();
         match msg {
             Incoming::Enqueue {
                 id,
@@ -564,7 +576,10 @@ mod tests {
         )
         .unwrap();
         let item = request.validate(&logger).unwrap();
-        assert_eq!(item.download.url, "https://example.com/big.iso?token=secret");
+        assert_eq!(
+            item.download.url,
+            "https://example.com/big.iso?token=secret"
+        );
         assert_eq!(item.download.file_name.as_deref(), Some("renamed.iso"));
         assert_eq!(
             item.download.output_dir.as_deref(),
@@ -585,7 +600,10 @@ mod tests {
             item.download.referer.as_deref(),
             Some("https://example.com/page")
         );
-        assert_eq!(item.download.user_agent.as_deref(), Some("Mozilla/5.0 test"));
+        assert_eq!(
+            item.download.user_agent.as_deref(),
+            Some("Mozilla/5.0 test")
+        );
         assert_eq!(item.download.speed_limit_bps, Some(1_048_576));
         assert_eq!(item.source, "firefox");
         assert_eq!(
@@ -593,7 +611,10 @@ mod tests {
             Some("https://example.com/page")
         );
         assert!(item.download.resume, "resume defaults to true");
-        assert!(!item.download.insecure, "browser handoffs cannot disable TLS checks");
+        assert!(
+            !item.download.insecure,
+            "browser handoffs cannot disable TLS checks"
+        );
         // Privacy check: the log must not contain the cookie or the URL query.
         let log = std::fs::read_to_string(logger.path()).unwrap();
         assert!(!log.contains("a=1; b=2"));
@@ -604,7 +625,11 @@ mod tests {
     #[test]
     fn validate_rejects_non_http_urls() {
         let (logger, dir) = test_logger();
-        for url in ["file:///C:/Windows/win.ini", "data:text/plain,x", "nonsense"] {
+        for url in [
+            "file:///C:/Windows/win.ini",
+            "data:text/plain,x",
+            "nonsense",
+        ] {
             let request: ExtensionRequest =
                 serde_json::from_str(&format!(r#"{{"url":"{url}"}}"#)).unwrap();
             assert!(request.validate(&logger).is_err(), "{url} must be rejected");
@@ -693,13 +718,25 @@ mod tests {
         assert_eq!(json["download_id"], "dl_01");
         assert_eq!(json["gui_running"], true);
 
-        let queued = Outgoing::queued(3, codes::GUI_UNAVAILABLE, Path::new(r"C:\tmp\1.json"));
+        let queued = Outgoing::queued(3, codes::GUI_UNAVAILABLE, Path::new(r"C:\tmp\1.json"), true);
         let json: serde_json::Value = serde_json::from_slice(&queued.to_json()).unwrap();
         assert_eq!(json["type"], "queued");
         assert_eq!(json["reason"], "gui_unavailable");
         assert_eq!(json["spool"], r"C:\tmp\1.json");
+        assert_eq!(
+            json["credentials_stripped"], true,
+            "queued responses must tell the extension that credentials were not persisted"
+        );
+        let clean = Outgoing::queued(
+            4,
+            codes::GUI_UNAVAILABLE,
+            Path::new(r"C:\tmp\2.json"),
+            false,
+        );
+        let clean_json: serde_json::Value = serde_json::from_slice(&clean.to_json()).unwrap();
+        assert_eq!(clean_json["credentials_stripped"], false);
 
-        let error = Outgoing::error(4, codes::INVALID_REQUEST, "bad");
+        let error = Outgoing::error(5, codes::INVALID_REQUEST, "bad");
         let json: serde_json::Value = serde_json::from_slice(&error.to_json()).unwrap();
         assert_eq!(json["type"], "error");
         assert_eq!(json["code"], "invalid_request");

@@ -99,9 +99,37 @@ pub fn gui_candidates(
     deduped
 }
 
+/// Production readiness probe: is a GUI answering IPC right now?
+///
+/// This is the **only** function in this module that reads the global
+/// `%LOCALAPPDATA%\RDM\ipc.json` (via `rdm-ipc`). Everything else takes
+/// injected parameters, so unit tests never depend on whether the developer
+/// happens to have a real RDM GUI running.
+pub fn gui_alive() -> bool {
+    // Cheap liveness first (300 ms connect) so a stale endpoint cannot eat the
+    // whole 8 s budget in a single 5 s IPC read timeout.
+    rdm_ipc::is_gui_alive() && ipc_client::ping().is_ok()
+}
+
 /// Ensure a GUI is reachable, optionally launching one.
+///
+/// `state_dir` is only used to locate `rdm-gui.exe` (same directory / parent /
+/// state dir) and to log; readiness itself is checked through [`gui_alive`].
 pub fn ensure_gui(launch: bool, logger: &Logger, state_dir: &Path) -> GuiStatus {
-    if ipc_client::ping().is_ok() {
+    ensure_gui_with(launch, logger, state_dir, &gui_alive)
+}
+
+/// Testable core of [`ensure_gui`] with an injectable readiness probe.
+///
+/// Tests pass `|| true` / `|| false` and a tempdir `state_dir`, so they never
+/// read the real state directory and never spawn a real GUI.
+fn ensure_gui_with(
+    launch: bool,
+    logger: &Logger,
+    state_dir: &Path,
+    probe: &dyn Fn() -> bool,
+) -> GuiStatus {
+    if probe() {
         return GuiStatus::available(false);
     }
     if !launch {
@@ -124,13 +152,10 @@ pub fn ensure_gui(launch: bool, logger: &Logger, state_dir: &Path) -> GuiStatus 
         return GuiStatus::unavailable("gui_binary_not_found");
     };
 
-    let mut child = match spawn_gui(path) {
+    let child = match spawn_gui(path) {
         Ok(child) => child,
         Err(err) => {
-            logger.error(&format!(
-                "failed to launch GUI {}: {err}",
-                path.display()
-            ));
+            logger.error(&format!("failed to launch GUI {}: {err}", path.display()));
             return GuiStatus::unavailable("gui_spawn_failed");
         }
     };
@@ -141,7 +166,7 @@ pub fn ensure_gui(launch: bool, logger: &Logger, state_dir: &Path) -> GuiStatus 
     ));
 
     let mut child_slot = Some(child);
-    if wait_until_ready(&mut child_slot, GUI_START_TIMEOUT) {
+    if wait_until_ready_with(probe, &mut child_slot, GUI_START_TIMEOUT) {
         // Drop the handle without waiting: the GUI must keep running. With
         // CREATE_BREAKAWAY_FROM_JOB it survives Firefox killing our job.
         if let Some(child) = child_slot {
@@ -166,14 +191,16 @@ pub fn ensure_gui(launch: bool, logger: &Logger, state_dir: &Path) -> GuiStatus 
     GuiStatus::unavailable("gui_start_timeout")
 }
 
-/// Poll the IPC endpoint until the GUI answers a `ping`, the child exits, or
-/// the deadline expires.
-fn wait_until_ready(child: &mut Option<Child>, timeout: Duration) -> bool {
+/// Poll the IPC endpoint until `probe` reports ready, the child exits, or the
+/// deadline expires. Callers that don't need injection use [`gui_alive`].
+fn wait_until_ready_with(
+    mut probe: impl FnMut() -> bool,
+    child: &mut Option<Child>,
+    timeout: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        // Cheap liveness first (300 ms connect) so a stale endpoint cannot eat
-        // the whole 8 s budget in a single 5 s IPC read timeout.
-        if rdm_ipc::is_gui_alive() && ipc_client::ping().is_ok() {
+        if probe() {
             return true;
         }
         if let Some(child) = child.as_mut() {
@@ -284,7 +311,9 @@ mod tests {
     #[test]
     fn wait_until_ready_gives_up_when_child_exits() {
         // `cmd /C exit` terminates immediately; the helper must notice the
-        // exit instead of sleeping for the full timeout.
+        // exit instead of sleeping for the full timeout. The injectable probe
+        // keeps this test independent of whether a real GUI happens to run on
+        // the developer machine.
         let child = Command::new("cmd")
             .args(["/C", "exit", "0"])
             .stdout(Stdio::null())
@@ -293,10 +322,74 @@ mod tests {
             .expect("spawn cmd");
         let mut slot = Some(child);
         let started = Instant::now();
-        assert!(!wait_until_ready(&mut slot, Duration::from_secs(5)));
+        assert!(!wait_until_ready_with(
+            || false,
+            &mut slot,
+            Duration::from_secs(5)
+        ));
         assert!(started.elapsed() < Duration::from_secs(2));
         if let Some(mut child) = slot {
             let _ = child.wait();
         }
+    }
+
+    #[test]
+    fn wait_until_ready_returns_true_as_soon_as_probe_succeeds() {
+        let started = Instant::now();
+        assert!(wait_until_ready_with(
+            || true,
+            &mut None,
+            Duration::from_secs(5)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // -- isolation tests ---------------------------------------------------
+    //
+    // These use `ensure_gui_with` with an injected probe and a tempdir state
+    // directory, so they never read the real `%LOCALAPPDATA%\RDM\ipc.json` and
+    // stay green even while a real RDM GUI is running on the machine.
+
+    fn test_logger(tag: &str) -> (crate::logger::Logger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rdm-native-gui-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        (crate::logger::Logger::new(&dir), dir)
+    }
+
+    #[test]
+    fn ensure_gui_returns_early_when_probe_reports_alive() {
+        let (logger, dir) = test_logger("alive");
+        let status = ensure_gui_with(true, &logger, &dir, &|| true);
+        assert!(status.running);
+        assert!(
+            !status.launched,
+            "an already-running GUI must not be launched again"
+        );
+        assert!(status.reason.is_none());
+        let log = std::fs::read_to_string(logger.path()).unwrap_or_default();
+        assert!(
+            !log.contains("spawned RDM GUI"),
+            "no GUI process may be spawned when the probe says it is alive: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_gui_does_not_launch_when_launch_gui_is_false() {
+        let (logger, dir) = test_logger("no-launch");
+        let status = ensure_gui_with(false, &logger, &dir, &|| false);
+        assert!(!status.running);
+        assert!(!status.launched);
+        assert_eq!(status.reason.as_deref(), Some("gui_not_running"));
+        let log = std::fs::read_to_string(logger.path()).unwrap_or_default();
+        assert!(
+            !log.contains("spawned RDM GUI"),
+            "launch_gui=false must never spawn a GUI: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

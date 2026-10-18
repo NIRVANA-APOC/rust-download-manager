@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, ElementId, Entity, Focusable, Font,
-    FontFallbacks, Hsla, IntoElement, Render, UniformListScrollHandle, WeakEntity, Window, canvas,
-    div, fill, point, px, rgb, size, uniform_list,
+    canvas, div, fill, point, px, rgb, size, uniform_list, AnyElement, App, Bounds, ClickEvent,
+    Context, ElementId, Entity, Focusable, Font, FontFallbacks, Hsla, IntoElement, MouseButton,
+    Render, UniformListScrollHandle, WeakEntity, Window,
 };
 use rdm_core::{DownloadHandle, DownloadRequest};
 use rdm_ipc::{Envelope, Request, Response};
@@ -22,8 +22,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::engine::{EngineMsg, EngineRuntime};
 use crate::ipc_server;
 use crate::model::{
-    self, DownloadItem, Filter, ItemState, Settings, Theme, active_count, filter_count,
-    filtered_indices, format_limit, format_speed, global_speed_bps, next_download_id, validate_url,
+    self, active_count, filter_count, filtered_indices, format_limit, format_speed,
+    global_speed_bps, next_download_id, validate_url, DownloadItem, Filter, ItemState, Settings,
+    StopRequest, Theme,
 };
 use crate::open_path;
 use crate::text_input::TextInput;
@@ -116,7 +117,9 @@ impl RdmApp {
                 cx,
             );
         });
-        limit_input.update(cx, |input, cx| input.set_text(settings.speed_limit_mb_text(), cx));
+        limit_input.update(cx, |input, cx| {
+            input.set_text(settings.speed_limit_mb_text(), cx)
+        });
 
         let mut app = Self {
             items,
@@ -145,7 +148,7 @@ impl RdmApp {
 
         // 启动时恢复：CLI URL / Firefox 兜底队列。先入队，泵启动后事件自然会被消费。
         for item in initial {
-            match Self::prepare_request(&app.settings, item.download) {
+            match model::prepare_request(&app.settings, item.download) {
                 Ok(request) => {
                     let source = if item.source.is_empty() {
                         "cli".to_string()
@@ -185,7 +188,7 @@ impl RdmApp {
         };
         let request = self.settings.build_request(url);
         self.url_input.update(cx, |input, cx| input.clear(cx));
-        match Self::prepare_request(&self.settings, request) {
+        match model::prepare_request(&self.settings, request) {
             Ok(request) => {
                 let id = self.push_download(request, "gui".to_string());
                 tracing::info!(download_id = %id, "GUI 添加下载");
@@ -209,7 +212,8 @@ impl RdmApp {
             .map(|dir| dir.display().to_string())
             .unwrap_or_default();
         let limit_text = self.settings.speed_limit_mb_text();
-        self.dir_input.update(cx, |input, cx| input.set_text(dir_text, cx));
+        self.dir_input
+            .update(cx, |input, cx| input.set_text(dir_text, cx));
         self.limit_input
             .update(cx, |input, cx| input.set_text(limit_text, cx));
 
@@ -237,9 +241,7 @@ impl RdmApp {
             }
         };
         let mut settings = self.settings.clone();
-        settings.default_connections = self
-            .draft_connections
-            .clamp(1, rdm_core::MAX_CONNECTIONS);
+        settings.default_connections = self.draft_connections.clamp(1, rdm_core::MAX_CONNECTIONS);
         settings.default_dir = if dir_text.is_empty() {
             None
         } else {
@@ -318,7 +320,9 @@ impl RdmApp {
     }
 
     fn open_folder_by_id(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(index) = self.index_of(id) else { return };
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
         let item = &self.items[index];
         let target = open_path::resolve_folder_target(
             item.path.as_deref(),
@@ -332,7 +336,9 @@ impl RdmApp {
     }
 
     fn open_file_by_id(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(index) = self.index_of(id) else { return };
+        let Some(index) = self.index_of(id) else {
+            return;
+        };
         if let Some(path) = self.items[index].path.clone() {
             if let Err(err) = open_path::open_file(&path) {
                 self.set_toast(format!("打开文件失败: {err}"), true);
@@ -343,17 +349,13 @@ impl RdmApp {
 
     fn pause_item(&mut self, index: usize) {
         let id = self.items[index].id.clone();
-        if self.items[index].state != ItemState::Downloading {
+        // 状态保持「下载中」，等引擎确认 Paused 再迁移（避免 resume 与旧任务并发写盘）。
+        if !self.items[index].begin_stop(StopRequest::Pause) {
             return;
         }
         if let Some((_, handle)) = self.handles.get(&id) {
             handle.pause();
         }
-        let item = &mut self.items[index];
-        item.state = ItemState::Paused;
-        item.note = Some("正在暂停…".to_string());
-        item.clear_speed();
-        self.persist_now();
     }
 
     fn resume_item(&mut self, index: usize) {
@@ -361,7 +363,8 @@ impl RdmApp {
         if !matches!(
             state,
             ItemState::Paused | ItemState::Failed | ItemState::Cancelled
-        ) {
+        ) || !self.items[index].stop_request.is_none()
+        {
             return;
         }
         self.start_item(index);
@@ -369,14 +372,24 @@ impl RdmApp {
 
     fn cancel_item(&mut self, index: usize) {
         let id = self.items[index].id.clone();
-        if let Some((_, handle)) = self.handles.remove(&id) {
-            handle.cancel();
-        }
-        let item = &mut self.items[index];
-        if item.state.is_terminal() {
+        if self.items[index].state == ItemState::Downloading {
+            // 取消同样等引擎回 Cancelled；期间展示「取消中…」。
+            if !self.items[index].begin_stop(StopRequest::Cancel) {
+                return;
+            }
+            if let Some((_, handle)) = self.handles.get(&id) {
+                handle.cancel();
+            }
             return;
         }
+        if self.items[index].state.is_terminal() {
+            return;
+        }
+        // 已暂停的任务没有运行中的引擎 task，直接落为已取消。
+        self.handles.remove(&id);
+        let item = &mut self.items[index];
         item.state = ItemState::Cancelled;
+        item.stop_request = StopRequest::None;
         item.error = Some("已取消".to_string());
         item.note = None;
         item.clear_speed();
@@ -405,14 +418,14 @@ impl RdmApp {
         let id = item.id.clone();
         let request = item.request.clone();
         item.state = ItemState::Downloading;
+        item.stop_request = StopRequest::None;
         item.error = None;
         item.note = Some("排队中…".to_string());
         item.speed_history.clear();
         item.clear_speed();
         let handle = DownloadHandle::new();
         self.handles.insert(id.clone(), (run_id, handle.clone()));
-        self.engine
-            .start_download(id, run_id, request, handle);
+        self.engine.start_download(id, run_id, request, handle);
         self.persist_now();
     }
 
@@ -420,22 +433,6 @@ impl RdmApp {
         let id = next_download_id(self.next_seq);
         self.next_seq += 1;
         id
-    }
-
-    /// 校验 URL、补齐默认目录/限速，生成最终请求。
-    fn prepare_request(
-        settings: &Settings,
-        mut request: DownloadRequest,
-    ) -> Result<DownloadRequest, String> {
-        request.url = validate_url(&request.url)?;
-        request = request.normalized();
-        if request.output_dir.is_none() {
-            request.output_dir = settings.default_dir.clone();
-        }
-        if request.speed_limit_bps.is_none() {
-            request.speed_limit_bps = settings.speed_limit_bps;
-        }
-        Ok(request)
     }
 
     /// 入队并（按设置）自动开始；返回 download_id。
@@ -492,11 +489,7 @@ impl RdmApp {
         let mut notify = false;
         for msg in batch {
             match msg {
-                EngineMsg::DownloadEvent {
-                    id,
-                    run_id,
-                    event,
-                } => {
+                EngineMsg::DownloadEvent { id, run_id, event } => {
                     if let Some(item) = self
                         .items
                         .iter_mut()
@@ -507,11 +500,7 @@ impl RdmApp {
                         notify = true;
                     }
                 }
-                EngineMsg::Finished {
-                    id,
-                    run_id,
-                    result,
-                } => {
+                EngineMsg::Finished { id, run_id, result } => {
                     if let Some(item) = self
                         .items
                         .iter_mut()
@@ -571,7 +560,7 @@ impl RdmApp {
                 } else {
                     item.source
                 };
-                match Self::prepare_request(&self.settings, item.download) {
+                match model::prepare_request(&self.settings, item.download) {
                     Ok(request) => {
                         let id = self.push_download(request, source);
                         tracing::info!(download_id = %id, "IPC 入队");
@@ -605,9 +594,9 @@ impl RdmApp {
                 }
             }
             Request::OpenFolder { id } => {
-                if let Some(index) = self.index_of(&id) {
+                if self.index_of(&id).is_some() {
                     self.open_folder_by_id(&id, cx);
-                    Response::ok(request_id, serde_json::json!({ "id": index }))
+                    Response::ok(request_id, serde_json::json!({ "id": id }))
                 } else {
                     Response::error(request_id, "unknown download id")
                 }
@@ -796,11 +785,8 @@ impl RdmApp {
                                     if history.is_empty() {
                                         return;
                                     }
-                                    let max = history
-                                        .iter()
-                                        .copied()
-                                        .fold(0.0_f64, f64::max)
-                                        .max(1.0);
+                                    let max =
+                                        history.iter().copied().fold(0.0_f64, f64::max).max(1.0);
                                     let count = history.len() as f32;
                                     let gap = 1.0_f32;
                                     let width: f32 = bounds.size.width.into();
@@ -859,18 +845,19 @@ impl RdmApp {
                 )
                 .into_any_element()
         } else {
-            let processor = cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                let indices = filtered_indices(&this.items, this.filter);
-                let mut rows = Vec::with_capacity(range.len());
-                for index in range {
-                    if let Some(item_index) = indices.get(index).copied() {
-                        if let Some(item) = this.items.get(item_index) {
-                            rows.push(this.render_row(index, item, cx).into_any_element());
+            let processor =
+                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let indices = filtered_indices(&this.items, this.filter);
+                    let mut rows = Vec::with_capacity(range.len());
+                    for index in range {
+                        if let Some(item_index) = indices.get(index).copied() {
+                            if let Some(item) = this.items.get(item_index) {
+                                rows.push(this.render_row(index, item, cx).into_any_element());
+                            }
                         }
                     }
-                }
-                rows
-            });
+                    rows
+                });
             uniform_list("downloads", count, processor)
                 .size_full()
                 .track_scroll(self.scroll_handle.clone())
@@ -935,12 +922,22 @@ impl RdmApp {
         let palette = self.palette;
         let id = item.id.clone();
         let state = item.state;
-        let badge_color = match state {
-            ItemState::Downloading => palette.info,
-            ItemState::Paused => palette.warning,
-            ItemState::Completed => palette.success,
-            ItemState::Failed => palette.danger,
-            ItemState::Cancelled => palette.text_faint,
+        let stopping = !item.stop_request.is_none();
+        let badge_color = if stopping {
+            palette.warning
+        } else {
+            match state {
+                ItemState::Downloading => palette.info,
+                ItemState::Paused => palette.warning,
+                ItemState::Completed => palette.success,
+                ItemState::Failed => palette.danger,
+                ItemState::Cancelled => palette.text_faint,
+            }
+        };
+        let badge_label = if let Some(label) = item.stop_request.label_zh() {
+            label
+        } else {
+            state.label_zh()
         };
         let progress_color = match state {
             ItemState::Downloading => palette.accent,
@@ -982,20 +979,33 @@ impl RdmApp {
             file_label.into_any_element()
         };
 
-        // 第二行说明：错误 / 重试 / URL。
+        // 第二行说明：错误 / 重试 / 路径（开启 SHA-256 后展示引擎返回的校验值）。
         let detail_text = if let Some(error) = &item.error {
             error.clone()
         } else if let Some(note) = &item.note {
             note.clone()
         } else if state == ItemState::Completed {
-            item.path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| item.url.clone())
+            if self.settings.verify_sha256 {
+                if let Some(hash) = &item.sha256 {
+                    format!("SHA-256: {hash}")
+                } else {
+                    item.path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| item.url.clone())
+                }
+            } else {
+                item.path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| item.url.clone())
+            }
         } else {
             item.url.clone()
         };
-        let detail_color = if item.error.is_some() {
+        let detail_color = if stopping {
+            palette.warning
+        } else if item.error.is_some() {
             palette.danger
         } else if item.note.is_some() {
             palette.warning
@@ -1003,10 +1013,10 @@ impl RdmApp {
             palette.text_faint
         };
 
-        // 行内操作按钮。
+        // 行内操作按钮。停止动作等待引擎确认期间只保留目录/删除。
         let mut actions: Vec<AnyElement> = Vec::new();
         match state {
-            ItemState::Downloading => {
+            ItemState::Downloading if !stopping => {
                 let target = id.clone();
                 actions.push(row_action_button(
                     ElementId::named_usize("pause", index),
@@ -1028,7 +1038,7 @@ impl RdmApp {
                     }),
                 ));
             }
-            ItemState::Paused | ItemState::Failed | ItemState::Cancelled => {
+            ItemState::Paused | ItemState::Failed | ItemState::Cancelled if !stopping => {
                 let target = id.clone();
                 actions.push(row_action_button(
                     ElementId::named_usize("resume", index),
@@ -1052,6 +1062,8 @@ impl RdmApp {
                     }),
                 ));
             }
+            // Downloading 且 stopping：只显示目录/删除（在 match 外追加）。
+            _ => {}
         }
         {
             let target = id.clone();
@@ -1086,11 +1098,7 @@ impl RdmApp {
                 if history.is_empty() {
                     return;
                 }
-                let max = history
-                    .iter()
-                    .copied()
-                    .fold(0.0_f64, f64::max)
-                    .max(1.0);
+                let max = history.iter().copied().fold(0.0_f64, f64::max).max(1.0);
                 let count = history.len() as f32;
                 let gap = 1.0_f32;
                 let width: f32 = bounds.size.width.into();
@@ -1142,7 +1150,7 @@ impl RdmApp {
                             .bg(Hsla::from(badge_color).opacity(0.16))
                             .text_color(badge_color)
                             .text_xs()
-                            .child(state.label_zh()),
+                            .child(badge_label),
                     )
                     .child(file_label)
                     .child(
@@ -1480,6 +1488,7 @@ impl RdmApp {
             );
 
         div()
+            .id("settings-backdrop")
             .absolute()
             .top(px(0.))
             .left(px(0.))
@@ -1489,6 +1498,8 @@ impl RdmApp {
             .items_center()
             .justify_center()
             .bg(palette.overlay)
+            // 吞掉点击，避免穿透到背后的列表行；弹窗内部控件仍先收到事件。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(panel)
     }
 }
@@ -1677,7 +1688,11 @@ fn theme_button(
         .w(px(64.))
         .rounded_sm()
         .border_1()
-        .border_color(if active { palette.accent } else { palette.border })
+        .border_color(if active {
+            palette.accent
+        } else {
+            palette.border
+        })
         .bg(if active {
             palette.accent_soft
         } else {
@@ -1714,7 +1729,11 @@ fn settings_toggle_row(
     palette: Palette,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let knob_bg = if value { palette.success } else { palette.text_faint };
+    let knob_bg = if value {
+        palette.success
+    } else {
+        palette.text_faint
+    };
     div()
         .id(id)
         .flex()
@@ -1731,12 +1750,7 @@ fn settings_toggle_row(
                 .flex_row()
                 .items_center()
                 .gap(px(8.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.text_faint)
-                        .child(hint),
-                )
+                .child(div().text_xs().text_color(palette.text_faint).child(hint))
                 .child(
                     div()
                         .w(px(38.))

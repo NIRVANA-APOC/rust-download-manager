@@ -132,10 +132,9 @@ pub(crate) async fn probe_with(
     let head_status = head.status();
     let head_final_url = head.url().to_string();
     let head_version = version_string(head.version());
-    let mut snapshot = HeaderSnapshot::capture(head.headers());
-    if let Some(length) = head.content_length() {
-        snapshot.content_length = Some(length);
-    }
+    // NOTE: `Response::content_length()` is a *body* size hint (Some(0) for a
+    // HEAD response); only the actual header is meaningful here.
+    let snapshot = HeaderSnapshot::capture(head.headers());
     drop(head);
 
     if head_status.is_success() {
@@ -193,10 +192,9 @@ async fn ranged_fallback(
     let status = response.status();
     let final_url = response.url().to_string();
     let fallback_version = version_string(response.version());
-    let mut snapshot = HeaderSnapshot::capture(response.headers());
-    if let Some(length) = response.content_length() {
-        snapshot.content_length = Some(length);
-    }
+    // Only the header matters: for a 206 the body size hint is the range
+    // length, not the remote total.
+    let snapshot = HeaderSnapshot::capture(response.headers());
     // The body is irrelevant (at most one byte); drop the response so the
     // connection can be reset/closed.
     drop(response);

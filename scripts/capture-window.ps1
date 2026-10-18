@@ -1,12 +1,13 @@
 # Capture a screenshot of the RDM GUI window (not the whole desktop).
-# Uses the DWM-composited screen rectangle of the top-level window, which is
-# reliable for GPU-rendered windows (PrintWindow often returns black for
-# DirectComposition swap chains).
+# Uses the DWM extended frame bounds and moves the window to the top-left first,
+# which keeps evidence clean and is reliable for GPU-rendered windows
+# (PrintWindow often returns black for DirectComposition swap chains).
 [CmdletBinding()]
 param(
     [string]$ProcessName = "rdm-gui",
     [string]$OutFile = "docs/evidence/rdm-gui.png",
-    [int]$WaitSeconds = 3
+    [int]$WaitSeconds = 2,
+    [switch]$KeepPosition
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +27,8 @@ public static class Win32Window {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     public static List<IntPtr> WindowsOf(uint targetPid) {
         var list = new List<IntPtr>();
@@ -36,6 +39,12 @@ public static class Win32Window {
         }, IntPtr.Zero);
         return list;
     }
+    public static RECT FrameBounds(IntPtr h) {
+        RECT r;
+        if (DwmGetWindowAttribute(h, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, out r, Marshal.SizeOf(typeof(RECT))) == 0) return r;
+        GetWindowRect(h, out r);
+        return r;
+    }
 }
 "@
 
@@ -45,8 +54,7 @@ if (-not $proc) { throw "process '$ProcessName' is not running; start it first" 
 $hwnd = [IntPtr]::Zero
 for ($i = 0; $i -lt 40; $i++) {
     $windows = [Win32Window]::WindowsOf([uint32]$proc.Id) | Where-Object {
-        $r = New-Object Win32Window+RECT
-        [Win32Window]::GetWindowRect($_, [ref]$r) | Out-Null
+        $r = [Win32Window]::FrameBounds($_)
         ($r.Right - $r.Left) -gt 300 -and ($r.Bottom - $r.Top) -gt 200
     }
     if ($windows) { $hwnd = $windows | Select-Object -First 1; break }
@@ -55,11 +63,16 @@ for ($i = 0; $i -lt 40; $i++) {
 if ($hwnd -eq [IntPtr]::Zero) { throw "no visible top-level window found for pid $($proc.Id)" }
 
 [Win32Window]::ShowWindow($hwnd, 9) | Out-Null   # SW_RESTORE
+if (-not $KeepPosition) {
+    # Move to a predictable spot so the captured rectangle is not clipped by
+    # the screen edge (the default centered 1180x760 window can be wider than
+    # the current desktop working area on small/DPI-scaled displays).
+    [Win32Window]::SetWindowPos($hwnd, [IntPtr]::Zero, 8, 8, 0, 0, 0x0001 -bor 0x0004) | Out-Null
+}
 [Win32Window]::SetForegroundWindow($hwnd) | Out-Null
 Start-Sleep -Seconds $WaitSeconds
 
-$rect = New-Object Win32Window+RECT
-[Win32Window]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+$rect = [Win32Window]::FrameBounds($hwnd)
 $w = $rect.Right - $rect.Left
 $h = $rect.Bottom - $rect.Top
 if ($w -le 0 -or $h -le 0) { throw "invalid window rect ${w}x${h}" }

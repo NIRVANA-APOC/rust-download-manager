@@ -600,13 +600,16 @@ async function sendHandoff(request, settings) {
 
 function recentEntryFromResponse(request, response) {
   const handed = response.type === "enqueued";
+  const queuedDetail = response.credentials_stripped
+    ? "RDM 未运行，任务已排队，但登录态/授权信息不会保存；如需要登录态请先启动 RDM 后重新下载"
+    : "RDM GUI 未运行，已排队，下次启动自动加入";
   return {
     fileName: request.file_name || fileNameFromUrl(request.url),
     url: redactUrl(request.url),
     status: handed ? "handed" : "queued",
     detail: handed
       ? "已交给 RDM" + (response.download_id ? "（" + response.download_id + "）" : "")
-      : "RDM GUI 未运行，已排队，下次启动自动加入",
+      : queuedDetail,
   };
 }
 

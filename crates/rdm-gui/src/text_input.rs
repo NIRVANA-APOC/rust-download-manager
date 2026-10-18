@@ -17,11 +17,11 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, div, fill, point, px, relative, size,
+    div, fill, point, px, relative, size, Bounds, ClipboardItem, Context, CursorStyle, Element,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
 use crate::theme::Palette;
@@ -61,7 +61,11 @@ pub struct TextInput {
 }
 
 impl TextInput {
-    pub fn new(cx: &mut Context<Self>, placeholder: impl Into<SharedString>, palette: Palette) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        placeholder: impl Into<SharedString>,
+        palette: Palette,
+    ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             content: SharedString::default(),
@@ -208,7 +212,12 @@ impl TextInput {
         self.is_selecting = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_selecting {
             let index = self.index_for_mouse_position(event.position);
             self.select_to(index, cx);
@@ -504,7 +513,10 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), Hsla::from(self.palette.text_faint))
+            (
+                input.placeholder.clone(),
+                Hsla::from(self.palette.text_faint),
+            )
         } else {
             (content, style.color)
         };

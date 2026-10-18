@@ -203,8 +203,7 @@ impl DownloadHandle {
     }
 
     pub fn cancel(&self) {
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn pause(&self) {
@@ -222,8 +221,7 @@ impl DownloadHandle {
     pub fn reset(&self) {
         self.cancel
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.pause
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.pause.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

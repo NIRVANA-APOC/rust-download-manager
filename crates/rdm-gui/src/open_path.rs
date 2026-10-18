@@ -32,11 +32,10 @@ pub fn folder_spec(file: &Path) -> CommandSpec {
     #[cfg(target_os = "windows")]
     {
         if file.is_file() {
-            CommandSpec::new(
-                "explorer",
-                vec![format!("/select,{}", file.display())],
-            )
-        } else if let Some(parent) = file.parent().filter(|parent| !parent.as_os_str().is_empty())
+            CommandSpec::new("explorer", vec![format!("/select,{}", file.display())])
+        } else if let Some(parent) = file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
         {
             CommandSpec::new("explorer", vec![parent.display().to_string()])
         } else {

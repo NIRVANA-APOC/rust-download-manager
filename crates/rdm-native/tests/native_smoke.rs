@@ -66,8 +66,7 @@ impl TempState {
     }
 
     fn log_text(&self) -> String {
-        std::fs::read_to_string(self.rdm_dir().join("logs").join("native.log"))
-            .unwrap_or_default()
+        std::fs::read_to_string(self.rdm_dir().join("logs").join("native.log")).unwrap_or_default()
     }
 }
 
@@ -114,8 +113,7 @@ impl MockIpcServer {
                 while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
-                            if let Err(err) =
-                                handle_connection(stream, &expected_token, &recorded)
+                            if let Err(err) = handle_connection(stream, &expected_token, &recorded)
                             {
                                 eprintln!("mock IPC connection error: {err}");
                             }
@@ -227,10 +225,7 @@ fn handle_connection(
             "{{\"id\":{},\"ok\":true,\"data\":{{\"download_id\":\"dl_42\"}}}}\n",
             envelope.id
         ),
-        _ => format!(
-            "{{\"id\":{},\"ok\":true,\"data\":null}}\n",
-            envelope.id
-        ),
+        _ => format!("{{\"id\":{},\"ok\":true,\"data\":null}}\n", envelope.id),
     };
     writer.write_all(response.as_bytes())?;
     writer.flush()?;
@@ -264,14 +259,11 @@ impl HostProcess {
         let stdin = child.stdin.take().expect("child stdin");
         let mut stdout = child.stdout.take().expect("child stdout");
         let (sender, responses) = std::sync::mpsc::channel();
-        let reader = thread::spawn(move || loop {
-            match read_frame(&mut stdout) {
-                Ok(Some(frame)) => {
-                    if sender.send(frame).is_err() {
-                        break;
-                    }
+        let reader = thread::spawn(move || {
+            while let Ok(Some(frame)) = read_frame(&mut stdout) {
+                if sender.send(frame).is_err() {
+                    break;
                 }
-                _ => break,
             }
         });
         HostProcess {
@@ -299,8 +291,7 @@ impl HostProcess {
             .responses
             .recv_timeout(RESPONSE_TIMEOUT)
             .expect("host must answer every request");
-        serde_json::from_slice(&frame)
-            .unwrap_or_else(|err| panic!("response is not JSON ({err})"))
+        serde_json::from_slice(&frame).unwrap_or_else(|err| panic!("response is not JSON ({err})"))
     }
 
     fn close_stdin(&mut self) {
@@ -335,7 +326,10 @@ impl Drop for HostProcess {
 }
 
 fn unreachable_gui_path(state: &TempState) -> PathBuf {
-    state.local_appdata().join("no-such-gui").join("rdm-gui.exe")
+    state
+        .local_appdata()
+        .join("no-such-gui")
+        .join("rdm-gui.exe")
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +454,10 @@ fn enqueue_end_to_end_through_mock_gui() {
 
     // Privacy: secrets must not appear in the log file.
     let log = state.log_text();
-    assert!(log.contains("cookie accepted: host=example.com"), "log: {log}");
+    assert!(
+        log.contains("cookie accepted: host=example.com"),
+        "log: {log}"
+    );
     assert!(!log.contains("topsecret"), "cookie value leaked: {log}");
     assert!(!log.contains("secret-signature"), "url query leaked: {log}");
     assert!(!log.contains("must-not-leak"), "header value leaked: {log}");
@@ -477,6 +474,11 @@ fn enqueue_spools_when_gui_cannot_be_started() {
             "url":"https://example.com/spooled.bin",
             "file_name":"spooled.bin",
             "connections":4,
+            "headers":{
+                "Accept":"application/octet-stream",
+                "Authorization":"Bearer must-not-persist",
+                "Cookie":"sid=a=1"
+            },
             "cookie":"a=1",
             "source":"firefox",
             "source_page":"https://example.com/list"
@@ -490,8 +492,15 @@ fn enqueue_spools_when_gui_cannot_be_started() {
     assert_eq!(response["type"], "queued");
     assert_eq!(response["id"], 11);
     assert_eq!(response["reason"], "gui_unavailable");
+    assert_eq!(
+        response["credentials_stripped"], true,
+        "queued response must report that credentials were stripped before spooling"
+    );
     let spool_path = PathBuf::from(response["spool"].as_str().expect("spool path"));
-    assert!(spool_path.is_file(), "spool file must exist: {spool_path:?}");
+    assert!(
+        spool_path.is_file(),
+        "spool file must exist: {spool_path:?}"
+    );
     assert!(spool_path.starts_with(state.rdm_dir().join("queue")));
 
     let text = std::fs::read_to_string(&spool_path).unwrap();
@@ -499,15 +508,49 @@ fn enqueue_spools_when_gui_cannot_be_started() {
     assert_eq!(item.download.url, "https://example.com/spooled.bin");
     assert_eq!(item.download.file_name.as_deref(), Some("spooled.bin"));
     assert_eq!(item.download.connections, 4);
-    assert_eq!(item.download.cookie.as_deref(), Some("a=1"));
     assert_eq!(item.source, "firefox");
     assert_eq!(
         item.source_page.as_deref(),
         Some("https://example.com/list")
     );
+    // Privacy: the spool must not contain cookies or authorization material,
+    // while non-credential headers survive.
+    assert_eq!(
+        item.download.cookie, None,
+        "cookie must never be persisted to the spool"
+    );
+    assert_eq!(
+        item.download.headers.get("Accept").map(String::as_str),
+        Some("application/octet-stream")
+    );
+    for name in ["Authorization", "Cookie"] {
+        assert!(
+            !item.download.headers.contains_key(name),
+            "{name} must never be persisted to the spool"
+        );
+    }
+    for secret in ["a=1", "must-not-persist"] {
+        assert!(
+            !text.contains(secret),
+            "spool file leaked credential material: {secret}"
+        );
+    }
 
     host.close_stdin();
     assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+
+    // The log must not contain credential values either.
+    let log = state.log_text();
+    assert!(
+        log.contains("credentials_stripped=true"),
+        "log must mention stripped credentials: {log}"
+    );
+    for secret in ["a=1", "must-not-persist"] {
+        assert!(
+            !log.contains(secret),
+            "native.log leaked credential material: {secret}"
+        );
+    }
 }
 
 #[test]
@@ -516,9 +559,7 @@ fn invalid_requests_get_structured_errors_and_host_keeps_serving() {
     let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
 
     // `file:` URLs must never reach the download engine.
-    host.send_json(
-        r#"{"type":"enqueue","id":21,"request":{"url":"file:///C:/Windows/win.ini"}}"#,
-    );
+    host.send_json(r#"{"type":"enqueue","id":21,"request":{"url":"file:///C:/Windows/win.ini"}}"#);
     let response = host.recv_json();
     assert_eq!(response["type"], "error");
     assert_eq!(response["id"], 21);

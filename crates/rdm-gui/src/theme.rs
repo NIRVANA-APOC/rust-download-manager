@@ -1,6 +1,6 @@
 //! 深色 / 浅色两套调色板。视图层只从 `Palette` 取颜色，避免散落的魔法色值。
 
-use gpui::{Rgba, rgb, rgba};
+use gpui::{rgb, rgba, Rgba};
 
 use crate::model::Theme;
 

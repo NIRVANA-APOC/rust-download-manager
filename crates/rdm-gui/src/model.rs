@@ -86,6 +86,33 @@ pub enum Filter {
     Failed,
 }
 
+/// 正在等待引擎确认的停止动作。
+///
+/// 暂停/取消不是「立刻生效」：引擎 worker 还要走完当前 64 KiB 读循环、flush 状态。
+/// 在引擎回 `Paused/Cancelled` 之前，GUI 保持 `Downloading` 状态并展示「暂停中/取消中」，
+/// 避免用户点「继续」时新旧两个任务同时写同一个 `.part`（会损坏文件）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopRequest {
+    #[default]
+    None,
+    Pause,
+    Cancel,
+}
+
+impl StopRequest {
+    pub fn label_zh(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Pause => Some("暂停中"),
+            Self::Cancel => Some("取消中"),
+        }
+    }
+
+    pub fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 impl Filter {
     pub const ALL: [Filter; 5] = [
         Filter::All,
@@ -134,13 +161,6 @@ impl Theme {
             Self::Light => "浅色",
         }
     }
-
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
-        }
-    }
 }
 
 /// `settings.json` 的内容。字段都带 `#[serde(default)]`，旧文件缺字段时用默认值。
@@ -174,9 +194,7 @@ impl Settings {
     /// 收敛非法值（手工改过 JSON 也不至于 panic）。
     pub fn normalized(&self) -> Self {
         let mut out = self.clone();
-        out.default_connections = out
-            .default_connections
-            .clamp(1, rdm_core::MAX_CONNECTIONS);
+        out.default_connections = out.default_connections.clamp(1, rdm_core::MAX_CONNECTIONS);
         out.speed_limit_bps = out.speed_limit_bps.filter(|v| *v > 0);
         out
     }
@@ -192,13 +210,29 @@ impl Settings {
     /// 构造新下载的 `DownloadRequest`。`expected_sha256` 留空：见 `verify_sha256` 注释。
     pub fn build_request(&self, url: impl Into<String>) -> DownloadRequest {
         let mut req = DownloadRequest::new(url);
-        req.connections = self
-            .default_connections
-            .clamp(1, rdm_core::MAX_CONNECTIONS);
+        req.connections = self.default_connections.clamp(1, rdm_core::MAX_CONNECTIONS);
         req.output_dir = self.default_dir.clone();
         req.speed_limit_bps = self.speed_limit_bps.filter(|v| *v > 0);
         req
     }
+}
+
+/// 校验 URL、补齐设置里的默认目录/限速，并收敛连接数。
+///
+/// GUI 添加、IPC `enqueue`、CLI URL、spool 恢复都走这一条路径，保证行为一致。
+pub fn prepare_request(
+    settings: &Settings,
+    mut request: DownloadRequest,
+) -> Result<DownloadRequest, String> {
+    request.url = validate_url(&request.url)?;
+    request = request.normalized();
+    if request.output_dir.is_none() {
+        request.output_dir = settings.default_dir.clone();
+    }
+    if request.speed_limit_bps.is_none() {
+        request.speed_limit_bps = settings.speed_limit_bps.filter(|value| *value > 0);
+    }
+    Ok(request)
 }
 
 /// 解析「MB/s」文本框；空或 0 表示不限速。
@@ -221,18 +255,6 @@ pub fn parse_speed_limit_mb(text: &str) -> Result<Option<u64>, String> {
         return Err("全局限速过大".to_string());
     }
     Ok(Some(bps as u64))
-}
-
-/// 校验并收敛连接数输入。
-pub fn parse_connections(text: &str) -> Result<usize, String> {
-    let text = text.trim();
-    let value: usize = text
-        .parse()
-        .map_err(|_| "连接数必须是整数".to_string())?;
-    if !(1..=rdm_core::MAX_CONNECTIONS).contains(&value) {
-        return Err(format!("连接数需在 1..={} 之间", rdm_core::MAX_CONNECTIONS));
-    }
-    Ok(value)
 }
 
 fn trim_float(value: f64) -> String {
@@ -392,6 +414,8 @@ pub struct DownloadItem {
     pub sha256: Option<String>,
     /// 当前引擎任务的代号；旧任务迟到的事件按此丢弃。
     pub run_id: u64,
+    /// 已请求、等待引擎确认的停止动作。
+    pub stop_request: StopRequest,
 }
 
 impl DownloadItem {
@@ -420,12 +444,15 @@ impl DownloadItem {
             range_supported: None,
             sha256: None,
             run_id: 0,
+            stop_request: StopRequest::None,
         }
     }
 
     pub fn progress_fraction(&self) -> Option<f64> {
         match self.total {
-            Some(total) if total > 0 => Some((self.downloaded as f64 / total as f64).clamp(0.0, 1.0)),
+            Some(total) if total > 0 => {
+                Some((self.downloaded as f64 / total as f64).clamp(0.0, 1.0))
+            }
             _ => None,
         }
     }
@@ -464,8 +491,11 @@ impl DownloadItem {
     }
 
     pub fn push_speed_sample(&mut self, value: f64) {
-        self.speed_history
-            .push_back(if value.is_finite() { value.max(0.0) } else { 0.0 });
+        self.speed_history.push_back(if value.is_finite() {
+            value.max(0.0)
+        } else {
+            0.0
+        });
         while self.speed_history.len() > SPEED_HISTORY_LEN {
             self.speed_history.pop_front();
         }
@@ -477,17 +507,41 @@ impl DownloadItem {
         self.active_workers = 0;
     }
 
+    /// 请求停止（暂停/取消）。
+    ///
+    /// 只有「下载中且没有待确认停止动作」时生效；返回 false 表示忽略重复请求。
+    /// 状态保持 `Downloading`，等引擎回 `Paused/Cancelled` 后再迁移（见 `StopRequest`）。
+    pub fn begin_stop(&mut self, request: StopRequest) -> bool {
+        if self.state != ItemState::Downloading || !self.stop_request.is_none() {
+            return false;
+        }
+        self.stop_request = request;
+        self.note = request.label_zh().map(|label| format!("{label}…"));
+        true
+    }
+
+    /// 引擎确认停止后清理停止标记。
+    fn finish_stop(&mut self) {
+        self.stop_request = StopRequest::None;
+    }
+
     /// 应用一条引擎事件（仅当 `run_id` 匹配时由调用方调用）。
     pub fn apply_event(&mut self, event: DownloadEvent) {
+        let stopping = !self.stop_request.is_none();
         match event {
             DownloadEvent::Probing => {
-                self.note = Some("正在探测服务器…".to_string());
+                if !stopping {
+                    self.note = Some("正在探测服务器…".to_string());
+                }
             }
             DownloadEvent::Metadata(meta) => {
-                self.file_name = meta.file_name;
+                // `request.file_name` 是用户显式指定，不能被服务器推导名覆盖。
+                if self.request.file_name.is_none() {
+                    self.file_name = meta.file_name;
+                }
                 self.total = meta.total_bytes;
                 self.range_supported = Some(meta.supports_ranges);
-                if !meta.supports_ranges {
+                if !meta.supports_ranges && !stopping {
                     self.note = Some("服务器不支持 Range，将单连接下载".to_string());
                 }
             }
@@ -498,12 +552,14 @@ impl DownloadItem {
                 resumed_chunks,
             } => {
                 self.active_workers = connections;
-                if resumed_chunks > 0 {
-                    self.note = Some(format!(
-                        "断点续传：已完成 {resumed_chunks}/{total_chunks} 块"
-                    ));
-                } else {
-                    self.note = None;
+                if !stopping {
+                    self.note = if resumed_chunks > 0 {
+                        Some(format!(
+                            "断点续传：已完成 {resumed_chunks}/{total_chunks} 块"
+                        ))
+                    } else {
+                        None
+                    };
                 }
             }
             DownloadEvent::Progress {
@@ -522,9 +578,11 @@ impl DownloadItem {
                     self.eta_secs = eta_secs;
                     self.active_workers = active_workers;
                     self.push_speed_sample(speed_bps);
-                    self.note = None;
+                    if !stopping {
+                        self.note = None;
+                    }
                 } else {
-                    // 暂停/取消过程中仍可能收到最后一帧进度：只更新字节数。
+                    // 暂停/取消确认后仍可能收到最后一帧进度：只回填字节数。
                     self.downloaded = self.downloaded.max(downloaded);
                 }
             }
@@ -534,29 +592,41 @@ impl DownloadItem {
                 delay_ms,
                 reason,
             } => {
-                self.note = Some(format!(
-                    "第 {attempt} 次重试（{}s）：{reason}",
-                    (delay_ms / 1000).max(1)
-                ));
+                if !stopping {
+                    self.note = Some(format!(
+                        "第 {attempt} 次重试（{}s）：{reason}",
+                        (delay_ms / 1000).max(1)
+                    ));
+                }
             }
             DownloadEvent::Completed { .. } => {
                 // 最终结果由 `apply_result` 收敛，这里只清状态提示。
-                self.note = None;
+                if !stopping {
+                    self.note = None;
+                }
             }
             DownloadEvent::Paused { downloaded } => {
                 if self.state != ItemState::Cancelled {
                     self.state = ItemState::Paused;
                     self.downloaded = self.downloaded.max(downloaded);
                     self.clear_speed();
+                    self.error = None;
                     self.note = None;
+                    self.finish_stop();
                 }
             }
             DownloadEvent::Failed { error } => {
                 if self.state != ItemState::Cancelled {
-                    self.state = ItemState::Failed;
-                    self.error = Some(error);
-                    self.clear_speed();
-                    self.note = None;
+                    if self.stop_request == StopRequest::Cancel {
+                        // 等 `Finished` 收敛成 Cancelled，先保留错误信息。
+                        self.error = Some(error);
+                    } else {
+                        self.state = ItemState::Failed;
+                        self.error = Some(error);
+                        self.clear_speed();
+                        self.note = None;
+                        self.finish_stop();
+                    }
                 }
             }
         }
@@ -570,12 +640,16 @@ impl DownloadItem {
                 self.state = ItemState::Completed;
                 self.total = Some(summary.total_bytes);
                 self.downloaded = summary.total_bytes;
+                if let Some(name) = summary.path.file_name() {
+                    self.file_name = name.to_string_lossy().into_owned();
+                }
                 self.path = Some(summary.path);
                 self.error = None;
                 self.note = None;
                 self.range_supported = Some(summary.range_supported);
                 self.sha256 = summary.sha256;
                 self.clear_speed();
+                self.finish_stop();
             }
             Err(DownloadError::Paused { downloaded }) => {
                 if self.state != ItemState::Cancelled {
@@ -584,6 +658,7 @@ impl DownloadItem {
                     self.note = None;
                     self.clear_speed();
                 }
+                self.finish_stop();
             }
             Err(DownloadError::Cancelled { downloaded }) => {
                 self.state = ItemState::Cancelled;
@@ -591,12 +666,23 @@ impl DownloadItem {
                 self.error = Some("已取消".to_string());
                 self.note = None;
                 self.clear_speed();
+                self.finish_stop();
             }
             Err(error) => {
-                self.state = ItemState::Failed;
-                self.error = Some(error.to_string());
-                self.note = None;
-                self.clear_speed();
+                if self.state == ItemState::Cancelled || self.stop_request == StopRequest::Cancel {
+                    // 用户已取消：引擎在探测阶段可能返回普通错误而不是 Cancelled，
+                    // 保持"已取消"语义，避免 UI 把用户操作显示成失败。
+                    self.state = ItemState::Cancelled;
+                    self.error = Some("已取消".to_string());
+                    self.note = None;
+                    self.clear_speed();
+                } else {
+                    self.state = ItemState::Failed;
+                    self.error = Some(error.to_string());
+                    self.note = None;
+                    self.clear_speed();
+                }
+                self.finish_stop();
             }
         }
     }
@@ -661,6 +747,7 @@ impl DownloadItem {
             range_supported: saved.range_supported,
             sha256: saved.sha256,
             run_id: 0,
+            stop_request: StopRequest::None,
         };
         if item.state == ItemState::Paused && item.error.is_none() {
             item.note = Some("启动恢复：已暂停，可继续".to_string());
@@ -685,12 +772,18 @@ pub fn active_count(items: &[DownloadItem]) -> usize {
 }
 
 pub fn global_speed_bps(items: &[DownloadItem]) -> f64 {
-    items
+    let total: f64 = items
         .iter()
         .filter(|item| item.state.is_active())
         .map(|item| item.speed_bps)
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .sum()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum();
+    // 归一化 -0.0 / NaN，避免 IPC JSON 里出现 "-0.0"。
+    if total.is_finite() && total > 0.0 {
+        total
+    } else {
+        0.0
+    }
 }
 
 /// 过滤后的索引列表（给 `uniform_list` 用）。
@@ -838,7 +931,11 @@ pub fn load_downloads(state_dir: &Path) -> LoadOutcome {
     }
 }
 
-pub fn save_downloads(state_dir: &Path, items: &[DownloadItem], next_seq: u64) -> std::io::Result<()> {
+pub fn save_downloads(
+    state_dir: &Path,
+    items: &[DownloadItem],
+    next_seq: u64,
+) -> std::io::Result<()> {
     let state = PersistedState {
         version: STATE_FILE_VERSION,
         items: items.iter().map(DownloadItem::to_persisted).collect(),
@@ -1087,6 +1184,45 @@ mod tests {
     }
 
     #[test]
+    fn pause_waits_for_engine_confirmation() {
+        let mut item = item_in_state(1, ItemState::Downloading);
+        item.apply_event(DownloadEvent::Progress {
+            downloaded: 100,
+            total: Some(1_000),
+            speed_bps: 10.0,
+            eta_secs: Some(3.0),
+            active_workers: 4,
+        });
+        assert!(item.begin_stop(StopRequest::Pause));
+        assert_eq!(item.state, ItemState::Downloading, "暂停请求不能立刻改状态");
+        assert_eq!(item.stop_request, StopRequest::Pause);
+        assert!(
+            !item.begin_stop(StopRequest::Cancel),
+            "重复停止请求应被忽略"
+        );
+
+        // 引擎确认后 > 迁移到 Paused，并清停止标记。
+        item.apply_event(DownloadEvent::Paused { downloaded: 700 });
+        assert_eq!(item.state, ItemState::Paused);
+        assert_eq!(item.downloaded, 700);
+        assert!(item.stop_request.is_none());
+        assert!(
+            !item.begin_stop(StopRequest::Pause),
+            "已暂停任务不再接受停止请求"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_maps_late_engine_error_to_cancelled() {
+        let mut item = item_in_state(1, ItemState::Downloading);
+        assert!(item.begin_stop(StopRequest::Cancel));
+        item.apply_result(Err(DownloadError::Http("probe aborted".to_string())));
+        assert_eq!(item.state, ItemState::Cancelled);
+        assert!(item.stop_request.is_none());
+        assert_eq!(item.error.as_deref(), Some("已取消"));
+    }
+
+    #[test]
     fn cancelled_and_failed_are_distinct() {
         let mut cancelled = item_in_state(1, ItemState::Downloading);
         cancelled.apply_result(Err(DownloadError::Cancelled { downloaded: 7 }));
@@ -1100,15 +1236,81 @@ mod tests {
     }
 
     #[test]
+    fn cancel_wins_over_late_non_control_flow_error() {
+        // 用户在探测阶段取消时，引擎可能先返回普通错误；UI 应保持「已取消」。
+        let mut item = item_in_state(1, ItemState::Downloading);
+        item.apply_result(Err(DownloadError::Cancelled { downloaded: 0 }));
+        item.apply_result(Err(DownloadError::Http(
+            "probe aborted by cancellation".to_string(),
+        )));
+        assert_eq!(item.state, ItemState::Cancelled);
+        assert_eq!(item.error.as_deref(), Some("已取消"));
+    }
+
+    #[test]
+    fn prepare_request_applies_defaults_and_clamps() {
+        let settings = Settings {
+            default_connections: 4,
+            default_dir: Some(PathBuf::from("D:/downloads")),
+            speed_limit_bps: Some(1_048_576),
+            verify_sha256: false,
+            theme: Theme::Dark,
+            auto_start: true,
+        };
+
+        // URL 校验 + 连接数收敛 + 默认目录/限速补齐。
+        let mut request = DownloadRequest::new("  https://example.com/a.bin  ");
+        request.connections = 999;
+        let prepared = prepare_request(&settings, request).unwrap();
+        assert_eq!(prepared.url, "https://example.com/a.bin");
+        assert_eq!(prepared.connections, rdm_core::MAX_CONNECTIONS);
+        assert_eq!(prepared.output_dir, Some(PathBuf::from("D:/downloads")));
+        assert_eq!(prepared.speed_limit_bps, Some(1_048_576));
+
+        // 显式传的目录/限速不被覆盖。
+        let mut request = DownloadRequest::new("https://example.com/b.bin");
+        request.output_dir = Some(PathBuf::from("C:/custom"));
+        request.speed_limit_bps = Some(2_097_152);
+        let prepared = prepare_request(&settings, request).unwrap();
+        assert_eq!(prepared.output_dir, Some(PathBuf::from("C:/custom")));
+        assert_eq!(prepared.speed_limit_bps, Some(2_097_152));
+
+        // 非法 URL 拒绝。
+        assert!(prepare_request(&settings, DownloadRequest::new("ftp://x/a")).is_err());
+    }
+
+    #[test]
     fn completed_result_sets_path_and_hash() {
         let mut item = item_in_state(1, ItemState::Downloading);
         item.apply_result(Ok(sample_summary()));
         assert_eq!(item.state, ItemState::Completed);
         assert_eq!(item.total, Some(1_000));
         assert_eq!(item.downloaded, 1_000);
-        assert_eq!(item.path.as_deref(), Some(Path::new("C:/downloads/archive.zip")));
+        assert_eq!(
+            item.path.as_deref(),
+            Some(Path::new("C:/downloads/archive.zip"))
+        );
+        assert_eq!(item.file_name, "archive.zip");
         assert_eq!(item.sha256.as_deref(), Some("deadbeef"));
         assert_eq!(item.progress_fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn explicit_file_name_wins_over_server_metadata() {
+        let mut request = sample_request();
+        request.file_name = Some("custom-name.bin".to_string());
+        let mut item = DownloadItem::new(next_download_id(2), request, "test");
+        item.apply_event(DownloadEvent::Metadata(rdm_core::RemoteMeta {
+            final_url: "https://example.com/original".to_string(),
+            file_name: "server-name.bin".to_string(),
+            total_bytes: Some(10),
+            supports_ranges: true,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            http_version: None,
+        }));
+        assert_eq!(item.file_name, "custom-name.bin");
     }
 
     #[test]
@@ -1160,10 +1362,7 @@ mod tests {
         assert_eq!(parse_speed_limit_mb("").unwrap(), None);
         assert_eq!(parse_speed_limit_mb("0").unwrap(), None);
         assert_eq!(parse_speed_limit_mb("2").unwrap(), Some(2 * 1024 * 1024));
-        assert_eq!(
-            parse_speed_limit_mb("1.5").unwrap(),
-            Some(1_572_864)
-        );
+        assert_eq!(parse_speed_limit_mb("1.5").unwrap(), Some(1_572_864));
         assert!(parse_speed_limit_mb("abc").is_err());
         assert!(parse_speed_limit_mb("-1").is_err());
         let mut settings = Settings::default();
@@ -1177,21 +1376,20 @@ mod tests {
     }
 
     #[test]
-    fn connections_parsing_and_normalization() {
-        assert_eq!(parse_connections("8").unwrap(), 8);
-        assert!(parse_connections("0").is_err());
-        assert!(parse_connections("33").is_err());
+    fn connections_normalization() {
         let mut settings = Settings::default();
         settings.default_connections = 999;
         let normalized = settings.normalized();
         assert_eq!(normalized.default_connections, rdm_core::MAX_CONNECTIONS);
         let request = normalized.build_request("https://example.com/a.bin");
         assert_eq!(request.connections, rdm_core::MAX_CONNECTIONS);
+        settings.default_connections = 0;
+        assert_eq!(settings.normalized().default_connections, 1);
     }
 
     #[test]
-    fn theme_toggle() {
-        assert_eq!(Theme::Dark.toggled(), Theme::Light);
+    fn theme_labels() {
+        assert_eq!(Theme::Dark.label_zh(), "深色");
         assert_eq!(Theme::Light.label_zh(), "浅色");
     }
 
@@ -1245,7 +1443,9 @@ mod tests {
         let mut saved = item_in_state(1, ItemState::Paused).to_persisted();
         saved.request.url = "file:///etc/passwd".to_string();
         state.items.push(saved);
-        state.items.push(item_in_state(2, ItemState::Paused).to_persisted());
+        state
+            .items
+            .push(item_in_state(2, ItemState::Paused).to_persisted());
         std::fs::write(
             downloads_path(&dir),
             serde_json::to_vec_pretty(&state).unwrap(),

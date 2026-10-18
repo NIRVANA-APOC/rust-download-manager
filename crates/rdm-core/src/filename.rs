@@ -131,11 +131,9 @@ pub(crate) fn resolve_target(dir: &Path, desired: &str, resume: bool) -> (PathBu
 fn numbered(name: &str, n: u32) -> String {
     let path = Path::new(name);
     match (path.file_stem(), path.extension()) {
-        (Some(stem), Some(ext)) => format!(
-            "{} ({n}).{}",
-            stem.to_string_lossy(),
-            ext.to_string_lossy()
-        ),
+        (Some(stem), Some(ext)) => {
+            format!("{} ({n}).{}", stem.to_string_lossy(), ext.to_string_lossy())
+        }
         _ => format!("{name} ({n})"),
     }
 }
@@ -241,7 +239,10 @@ mod tests {
     #[test]
     fn parses_plain_filename() {
         let value = r#"attachment; filename="report final.pdf""#;
-        assert_eq!(parse_content_disposition(value).as_deref(), Some("report final.pdf"));
+        assert_eq!(
+            parse_content_disposition(value).as_deref(),
+            Some("report final.pdf")
+        );
     }
 
     #[test]
@@ -257,7 +258,10 @@ mod tests {
     #[test]
     fn decodes_latin1_ext_value() {
         let value = "attachment; filename*=ISO-8859-1'en'%A3%20rates.txt";
-        assert_eq!(parse_content_disposition(value).as_deref(), Some("£ rates.txt"));
+        assert_eq!(
+            parse_content_disposition(value).as_deref(),
+            Some("£ rates.txt")
+        );
     }
 
     #[test]

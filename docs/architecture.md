@@ -209,15 +209,38 @@ rdm probe <URL> [--json]
 
 ## 8. 构建与运行
 
-前置：Rust stable（本机为 `1.99.1`，GNU 工具链）+ MinGW-w64；GPUI 在 Windows 上
-debug 构建使用运行时 D3D 着色器编译（release 构建需要 `fxc.exe`，Windows SDK 自带）。
+### 8.1 前置环境（Windows，本机已验证）
+
+- Rust stable（本机 `rustc 1.99.1`，`x86_64-pc-windows-gnu` 工具链）。
+- MinGW-w64 GCC（本机 WinLibs 16.2.0 UCRT POSIX；`gcc` 必须在 `PATH` 中，链接
+  与 `crates/rdm-gui/build.rs` 都会用到）。
+- 无需管理员权限、无需 Visual Studio / Windows SDK（debug 构建）。
+
+### 8.2 GPUI / Windows 的两个坑（已处理）
+
+1. **comctl32 v6 manifest**：GPUI 导入 `TaskDialogIndirect`，只有 Common-Controls v6
+   导出；没有 manifest 时加载器绑定 v5 并在 `main` 前以 `STATUS_ENTRYPOINT_NOT_FOUND
+   (0xC0000139)` 退出。`gpui` 的 `windows-manifest` feature 提供该 manifest。
+2. **windows-gnu 下 MinGW 默认 manifest 冲突**：GCC 驱动会自动链接
+   `default-manifest.o`，与 GPUI 的 manifest 冲突（`ld: .rsrc merge failure: multiple
+   non-default manifests`），ld 最终保留 MinGW 默认 manifest 而不是我们的。
+   `crates/rdm-gui/build.rs` 在 `OUT_DIR/manifest-shadow` 生成一个空的
+   `default-manifest.o`，通过 `cargo:rustc-link-arg=-B<dir>` 让 GCC 的 `%:if-exists(...)`
+   命中它，从而只保留 GPUI 的 comctl32 v6 manifest。该 workaround 仅对
+   `windows-gnu` 生效，MSVC 目标无需处理。
+
+### 8.3 命令
 
 ```powershell
 cargo build -p rdm-cli -p rdm-native          # 不需要 GPU 依赖
 cargo test -p rdm-core                        # 引擎单测 + 集成测试
-cargo build -p rdm-gui                        # GPUI（首次编译较久）
+cargo build -p rdm-gui                        # GPUI（首次编译约 4-5 分钟）
 cargo run -p rdm-cli -- download https://example.com/file.bin -d downloads -c 8
 ```
+
+GPUI debug 构建在运行时用 `d3dcompiler_47.dll` 编译 HLSL（着色器源路径来自编译期
+`CARGO_MANIFEST_DIR`，因此同一台机器上的 cargo registry 缓存必须保留）；release 构建会
+在编译期调用 `fxc.exe`（Windows SDK 自带，本机未安装 SDK，故交付以 debug 构建验证）。
 
 Firefox 侧安装：`scripts/install-firefox-host.ps1`（写原生宿主 manifest + 注册表），
 然后在 `about:debugging` 临时加载 `extension/firefox/manifest.json`。
@@ -225,7 +248,11 @@ Firefox 侧安装：`scripts/install-firefox-host.ps1`（写原生宿主 manifes
 ## 9. 已知限制 / 后续
 
 - 仅 HTTP(S)；BT、视频站点解析不在核心范围。
-- 服务器忽略 Range 时无法加速（这是协议层硬限制，UI 必须诚实提示）。
+- 服务器忽略 Range 时无法加速（这是协议层硬限制，UI 会标记 `range_supported=false`）。
 - 签名 URL 过期、CDN 边缘内容不一致：靠校验器检测并重下，不做多镜像合并。
 - release 构建的 GPUI 着色器需要 Windows SDK 的 fxc（开发/CI 用 debug 构建规避）。
 - Firefox 原生消息宿主需要用户手动安装（脚本完成）；上架 AMO 需要签名与审核。
+- 扩展声明 Firefox 128+；GUI 离线时 spool 会剥离 Cookie/Authorization（需登录态的
+  下载应先启动 GUI）。
+- GPUI 仍为 pre-1.0；版本升级可能破坏 API，当前锁定 `gpui = 0.2.2`。
+

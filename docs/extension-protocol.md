@@ -65,8 +65,8 @@
 }
 // 结果
 {"type":"enqueued","id":2,"download_id":"...","gui_running":true}
-// 或（GUI 未运行且启动失败，已落入磁盘队列）
-{"type":"queued","id":2,"reason":"gui_unavailable","spool":"C:\\...\\queue\\1729.json"}
+// 或（GUI 未运行且启动失败，已落入磁盘队列；凭据已剥离）
+{"type":"queued","id":2,"reason":"gui_unavailable","spool":"C:\\...\\queue\\1729.json","credentials_stripped":true}
 // 或错误
 {"type":"error","id":2,"code":"invalid_request","message":"..."}
 ```
@@ -130,6 +130,15 @@ spool 文件内容 = `rdm_ipc::EnqueueItem` 的 JSON 原样（**不包装**）�
 {"id":8,"token":"...","method":"activate"}
 ```
 
+> **线格式警告（v1 已知缺陷）**：`Envelope.id`（数字）与 `Request::Pause/Resume/Cancel/OpenFolder`
+> 的 `id`（download id 字符串）经 serde flatten 后落在同一个 JSON 对象里，因此原始的
+> pause 请求在 JSON 文本中会出现**两个同名 `id` 键**，例如：
+> `{"id":4,"token":"...","method":"pause","id":"dl_01"}`。
+> 标准 JSON 序列化器通常无法生成重复键；GUI 侧 `parse_envelope` 已按原始文本手工兼容
+> 这两个键。Firefox 扩展当前不使用控制方法，因此真实链路不受影响；CLI/第三方集成如需
+> pause/resume，必须手工拼接原始 JSON。**v2 计划把内层字段改名为 `download_id`**，
+> 在此之前请以本节示例为准。
+
 ### 2.3 响应
 
 ```jsonc
@@ -153,7 +162,9 @@ spool 文件内容 = `rdm_ipc::EnqueueItem` 的 JSON 原样（**不包装**）�
 ## 4. 安全与隐私
 
 - IPC 只绑定 `127.0.0.1`，必须带 token；token 文件权限尽力收紧。
-- Cookie 只在扩展 → 宿主 → GUI 内存中传递，不落盘（日志脱敏）。
+- Cookie 只在扩展 → 宿主 → GUI 内存链路中传递，不写入 `ipc.json`/日志；**GUI 离线时的 spool 兜底会剥离
+  Cookie / Authorization / Proxy-Authorization 头**（`queued` 响应返回 `credentials_stripped: true`），
+  因此需要登录态的下载在 GUI 未运行时应先启动 GUI 再重试。
 - 扩展仅在用户开启接管时拦截；支持站点/扩展名黑名单；`about:`、`blob:`、`data:` 不拦截。
 - 原生宿主只接受 `allowed_extensions` 中扩展 ID 的连接（Firefox 强制）。
 - 下载 URL 必须 http(s)；拒绝 `file://`，避免本地文件被"下载"。

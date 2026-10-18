@@ -180,7 +180,10 @@ mod tests {
         let too_big = vec![0u8; MAX_FRAME_BYTES as usize + 1];
         let err = write_frame(&mut out, &too_big).unwrap_err();
         assert!(matches!(err, FrameError::TooLarge(_)));
-        assert!(out.is_empty(), "nothing must be written for a rejected frame");
+        assert!(
+            out.is_empty(),
+            "nothing must be written for a rejected frame"
+        );
     }
 
     #[test]

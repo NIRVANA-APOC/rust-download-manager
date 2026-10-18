@@ -1,0 +1,197 @@
+{
+  "b": {
+    "size": 67108864,
+    "final": 67108864,
+    "resumed_seen_downloading": true,
+    "file": "slow.bin",
+    "state": "completed",
+    "sha256": "E5A5454727735DD86A595040190B01BC62D8EBBA741F5ABE49BED1B1A243F60F",
+    "paused_at": 11010048,
+    "id": "dl_000002"
+  },
+  "downloads_json": {
+    "version": 1,
+    "items": [
+      {
+        "id": "dl_000001",
+        "file_name": "file",
+        "url": "http://127.0.0.1:18081/file",
+        "request": {
+          "url": "http://127.0.0.1:18081/file",
+          "output_dir": "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-downloads",
+          "file_name": null,
+          "connections": 4,
+          "chunk_size": null,
+          "headers": {},
+          "cookie": null,
+          "referer": null,
+          "user_agent": null,
+          "proxy": null,
+          "expected_sha256": null,
+          "speed_limit_bps": null,
+          "resume": true,
+          "insecure": false
+        },
+        "state": "completed",
+        "total": 8388608,
+        "downloaded": 8388608,
+        "path": "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-downloads\\file",
+        "error": null,
+        "source": "e2e",
+        "created_ms": 1792345548243,
+        "sha256": null,
+        "range_supported": true
+      },
+      {
+        "id": "dl_000002",
+        "file_name": "slow.bin",
+        "url": "http://127.0.0.1:18082/file",
+        "request": {
+          "url": "http://127.0.0.1:18082/file",
+          "output_dir": "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-downloads",
+          "file_name": "slow.bin",
+          "connections": 2,
+          "chunk_size": null,
+          "headers": {},
+          "cookie": null,
+          "referer": null,
+          "user_agent": null,
+          "proxy": null,
+          "expected_sha256": null,
+          "speed_limit_bps": null,
+          "resume": true,
+          "insecure": false
+        },
+        "state": "completed",
+        "total": 67108864,
+        "downloaded": 67108864,
+        "path": "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-downloads\\slow.bin",
+        "error": null,
+        "source": "e2e",
+        "created_ms": 1792345548638,
+        "sha256": null,
+        "range_supported": true
+      },
+      {
+        "id": "dl_000003",
+        "file_name": "file",
+        "url": "http://127.0.0.1:18081/file?cli=1",
+        "request": {
+          "url": "http://127.0.0.1:18081/file?cli=1",
+          "output_dir": "C:\\Users\\nirvana\\Downloads",
+          "file_name": null,
+          "connections": 8,
+          "chunk_size": null,
+          "headers": {},
+          "cookie": null,
+          "referer": null,
+          "user_agent": null,
+          "proxy": null,
+          "expected_sha256": null,
+          "speed_limit_bps": null,
+          "resume": true,
+          "insecure": false
+        },
+        "state": "completed",
+        "total": 8388608,
+        "downloaded": 8388608,
+        "path": "C:\\Users\\nirvana\\Downloads\\file",
+        "error": null,
+        "source": "cli",
+        "created_ms": 1792345568552,
+        "sha256": null,
+        "range_supported": true
+      }
+    ],
+    "next_seq": 4
+  },
+  "timestamp": "2026-10-19T01:46:08.8561365+08:00",
+  "ipc": {
+    "pid": 54072,
+    "protocol": 1,
+    "port": 53389
+  },
+  "gui_pid": 54072,
+  "checks": [
+    "PASS: fixture servers 启动（8MB@18081, 64MB@18082）",
+    "PASS: GUI 启动并发布 ipc.json (pid=54072, port=53389)",
+    "PASS: 启动时列表为空",
+    "PASS: A enqueue ok (dl_000001)",
+    "PASS: A completed，字节 8388608/8388608",
+    "PASS: A 输出文件存在",
+    "PASS: A 文件大小 = 8 MiB",
+    "PASS: A 无 .part/.part.json 残留",
+    "PASS: B enqueue ok (dl_000002)",
+    "PASS: B downloading 速度 > 0 (4090227 B/s)",
+    "PASS: B 全局速度 > 0 (4090227 B/s)",
+    "PASS: B status 含 downloading 状态（ETA 由引擎事件驱动）",
+    "PASS: B pause 请求 ok",
+    "PASS: B 保持 paused",
+    "PASS: 暂停确认后字节数冻结（delta=0 < 256KiB，paused_at=11010048）",
+    "PASS: B resume 请求 ok",
+    "PASS: B resume 后 completed",
+    "PASS: B 完成字节数 = 64 MiB",
+    "PASS: B 输出文件存在",
+    "PASS: B 文件大小 = 64 MiB",
+    "PASS: B 最终字节 > 暂停时字节（断点续传生效）",
+    "PASS: B 无 .part/.part.json 残留",
+    "PASS: 单实例 CLI 退出码 0",
+    "PASS: 单实例 CLI 输出「已投递」",
+    "PASS: CLI 追加任务 completed（file=file）",
+    "PASS: downloads.json 有 3 条记录",
+    "PASS: downloads.json 3 条均 completed",
+    "PASS: downloads.json next_seq=4",
+    "PASS: downloads.json 完成项含有效 path",
+    "PASS: downloads.json 记录 B 的字节数"
+  ],
+  "status_final": {
+    "downloads": [
+      {
+        "id": "dl_000001",
+        "file_name": "file",
+        "state": "completed",
+        "downloaded": 8388608,
+        "total": 8388608,
+        "speed_bps": 0.0,
+        "connections": 4
+      },
+      {
+        "id": "dl_000002",
+        "file_name": "slow.bin",
+        "state": "completed",
+        "downloaded": 67108864,
+        "total": 67108864,
+        "speed_bps": 0.0,
+        "connections": 2
+      },
+      {
+        "id": "dl_000003",
+        "file_name": "file",
+        "state": "completed",
+        "downloaded": 8388608,
+        "total": 8388608,
+        "speed_bps": 0.0,
+        "connections": 8
+      }
+    ],
+    "global_speed_bps": 0.0,
+    "active": 0
+  },
+  "a": {
+    "sha256": "68F5648506659EF2D03EBDCCA49C078B7886FAB81E7B2E5B7084CD052B5F03AD",
+    "file": "file",
+    "state": "completed",
+    "size": 8388608,
+    "id": "dl_000001"
+  },
+  "cli": {
+    "file": "file",
+    "state": "completed",
+    "id": "dl_000003"
+  },
+  "screenshots": [
+    "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-downloading.png",
+    "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-paused.png",
+    "C:\\Users\\nirvana\\AppData\\Local\\Temp\\rdm-e2e-completed.png"
+  ]
+}

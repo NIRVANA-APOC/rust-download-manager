@@ -134,9 +134,15 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--size" => parsed.size = parse_bytes(&next_value(&mut args, "--size")?)?,
-                "--port" => parsed.port = next_value(&mut args, "--port")?.parse().map_err(parse_err)?,
+                "--port" => {
+                    parsed.port = next_value(&mut args, "--port")?
+                        .parse()
+                        .map_err(parse_err)?
+                }
                 "--delay-ms" => {
-                    parsed.delay_ms = next_value(&mut args, "--delay-ms")?.parse().map_err(parse_err)?
+                    parsed.delay_ms = next_value(&mut args, "--delay-ms")?
+                        .parse()
+                        .map_err(parse_err)?
                 }
                 "--no-ranges" => parsed.no_ranges = true,
                 "--no-length" => parsed.no_length = true,
@@ -147,11 +153,27 @@ impl Args {
                 "--disposition" => {
                     parsed.disposition = Some(next_value(&mut args, "--disposition")?)
                 }
-                "--flaky" => parsed.flaky = Some(next_value(&mut args, "--flaky")?.parse().map_err(parse_err)?),
-                "--retry-after" => {
-                    parsed.retry_after = Some(next_value(&mut args, "--retry-after")?.parse().map_err(parse_err)?)
+                "--flaky" => {
+                    parsed.flaky = Some(
+                        next_value(&mut args, "--flaky")?
+                            .parse()
+                            .map_err(parse_err)?,
+                    )
                 }
-                "--seed" => parsed.seed = Some(next_value(&mut args, "--seed")?.parse().map_err(parse_err)?),
+                "--retry-after" => {
+                    parsed.retry_after = Some(
+                        next_value(&mut args, "--retry-after")?
+                            .parse()
+                            .map_err(parse_err)?,
+                    )
+                }
+                "--seed" => {
+                    parsed.seed = Some(
+                        next_value(&mut args, "--seed")?
+                            .parse()
+                            .map_err(parse_err)?,
+                    )
+                }
                 "--help" | "-h" => return Err("help requested".to_string()),
                 other => return Err(format!("unknown argument `{other}`")),
             }

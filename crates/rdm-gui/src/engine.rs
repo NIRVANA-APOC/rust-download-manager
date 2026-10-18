@@ -19,11 +19,9 @@
 
 use std::time::Duration;
 
-use rdm_core::{
-    DownloadError, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary,
-};
+use rdm_core::{DownloadError, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{UnboundedSender, error::SendError};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// 事件泵消息。所有跨线程通信都走这一个通道。
 pub enum EngineMsg {
@@ -64,10 +62,7 @@ impl std::fmt::Debug for EngineMsg {
                 .field("ok", &result.is_ok())
                 .finish(),
             Self::Tick => f.write_str("Tick"),
-            Self::Ipc { envelope, .. } => f
-                .debug_struct("Ipc")
-                .field("id", &envelope.id)
-                .finish(),
+            Self::Ipc { envelope, .. } => f.debug_struct("Ipc").field("id", &envelope.id).finish(),
         }
     }
 }
@@ -86,10 +81,6 @@ pub struct EngineRuntime {
 impl EngineRuntime {
     pub fn new(runtime: Handle, ui_tx: UnboundedSender<EngineMsg>) -> Self {
         Self { runtime, ui_tx }
-    }
-
-    pub fn sender(&self) -> UnboundedSender<EngineMsg> {
-        self.ui_tx.clone()
     }
 
     /// 启动一个下载任务。`handle` 由 `DownloadItem` 保存，用于暂停/取消。
@@ -141,15 +132,6 @@ impl EngineRuntime {
             }
         });
     }
-
-    /// 给 IPC server 用：从 tokio 侧把请求投递给 GUI。
-    pub fn send_ipc(
-        &self,
-        envelope: rdm_ipc::Envelope,
-        reply: tokio::sync::oneshot::Sender<rdm_ipc::Response>,
-    ) -> Result<(), SendError<EngineMsg>> {
-        self.ui_tx.send(EngineMsg::Ipc { envelope, reply })
-    }
 }
 
 #[cfg(test)]
@@ -197,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn ticker_and_sender_do_not_panic() {
+    fn ticker_emits_ticks_without_panicking() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()

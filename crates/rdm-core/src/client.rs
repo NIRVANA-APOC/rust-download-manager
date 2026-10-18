@@ -32,14 +32,16 @@ pub(crate) fn build_http1(request: &DownloadRequest) -> Result<reqwest::Client, 
     build_inner(request, true)
 }
 
-fn build_inner(request: &DownloadRequest, http1_only: bool) -> Result<reqwest::Client, DownloadError> {
+fn build_inner(
+    request: &DownloadRequest,
+    http1_only: bool,
+) -> Result<reqwest::Client, DownloadError> {
     let mut headers = HeaderMap::new();
 
     // Caller-provided headers first so explicit fields below win.
     for (name, value) in &request.headers {
-        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            DownloadError::Other(format!("invalid request header name: {name}"))
-        })?;
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| DownloadError::Other(format!("invalid request header name: {name}")))?;
         let value = HeaderValue::from_str(value).map_err(|_| {
             DownloadError::Other(format!("invalid value for request header {name}"))
         })?;
@@ -89,8 +91,8 @@ fn header(value: &str, what: &str) -> Result<HeaderValue, DownloadError> {
 
 /// Validate and normalise the request URL (http/https only).
 pub(crate) fn validate_url(url: &str) -> Result<url::Url, DownloadError> {
-    let parsed =
-        url::Url::parse(url).map_err(|error| DownloadError::InvalidUrl(format!("{url}: {error}")))?;
+    let parsed = url::Url::parse(url)
+        .map_err(|error| DownloadError::InvalidUrl(format!("{url}: {error}")))?;
     match parsed.scheme() {
         "http" | "https" => Ok(parsed),
         other => Err(DownloadError::InvalidUrl(format!(

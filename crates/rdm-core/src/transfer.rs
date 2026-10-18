@@ -90,7 +90,10 @@ async fn run_inner(
         .unwrap_or_else(|| PathBuf::from("."));
     tokio::fs::create_dir_all(&dir).await?;
 
-    let desired = request.file_name.clone().unwrap_or_else(|| meta.file_name.clone());
+    let desired = request
+        .file_name
+        .clone()
+        .unwrap_or_else(|| meta.file_name.clone());
     let (target, file_name) = filename::resolve_target(&dir, &desired, request.resume);
     let part = state::part_path(&target);
     let state_path = state::state_path(&target);
@@ -346,7 +349,11 @@ impl ChunkTransfer {
     fn is_stopped(&self) -> bool {
         self.controls.stopped()
             || self.downgrade.load(Ordering::SeqCst)
-            || self.failure.lock().expect("failure mutex poisoned").is_some()
+            || self
+                .failure
+                .lock()
+                .expect("failure mutex poisoned")
+                .is_some()
     }
 
     fn fail(&self, error: DownloadError) {
@@ -519,9 +526,7 @@ async fn chunked(ctx: Context, total: u64) -> Result<DownloadSummary, DownloadEr
     counters
         .completed_chunks
         .store(resumed_chunks, Ordering::Relaxed);
-    let connections_used = plan
-        .total_chunks
-        .clamp(1, ctx.connections() as u64) as usize;
+    let connections_used = plan.total_chunks.clamp(1, ctx.connections() as u64) as usize;
 
     ctx.events.emit(DownloadEvent::Started {
         connections: connections_used,
@@ -682,9 +687,15 @@ async fn worker(shared: Arc<ChunkTransfer>) {
             continue;
         }
 
-        shared.counters.active_workers.fetch_add(1, Ordering::SeqCst);
+        shared
+            .counters
+            .active_workers
+            .fetch_add(1, Ordering::SeqCst);
         let outcome = fetch_chunk(&shared, &mut file, index).await;
-        shared.counters.active_workers.fetch_sub(1, Ordering::SeqCst);
+        shared
+            .counters
+            .active_workers
+            .fetch_sub(1, Ordering::SeqCst);
 
         match outcome {
             ChunkOutcome::Done => {
@@ -692,7 +703,10 @@ async fn worker(shared: Arc<ChunkTransfer>) {
                 shared
                     .completed_bytes
                     .fetch_add(shared.plan.chunk_len(index), Ordering::SeqCst);
-                shared.counters.completed_chunks.fetch_add(1, Ordering::SeqCst);
+                shared
+                    .counters
+                    .completed_chunks
+                    .fetch_add(1, Ordering::SeqCst);
                 shared.after_chunk().await;
             }
             ChunkOutcome::Stopped => return,
@@ -824,7 +838,10 @@ async fn attempt_chunk(
             Some(range) => {
                 range.start == start
                     && range.end == end_inclusive
-                    && range.total.map(|total| total == shared.total).unwrap_or(true)
+                    && range
+                        .total
+                        .map(|total| total == shared.total)
+                        .unwrap_or(true)
             }
             None => false,
         };
@@ -1167,9 +1184,12 @@ async fn single_attempt(
 // ---------------------------------------------------------------------------
 
 async fn prepare_part(part: &Path, total: u64) -> Result<(), DownloadError> {
+    // Deliberately do not truncate: a resumed `.part` keeps its completed
+    // chunks, and `set_len` normalises the length either way.
     let file = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(part)
         .await?;
     file.set_len(total).await?;
@@ -1192,8 +1212,11 @@ async fn verify_checksum(ctx: &Context, path: &Path) -> Result<Option<String>, D
     };
     let actual = sha256_file(path).await?;
     if !actual.eq_ignore_ascii_case(expected.trim()) {
-        // Keep the payload for diagnosis but drop state: the bitmap would call
-        // a corrupt file complete on the next run.
+        // Never leave a complete-looking-but-corrupt payload behind: drop the
+        // `.part` payload *and* the state bitmap (which would otherwise call it
+        // complete on the next run). The caller only learns the expected and
+        // actual digests from the error.
+        let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(&ctx.state_path).await;
         return Err(DownloadError::ChecksumMismatch {
             expected: expected.trim().to_ascii_lowercase(),

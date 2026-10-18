@@ -13,7 +13,7 @@ param(
     [int]$SizeMB = 64,
     [int]$DelayMs = 20,
     [int]$Connections = 8,
-    [int]$Runs = 2,
+    [int]$Runs = 5,
     [int]$Port = 18080
 )
 
@@ -45,7 +45,7 @@ foreach ($c in @(1, $Connections)) {
             Start-Sleep -Milliseconds 400
             $file = Join-Path $outDir "bench-c$c-r$run.bin"
             Remove-Item $file -ErrorAction SilentlyContinue
-            $json = & $cli download "http://127.0.0.1:$Port/file.bin" `
+            $json = & $cli download "http://127.0.0.1:$Port/file" `
                 --dir $outDir --name ("bench-c$c-r$run.bin") `
                 --connections $c --json --quiet 2>&1
             $last = $json | Where-Object { $_ -match '"event"\s*:\s*"completed"' } | Select-Object -Last 1
@@ -84,3 +84,4 @@ if ($base -and $multi) {
 
 $summary | ConvertTo-Json | Set-Content (Join-Path $root "bench-out\summary.json")
 Write-Host "raw results: bench-out\summary.json"
+

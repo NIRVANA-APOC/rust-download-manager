@@ -166,7 +166,11 @@ mod tests {
         assert!(is_compatible(
             &state,
             &request("https://example.com/file.bin"),
-            &meta("https://cdn.example.com/file.bin", Some(total), Some("\"abc\"")),
+            &meta(
+                "https://cdn.example.com/file.bin",
+                Some(total),
+                Some("\"abc\"")
+            ),
             total
         ));
     }
@@ -180,25 +184,41 @@ mod tests {
         assert!(!is_compatible(
             &state,
             &req,
-            &meta("https://cdn.example.com/file.bin", Some(total), Some("\"changed\"")),
+            &meta(
+                "https://cdn.example.com/file.bin",
+                Some(total),
+                Some("\"changed\"")
+            ),
             total
         ));
         assert!(!is_compatible(
             &state,
             &req,
-            &meta("https://cdn.example.com/file.bin", Some(total), Some("\"abc\"")),
+            &meta(
+                "https://cdn.example.com/file.bin",
+                Some(total),
+                Some("\"abc\"")
+            ),
             total + 1
         ));
         assert!(!is_compatible(
             &state,
             &req,
-            &meta("https://other.example.com/file.bin", Some(total), Some("\"abc\"")),
+            &meta(
+                "https://other.example.com/file.bin",
+                Some(total),
+                Some("\"abc\"")
+            ),
             total
         ));
         assert!(!is_compatible(
             &state,
             &request("https://example.com/other.bin"),
-            &meta("https://cdn.example.com/file.bin", Some(total), Some("\"abc\"")),
+            &meta(
+                "https://cdn.example.com/file.bin",
+                Some(total),
+                Some("\"abc\"")
+            ),
             total
         ));
     }

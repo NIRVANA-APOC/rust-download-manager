@@ -92,7 +92,10 @@ impl Logger {
 
 fn open_log_file(dir: &Path, path: &Path) -> std::io::Result<File> {
     fs::create_dir_all(dir)?;
-    if fs::metadata(path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+    if fs::metadata(path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false)
+    {
         let rotated = dir.join("native.log.1");
         let _ = fs::remove_file(&rotated);
         let _ = fs::rename(path, &rotated);

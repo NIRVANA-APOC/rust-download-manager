@@ -19,7 +19,9 @@ impl ChunkPlan {
     pub fn new(total: u64, connections: usize, requested: Option<u64>) -> Self {
         let connections = connections.max(1) as u64;
         let chunk_size = requested
-            .unwrap_or_else(|| (total / (connections * 4)).clamp(MIN_CHUNK_SIZE, DEFAULT_CHUNK_SIZE))
+            .unwrap_or_else(|| {
+                (total / (connections * 4)).clamp(MIN_CHUNK_SIZE, DEFAULT_CHUNK_SIZE)
+            })
             .max(1);
         Self::with_chunk_size(total, chunk_size)
     }

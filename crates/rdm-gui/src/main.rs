@@ -26,19 +26,19 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    px, size,
+    px, size, App, Application, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 use rdm_ipc::{EnqueueItem, Request};
 use tokio::sync::mpsc;
 
 use crate::app::{Bootstrap, CloseDialog, RdmApp};
 use crate::engine::{EngineMsg, EngineRuntime};
-use crate::theme::Palette;
 use crate::text_input::{
-    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
-    Submit, TextInput,
+    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
+    SelectRight, Submit, TextInput,
 };
+use crate::theme::Palette;
 
 const WINDOW_WIDTH: f32 = 1180.0;
 const WINDOW_HEIGHT: f32 = 760.0;
@@ -110,7 +110,11 @@ fn main() {
         );
     }
     if loaded.skipped > 0 {
-        tracing::warn!(skipped = loaded.skipped, "downloads.json 中 {} 条记录 URL 非法已跳过", loaded.skipped);
+        tracing::warn!(
+            skipped = loaded.skipped,
+            "downloads.json 中 {} 条记录 URL 非法已跳过",
+            loaded.skipped
+        );
     }
 
     let mut initial: Vec<EnqueueItem> = Vec::new();
@@ -190,11 +194,7 @@ fn main() {
     // ---- 5. GPUI ----------------------------------------------------------
     Application::new().run(move |cx: &mut App| {
         bind_keys(cx);
-        let bounds = Bounds::centered(
-            None,
-            size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
-            cx,
-        );
+        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
@@ -210,20 +210,16 @@ fn main() {
             let url_input =
                 cx.new(|cx| TextInput::new(cx, "输入或粘贴下载 URL（http/https）", palette));
             let dir_input = cx.new(|cx| {
-                TextInput::new(cx, "例如 C:\\Users\\you\\Downloads（留空使用默认）", palette)
-            });
-            let limit_input =
-                cx.new(|cx| TextInput::new(cx, "例如 2 或 1.5，留空不限速", palette));
-
-            let app = cx.new(|cx| {
-                RdmApp::new(
+                TextInput::new(
                     cx,
-                    url_input.clone(),
-                    dir_input,
-                    limit_input,
-                    bootstrap,
+                    "例如 C:\\Users\\you\\Downloads（留空使用默认）",
+                    palette,
                 )
             });
+            let limit_input = cx.new(|cx| TextInput::new(cx, "例如 2 或 1.5，留空不限速", palette));
+
+            let app =
+                cx.new(|cx| RdmApp::new(cx, url_input.clone(), dir_input, limit_input, bootstrap));
 
             // URL 输入框 Enter = 添加。Entity 引用通过弱句柄回传，避免循环强引用。
             let weak_app = app.downgrade();

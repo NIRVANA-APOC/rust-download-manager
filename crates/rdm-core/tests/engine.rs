@@ -84,6 +84,59 @@ async fn probe_meta(server: &TestServer) -> RemoteMeta {
         .expect("probe succeeds")
 }
 
+/// Compare a downloaded file with the fixture payload without dumping
+/// megabytes of bytes into the test output on mismatch.
+fn assert_payload_eq(path: &Path, expected: &[u8], context: &str) {
+    let actual = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("{context}: could not read {}: {error}", path.display()));
+    if actual == expected {
+        return;
+    }
+    let limit = actual.len().min(expected.len());
+    let at = (0..limit)
+        .find(|index| actual[*index] != expected[*index])
+        .unwrap_or(limit);
+    let start = at.saturating_sub(8);
+    let actual_slice = &actual[start..(at + 8).min(actual.len())];
+    let expected_slice = &expected[start..(at + 8).min(expected.len())];
+    panic!(
+        "{context}: payload mismatch at byte {at} (actual {} bytes, expected {} bytes); \
+         actual {:02x?} vs expected {:02x?}",
+        actual.len(),
+        expected.len(),
+        actual_slice,
+        expected_slice
+    );
+}
+
+/// Wait until the fixture stops observing traffic, then return its counters.
+///
+/// After a pause the client drops in-flight responses; the server tasks may
+/// still flush a few buffered bytes to half-closed sockets. Any byte-level
+/// delta assertion must be taken *after* that settles, otherwise leftover
+/// writes from the paused run leak into the resumed run's delta.
+async fn settled_stats(server: &TestServer) -> rdm_fixture_server::Stats {
+    let mut last = server.stats();
+    let mut stable = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let now = server.stats();
+        let quiet = now.body_bytes_sent == last.body_bytes_sent
+            && now.requests == last.requests
+            && now.range_headers.len() == last.range_headers.len();
+        if quiet {
+            stable += 1;
+            if stable >= 3 {
+                return now;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+    server.stats()
+}
+
 // ---------------------------------------------------------------------------
 // §3.6.1 — multi-connection output equals single-connection output
 // ---------------------------------------------------------------------------
@@ -97,23 +150,17 @@ async fn multi_connection_matches_single_connection() {
     let single_dir = TempDir::new("single");
     let mut single_request = request_for(&server, single_dir.path(), 1);
     single_request.chunk_size = Some(512 * 1024);
-    let single = download(single_request, None).await.expect("single download");
+    let single = download(single_request, None)
+        .await
+        .expect("single download");
 
     let multi_dir = TempDir::new("multi");
     let mut multi_request = request_for(&server, multi_dir.path(), 8);
     multi_request.chunk_size = Some(512 * 1024);
     let multi = download(multi_request, None).await.expect("multi download");
 
-    assert_eq!(
-        std::fs::read(&single.path).unwrap(),
-        expected,
-        "single-connection payload mismatch"
-    );
-    assert_eq!(
-        std::fs::read(&multi.path).unwrap(),
-        expected,
-        "multi-connection payload mismatch"
-    );
+    assert_payload_eq(&single.path, &expected, "single-connection");
+    assert_payload_eq(&multi.path, &expected, "multi-connection");
     assert_eq!(single.total_bytes, total);
     assert_eq!(multi.total_bytes, total);
     assert_eq!(single.connections, 1);
@@ -135,7 +182,10 @@ async fn multi_connection_matches_single_connection() {
         stats.responses_206
     );
     assert!(
-        stats.http_versions.iter().all(|version| version == "HTTP/1.1"),
+        stats
+            .http_versions
+            .iter()
+            .all(|version| version == "HTTP/1.1"),
         "fixture saw unexpected protocols: {:?}",
         stats.http_versions
     );
@@ -163,7 +213,7 @@ async fn range_ignored_falls_back_to_single_stream() {
         "fallback must be reported as range_supported=false"
     );
     assert_eq!(summary.connections, 1);
-    assert_eq!(std::fs::read(&summary.path).unwrap(), server.content());
+    assert_payload_eq(&summary.path, &server.content(), "payload");
     assert_eq!(summary.total_bytes, total);
 
     let stats = server.stats();
@@ -188,7 +238,8 @@ async fn pause_midway(
     let handle = DownloadHandle::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task_handle = handle.clone();
-    let task = tokio::spawn(async move { download_with_handle(request, Some(tx), task_handle).await });
+    let task =
+        tokio::spawn(async move { download_with_handle(request, Some(tx), task_handle).await });
 
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -231,7 +282,8 @@ async fn resume_only_downloads_missing_chunks() {
     request.file_name = Some("payload.bin".to_string());
     request.chunk_size = Some(chunk_size);
 
-    let (paused, state) = pause_midway(request.clone(), 1024 * 1024, "payload.bin", dir.path()).await;
+    let (paused, state) =
+        pause_midway(request.clone(), 1024 * 1024, "payload.bin", dir.path()).await;
     let completed = completed_chunks(&state);
     assert!(
         !completed.is_empty(),
@@ -249,15 +301,11 @@ async fn resume_only_downloads_missing_chunks() {
         .len();
     assert_eq!(part_len, total);
 
-    let before = server.stats();
+    let before = settled_stats(&server).await;
     let resumed = download(request, None).await.expect("resume download");
-    let after = server.stats();
+    let after = settled_stats(&server).await;
 
-    assert_eq!(
-        std::fs::read(&resumed.path).unwrap(),
-        server.content(),
-        "resumed payload differs"
-    );
+    assert_payload_eq(&resumed.path, &server.content(), "resumed");
     assert_eq!(resumed.resumed_chunks, completed.len() as u64);
     assert!(resumed.range_supported);
 
@@ -272,7 +320,8 @@ async fn resume_only_downloads_missing_chunks() {
     let new_ranges = &after.range_headers[before.range_headers.len()..];
     let expected_missing_chunks = total.div_ceil(chunk_size) - completed.len() as u64;
     assert_eq!(
-        new_ranges.len() as u64, expected_missing_chunks,
+        new_ranges.len() as u64,
+        expected_missing_chunks,
         "expected exactly one range request per missing chunk"
     );
     for raw in new_ranges {
@@ -303,15 +352,18 @@ async fn etag_change_invalidates_resume() {
     request.file_name = Some("payload.bin".to_string());
     request.chunk_size = Some(chunk_size);
 
-    let (paused, state) = pause_midway(request.clone(), 1024 * 1024, "payload.bin", dir.path()).await;
+    let (paused, state) =
+        pause_midway(request.clone(), 1024 * 1024, "payload.bin", dir.path()).await;
     assert!(!completed_chunks(&state).is_empty());
 
     // The file "changed" on the server between the two runs.
     server.set_etag(Some("\"v2\"")).await;
 
-    let before = server.stats();
-    let resumed = download(request, None).await.expect("restart after ETag change");
-    let after = server.stats();
+    let before = settled_stats(&server).await;
+    let resumed = download(request, None)
+        .await
+        .expect("restart after ETag change");
+    let after = settled_stats(&server).await;
 
     assert_eq!(resumed.resumed_chunks, 0, "resume must be discarded");
     assert_eq!(std::fs::read(&resumed.path).unwrap(), server.content());
@@ -334,18 +386,20 @@ async fn etag_change_invalidates_resume() {
 }
 
 // ---------------------------------------------------------------------------
-// §3.6.5 — checksum mismatch: error, no rename
+// §3.6.5 — checksum mismatch: error, no rename, no leftover corrupt payload
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn checksum_mismatch_does_not_rename() {
+async fn checksum_mismatch_leaves_no_files() {
     let server = TestServer::start(Config::new(512 * 1024)).await.unwrap();
     let dir = TempDir::new("checksum");
     let mut request = request_for(&server, dir.path(), 4);
     request.file_name = Some("checksum.bin".to_string());
     request.expected_sha256 = Some("0".repeat(64));
 
-    let error = download(request, None).await.expect_err("checksum must fail");
+    let error = download(request, None)
+        .await
+        .expect_err("checksum must fail");
     match &error {
         DownloadError::ChecksumMismatch { expected, actual } => {
             assert_eq!(expected, &"0".repeat(64));
@@ -357,12 +411,21 @@ async fn checksum_mismatch_does_not_rename() {
     let target = dir.path().join("checksum.bin");
     assert!(!target.exists(), "mismatched payload must not be renamed");
     assert!(
-        dir.path().join("checksum.bin.part").exists(),
-        "payload kept for diagnosis"
+        !dir.path().join("checksum.bin.part").exists(),
+        "corrupt payload must be deleted, not left looking complete"
     );
     assert!(
         !dir.path().join("checksum.bin.part.json").exists(),
         "corrupt file must not leave a 'complete' resume state"
+    );
+    // Nothing else may linger in the output directory either.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "checksum failure should leave no files behind, found {leftovers:?}"
     );
     server.shutdown().await;
 }
@@ -382,7 +445,9 @@ async fn concurrency_beats_single_connection() {
     let single_dir = TempDir::new("speed-single");
     let single_request = request_for(&server, single_dir.path(), 1);
     let started = Instant::now();
-    let single = download(single_request, None).await.expect("single download");
+    let single = download(single_request, None)
+        .await
+        .expect("single download");
     let single_elapsed = started.elapsed();
 
     let multi_dir = TempDir::new("speed-multi");
@@ -391,14 +456,12 @@ async fn concurrency_beats_single_connection() {
     let multi = download(multi_request, None).await.expect("multi download");
     let multi_elapsed = started.elapsed();
 
-    assert_eq!(std::fs::read(&single.path).unwrap(), server.content());
-    assert_eq!(std::fs::read(&multi.path).unwrap(), server.content());
+    assert_payload_eq(&single.path, &server.content(), "single");
+    assert_payload_eq(&multi.path, &server.content(), "multi");
     assert_eq!(single.connections, 1);
     assert_eq!(multi.connections, 8);
 
-    eprintln!(
-        "concurrency: 1 connection = {single_elapsed:?}, 8 connections = {multi_elapsed:?}"
-    );
+    eprintln!("concurrency: 1 connection = {single_elapsed:?}, 8 connections = {multi_elapsed:?}");
     // Wide threshold to stay robust on a busy CI machine; expected ratio ~5-8x.
     assert!(
         multi_elapsed.as_secs_f64() * 1.8 < single_elapsed.as_secs_f64(),
@@ -425,7 +488,7 @@ async fn retries_429_with_retry_after() {
     let summary = download_with_handle(request, Some(tx), DownloadHandle::new())
         .await
         .expect("download should recover from 429");
-    assert_eq!(std::fs::read(&summary.path).unwrap(), server.content());
+    assert_payload_eq(&summary.path, &server.content(), "payload");
 
     let mut retries = 0u32;
     let mut retry_reason = String::new();
@@ -455,12 +518,12 @@ async fn retries_429_with_retry_after() {
 
 #[tokio::test]
 async fn content_disposition_filename_is_used() {
-    let server = TestServer::start(
-        Config::new(2048)
-            .with_content_disposition("attachment; filename*=UTF-8''%E4%B8%AD%E6%96%87%20payload.bin"),
-    )
-    .await
-    .unwrap();
+    let server =
+        TestServer::start(Config::new(2048).with_content_disposition(
+            "attachment; filename*=UTF-8''%E4%B8%AD%E6%96%87%20payload.bin",
+        ))
+        .await
+        .unwrap();
     let dir = TempDir::new("filename");
     let request = request_for(&server, dir.path(), 1);
 
@@ -472,7 +535,7 @@ async fn content_disposition_filename_is_used() {
         .to_string_lossy()
         .into_owned();
     assert_eq!(name, "中文 payload.bin");
-    assert_eq!(std::fs::read(&summary.path).unwrap(), server.content());
+    assert_payload_eq(&summary.path, &server.content(), "payload");
     server.shutdown().await;
 }
 
@@ -491,10 +554,12 @@ async fn global_rate_limit_is_respected() {
     request.speed_limit_bps = Some(limit);
 
     let started = Instant::now();
-    let summary = download(request, None).await.expect("rate limited download");
+    let summary = download(request, None)
+        .await
+        .expect("rate limited download");
     let elapsed = started.elapsed();
 
-    assert_eq!(std::fs::read(&summary.path).unwrap(), server.content());
+    assert_payload_eq(&summary.path, &server.content(), "payload");
     // Loose upper bound (1.5x) as allowed by the architecture checklist.
     assert!(
         summary.avg_speed_bps <= limit as f64 * 1.5,
@@ -571,7 +636,7 @@ async fn probe_falls_back_to_ranged_get_without_accept_ranges() {
     let summary = download(request_for(&server, dir.path(), 4), None)
         .await
         .expect("chunked download after GET fallback");
-    assert_eq!(std::fs::read(&summary.path).unwrap(), server.content());
+    assert_payload_eq(&summary.path, &server.content(), "payload");
     assert!(summary.range_supported);
     server.shutdown().await;
 }
@@ -593,6 +658,6 @@ async fn unknown_length_uses_single_stream() {
     assert!(!summary.range_supported);
     assert_eq!(summary.connections, 1);
     assert_eq!(summary.total_bytes, total);
-    assert_eq!(std::fs::read(&summary.path).unwrap(), server.content());
+    assert_payload_eq(&summary.path, &server.content(), "payload");
     server.shutdown().await;
 }

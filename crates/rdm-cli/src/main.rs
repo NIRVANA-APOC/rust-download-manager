@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use rdm_core::{
-    DownloadError, DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary, RemoteMeta,
-};
+use rdm_core::{DownloadEvent, DownloadHandle, DownloadRequest, RemoteMeta};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -359,7 +357,12 @@ impl EventPrinter {
     }
 
     fn emit_json(&self, event: &DownloadEvent) {
-        if self.quiet && matches!(event, DownloadEvent::Progress { .. } | DownloadEvent::Retrying { .. }) {
+        if self.quiet
+            && matches!(
+                event,
+                DownloadEvent::Progress { .. } | DownloadEvent::Retrying { .. }
+            )
+        {
             return;
         }
         let value = match event {
@@ -489,7 +492,9 @@ impl EventPrinter {
             } => {
                 if !self.quiet {
                     self.clear_progress();
-                    eprintln!("retrying chunk {chunk} (attempt {attempt}) in {delay_ms} ms: {reason}");
+                    eprintln!(
+                        "retrying chunk {chunk} (attempt {attempt}) in {delay_ms} ms: {reason}"
+                    );
                 }
             }
             DownloadEvent::Completed { summary } => {
@@ -497,7 +502,7 @@ impl EventPrinter {
                 self.completed_printed = true;
                 let seconds = summary.elapsed_ms as f64 / 1000.0;
                 println!(
-                    "saved {} ({} in {seconds:.2}s, {}/s, {} connection(s){})",
+                    "saved {} ({} in {seconds:.2}s, {}, {} connection(s){})",
                     summary.path.display(),
                     format_bytes(summary.total_bytes),
                     format_speed(summary.avg_speed_bps),
@@ -543,7 +548,7 @@ impl EventPrinter {
             let _ = std::io::stdout().flush();
             self.progress_width = line.chars().count();
             self.progress_visible = true;
-        } else if self.progress_ticks % 4 == 0 {
+        } else if self.progress_ticks.is_multiple_of(4) {
             println!("{line}");
         }
     }
@@ -590,7 +595,12 @@ fn format_eta(eta_secs: Option<f64>) -> String {
         Some(seconds) if seconds.is_finite() => {
             let seconds = seconds.max(0.0).round() as u64;
             if seconds >= 3600 {
-                format!("{:02}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+                format!(
+                    "{:02}:{:02}:{:02}",
+                    seconds / 3600,
+                    (seconds % 3600) / 60,
+                    seconds % 60
+                )
             } else {
                 format!("{:02}:{:02}", seconds / 60, seconds % 60)
             }

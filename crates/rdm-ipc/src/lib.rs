@@ -29,16 +29,31 @@ pub struct IpcInfo {
 }
 
 /// Everything the browser (or CLI) can ask the GUI to do.
+///
+/// `Enqueue` carries a full `DownloadRequest`; boxing it would ripple through
+/// every constructor in the GUI/native host for a negligible saving, so the
+/// large-variant lint is explicitly allowed here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
     Ping,
-    Enqueue { item: EnqueueItem },
+    Enqueue {
+        item: EnqueueItem,
+    },
     Status,
-    Pause { id: String },
-    Resume { id: String },
-    Cancel { id: String },
-    OpenFolder { id: String },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Cancel {
+        id: String,
+    },
+    OpenFolder {
+        id: String,
+    },
     /// Bring the main window to front.
     Activate,
 }
@@ -146,8 +161,7 @@ pub fn write_info(info: &IpcInfo) -> Result<(), IpcError> {
     std::fs::create_dir_all(&dir)?;
     let path = info_path();
     let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(info)
-        .map_err(|e| IpcError::Protocol(e.to_string()))?;
+    let text = serde_json::to_string_pretty(info).map_err(|e| IpcError::Protocol(e.to_string()))?;
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
@@ -169,11 +183,8 @@ pub fn is_gui_alive() -> bool {
 /// process, no async runtime needed).
 pub fn send(request: Request, timeout: Duration) -> Result<Response, IpcError> {
     let info = read_info()?;
-    let mut stream = TcpStream::connect_timeout(
-        &([127, 0, 0, 1], info.port).into(),
-        timeout,
-    )
-    .map_err(|_| IpcError::NotRunning("connection to RDM GUI failed".into()))?;
+    let mut stream = TcpStream::connect_timeout(&([127, 0, 0, 1], info.port).into(), timeout)
+        .map_err(|_| IpcError::NotRunning("connection to RDM GUI failed".into()))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
@@ -183,8 +194,8 @@ pub fn send(request: Request, timeout: Duration) -> Result<Response, IpcError> {
         token: Some(info.token.clone()),
         request,
     };
-    let mut line = serde_json::to_string(&envelope)
-        .map_err(|e| IpcError::Protocol(e.to_string()))?;
+    let mut line =
+        serde_json::to_string(&envelope).map_err(|e| IpcError::Protocol(e.to_string()))?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()?;

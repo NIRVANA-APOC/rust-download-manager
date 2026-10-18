@@ -13,13 +13,13 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rdm_ipc::{Envelope, IpcInfo, Response};
+use rdm_ipc::{Envelope, IpcInfo, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::engine::EngineMsg;
-use crate::model::{DownloadItem, active_count, global_speed_bps};
+use crate::model::{active_count, global_speed_bps, DownloadItem};
 
 /// 单连接读/写超时（与协议文档一致：5s）。
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -131,14 +131,10 @@ pub async fn handle_connection(
         }
     }
 
-    let envelope = match serde_json::from_str::<Envelope>(line.trim()) {
+    let envelope = match parse_envelope(&line) {
         Ok(envelope) => envelope,
         Err(err) => {
-            write_response(
-                &mut write_half,
-                &Response::error(0, format!("invalid_request: {err}")),
-            )
-            .await?;
+            write_response(&mut write_half, &Response::error(0, err)).await?;
             return Ok(());
         }
     };
@@ -154,7 +150,13 @@ pub async fn handle_connection(
 
     let request_id = envelope.id;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if tx.send(EngineMsg::Ipc { envelope, reply: reply_tx }).is_err() {
+    if tx
+        .send(EngineMsg::Ipc {
+            envelope,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
         write_response(
             &mut write_half,
             &Response::error(request_id, "internal: gui is shutting down"),
@@ -170,6 +172,82 @@ pub async fn handle_connection(
     };
     write_response(&mut write_half, &response).await?;
     Ok(())
+}
+
+/// 解析一行 `Envelope` JSON。
+///
+/// 注意 `rdm_ipc::Envelope` 的线格式有一个坑：`#[serde(flatten)]` 的
+/// `Request::Pause { id }` 等控制方法与 `Envelope.id`（u64）**都叫 `id`**，
+/// 序列化后是 `{"id":4,"token":"..","method":"pause","id":"dl_01"}` 这种重复键；
+/// serde flatten 反序列化会因类型冲突失败。这里对控制方法做宽容解析：
+/// 从原文取第一个数字 `id` 作为信封 id，从 JSON 对象取（最后出现的）字符串
+/// `id` 作为 download id，再手工构造 `Envelope`。
+pub fn parse_envelope(line: &str) -> Result<Envelope, String> {
+    let line = line.trim();
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|err| format!("invalid_request: {err}"))?;
+    let method = value
+        .get("method")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "invalid_request: missing method".to_string())?;
+    let token = value
+        .get("token")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+
+    if matches!(method, "pause" | "resume" | "cancel" | "open_folder") {
+        let download_id = value
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "invalid_request: missing download id".to_string())?
+            .to_string();
+        let envelope_id = first_numeric_id(line).unwrap_or(0);
+        let request = match method {
+            "pause" => Request::Pause { id: download_id },
+            "resume" => Request::Resume { id: download_id },
+            "cancel" => Request::Cancel { id: download_id },
+            _ => Request::OpenFolder { id: download_id },
+        };
+        return Ok(Envelope {
+            id: envelope_id,
+            token,
+            request,
+        });
+    }
+
+    serde_json::from_str::<Envelope>(line).map_err(|err| format!("invalid_request: {err}"))
+}
+
+/// 在原始 JSON 行里找第一个 `"id": <数字>`（控制方法的外层信封 id）。
+fn first_numeric_id(line: &str) -> Option<u64> {
+    let bytes = line.as_bytes();
+    let needle = b"\"id\"";
+    let mut search_from = 0usize;
+    while search_from + needle.len() <= bytes.len() {
+        let window = &bytes[search_from..];
+        let position = window
+            .windows(needle.len())
+            .position(|part| part == needle)?;
+        let mut index = search_from + position + needle.len();
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < bytes.len() && bytes[index] == b':' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let digits_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if index > digits_start {
+                return line[digits_start..index].parse::<u64>().ok();
+            }
+        }
+        search_from += position + 1;
+    }
+    None
 }
 
 fn authorized(envelope: &Envelope, expected: &str) -> bool {
@@ -234,7 +312,7 @@ pub fn enqueue_payload(download_id: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DownloadItem, ItemState, next_download_id};
+    use crate::model::{next_download_id, DownloadItem, ItemState};
     use rdm_core::DownloadRequest;
     use rdm_ipc::Request;
 
@@ -270,12 +348,108 @@ mod tests {
     #[test]
     fn parses_envelopes() {
         let line = r#"{"id":7,"token":"t","method":"ping"}"#;
-        let envelope: Envelope = serde_json::from_str(line).unwrap();
+        let envelope = parse_envelope(line).unwrap();
         assert_eq!(envelope.id, 7);
         assert!(matches!(envelope.request, Request::Ping));
 
-        let bad = serde_json::from_str::<Envelope>("not json");
-        assert!(bad.is_err());
+        assert!(parse_envelope("not json").is_err());
+        assert!(parse_envelope(r#"{"token":"t","method":"ping"}"#).is_err());
+    }
+
+    #[test]
+    fn parses_real_rdm_ipc_envelope_serialization() {
+        // 用 rdm_ipc 自身的 Envelope 序列化，确认 parse_envelope 能还原（含重复 id）。
+        for request in [
+            Request::Pause {
+                id: "dl_000009".into(),
+            },
+            Request::Resume {
+                id: "dl_000009".into(),
+            },
+            Request::Cancel {
+                id: "dl_000009".into(),
+            },
+            Request::OpenFolder {
+                id: "dl_000009".into(),
+            },
+            Request::Ping,
+            Request::Status,
+            Request::Activate,
+        ] {
+            let envelope = Envelope {
+                id: 9,
+                token: Some("tok".into()),
+                request,
+            };
+            let line = serde_json::to_string(&envelope).unwrap();
+            let parsed =
+                parse_envelope(&line).unwrap_or_else(|err| panic!("解析 {line} 失败: {err}"));
+            assert_eq!(parsed.id, 9, "line={line}");
+            assert_eq!(parsed.token.as_deref(), Some("tok"));
+        }
+    }
+
+    #[test]
+    fn parses_control_methods_with_duplicate_id_keys() {
+        // 与 rdm_ipc::Envelope 的实际线格式一致：外层 id 数字 + 内层 download id 字符串，
+        // 序列化后是重复的 "id" 键（详见 parse_envelope 文档注释）。
+        let cases = [
+            (
+                "pause",
+                r#"{"id":4,"token":"tok","method":"pause","id":"dl_01"}"#,
+            ),
+            (
+                "resume",
+                r#"{"id":5,"token":"tok","method":"resume","id":"dl_02"}"#,
+            ),
+            (
+                "cancel",
+                r#"{"id":6,"token":"tok","method":"cancel","id":"dl_03"}"#,
+            ),
+            (
+                "open_folder",
+                r#"{"id":7,"token":"tok","method":"open_folder","id":"dl_04"}"#,
+            ),
+        ];
+        for (index, (method, line)) in cases.into_iter().enumerate() {
+            let envelope =
+                parse_envelope(line).unwrap_or_else(|err| panic!("{method} 解析失败: {err}"));
+            assert_eq!(envelope.id, 4 + index as u64, "{method} 信封 id");
+            assert_eq!(envelope.token.as_deref(), Some("tok"));
+            let download_id = match envelope.request {
+                Request::Pause { id }
+                | Request::Resume { id }
+                | Request::Cancel { id }
+                | Request::OpenFolder { id } => id,
+                other => panic!("{method} 解析成了错误变体: {other:?}"),
+            };
+            assert_eq!(download_id, format!("dl_{:02}", index + 1));
+        }
+    }
+
+    #[test]
+    fn parses_enqueue_like_rdm_ipc() {
+        let line = r#"{"id":2,"token":"tok","method":"enqueue","item":{"download":{"url":"https://example.com/a.bin"},"source":"firefox","source_page":null}}"#;
+        let envelope = parse_envelope(line).unwrap();
+        assert_eq!(envelope.id, 2);
+        match envelope.request {
+            Request::Enqueue { item } => {
+                assert_eq!(item.download.url, "https://example.com/a.bin");
+                assert_eq!(item.source, "firefox");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_numeric_id_skips_string_ids() {
+        assert_eq!(first_numeric_id(r#"{"id":"dl_01"}"#), None);
+        assert_eq!(first_numeric_id(r#"{"id": 12}"#), Some(12));
+        assert_eq!(
+            first_numeric_id(r#"{"id":3,"token":"t","method":"pause","id":"dl_01"}"#),
+            Some(3)
+        );
+        assert_eq!(first_numeric_id(r#"{"token":"a\"id\":1","id":9}"#), Some(9));
     }
 
     #[test]

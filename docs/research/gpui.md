@@ -395,9 +395,12 @@ GPUI 的 foreground executor 是平台事件循环上的自定义执行器，**�
   **进程启动即退出，退出码 `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`**。
   保留该 feature 后 `embed-resource` 会把 GPUI 自带的 manifest/rc 编进 exe，
   启动正常。代价是：Windows GNU 工具链下 rustc 默认也会注入一个 manifest，
-  可能出现 `ld` 的 duplicate manifest 警告（本机已观测，不致命；Lead 正在做
-  manifest 合并/或给 rdm-gui 写 build.rs，后续若仍冲突，以「exe 能启动 + 有
-  comctl32 v6 声明」为准）。
+  `ld` 会报 `.rsrc merge failure: multiple non-default manifests`（不致命但噪音大）。
+  **最终解法**：`crates/rdm-gui/build.rs` 里加 windows-gnu 专用 workaround——
+  在 `OUT_DIR` 生成空的 `default-manifest.o`，通过
+  `cargo:rustc-link-arg=-B<shadow-dir>` 覆盖 MinGW 自动链接的默认 manifest，
+  让 GPUI 的 comctl32 v6 manifest 成为唯一资源。现在 `cargo build -p rdm-gui`
+  无 ld 警告、双击可启动（Lead 已验证）。
 
 ### 10.2 Debug 构建：运行时编译 HLSL
 
@@ -499,8 +502,27 @@ let shader_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 
 UI 状态机（下载行）：`Paused/Downloading/Completed/Failed/Cancelled`；
 过滤「失败」包含 `Failed + Cancelled`；`DownloadError::Paused/Cancelled` 映射为控制流；
-`run_id` 丢弃迟到事件。单测覆盖格式化、过滤、状态迁移、持久化 roundtrip、
-spool 解析、token 格式等纯逻辑（`cargo test -p rdm-gui`）。
+`run_id` 丢弃迟到事件。暂停/取消采用「两阶段」：GUI 先记录 `StopRequest::{Pause,Cancel}`，
+状态继续保持 `Downloading`（徽章显示「暂停中/取消中」），直到引擎回报 `Paused/Cancelled`
+才迁移状态 —— 避免用户在引擎尚未停稳时点「继续」，造成新旧任务同时写同一个 `.part` 文件。
+单测覆盖格式化、过滤、状态迁移（含停止两阶段）、持久化 roundtrip、spool 解析、token 格式等纯逻辑
+（`cargo test -p rdm-gui`）。
+
+### 12.1 实现验证记录（2026-10-19，Windows 11 + Rust 1.99.1 GNU）
+
+- `cargo build -p rdm-gui` 成功；`cargo test -p rdm-gui` **48/48 通过**。
+- GPUI 运行时：窗口 1180x760（125% DPI 下 DWM 边界约 1477x989）正常出图；中文标签、
+  uniform_list 虚拟列表、进度条、canvas 速度曲线、状态栏均正常。
+- 真实下载联调（`rdm-fixture-server`，8MB/20ms 与 64MB/100ms）：
+  - enqueue → downloading（约 4 MB/s，速度/ETA/连接数更新）→ pause（引擎确认后 `paused`，
+    字节数冻结）→ resume → completed；
+  - 8MB sha256 `68F564…03AD`；64MB 断点续传后 sha256 `E5A545…F60F`；`.part/.part.json` 零残留；
+  - `rdm-gui.exe <URL>` 单实例投递（退出码 0、返回 download_id）并完成；
+  - `downloads.json` 3 条 `completed`、`next_seq=4`。
+  - 证据：`docs/evidence/rdm-gui-e2e-{downloading,paused,completed}.png` 与
+    `docs/evidence/rdm-gui-e2e.json`（30 项断言全 PASS）。
+- 已知限制：IME 未在真实输入法下逐键验证；SHA-256 开关只展示引擎返回的 hash；
+  状态栏无「磁盘写入」数据源；`explorer /select` 只做了命令构造单测，未在自动化里真实弹窗。
 
 ---
 

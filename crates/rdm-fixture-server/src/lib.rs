@@ -336,7 +336,8 @@ impl TestServer {
     }
 
     pub async fn set_etag(&self, etag: Option<&str>) {
-        self.update_config(|c| c.etag = etag.map(str::to_owned)).await;
+        self.update_config(|c| c.etag = etag.map(str::to_owned))
+            .await;
     }
 
     /// Full payload bytes for assertions, generated with the same algorithm
@@ -557,9 +558,7 @@ async fn accept_loop(
     }
     // Close the listening socket before waiting for handlers.
     drop(listener);
-    let drain = async {
-        while connections.join_next().await.is_some() {}
-    };
+    let drain = async { while connections.join_next().await.is_some() {} };
     let _ = timeout(Duration::from_secs(2), drain).await;
 }
 
@@ -778,11 +777,7 @@ async fn serve_file(
             }
         }
     };
-    let length = if status == 206 {
-        end - start + 1
-    } else {
-        size
-    };
+    let length = if status == 206 { end - start + 1 } else { size };
 
     let mut headers = common_headers;
     if status == 206 {
@@ -941,12 +936,15 @@ mod tests {
 
     #[test]
     fn content_is_deterministic_and_block_aligned() {
-        let a = content_bytes(1000, 7);
-        let b = content_bytes(1000, 7);
+        let size = CONTENT_BLOCK_SIZE as u64 + 8;
+        let a = content_bytes(size, 7);
+        let b = content_bytes(size, 7);
         assert_eq!(a, b);
-        assert_ne!(a, content_bytes(1000, 8));
+        assert_ne!(a, content_bytes(size, 8));
         let block = content_block(7);
         assert_eq!(&a[..256], &block[..256]);
+        // The second block restarts the pattern (content is block-periodic).
         assert_eq!(&a[CONTENT_BLOCK_SIZE..CONTENT_BLOCK_SIZE + 4], &block[..4]);
+        assert_eq!(a.len() as u64, size);
     }
 }
