@@ -75,7 +75,8 @@ pub async fn download_with_handle(DownloadRequest, Option<UnboundedSender<Downlo
 - N 个 worker（`connections`，默认 8，上限 32）循环 `fetch_add` 领取下一块，
   **块级工作窃取**：慢连接只拖慢自己手上的块，不会造成固定分片方案的尾部空转。
 - 每块一次 `GET` + `Range: bytes=start-end`，校验返回 `206` 且 `Content-Range` 与请求一致；
-  流式读入 64 KiB 缓冲，用 `write_all_at(offset)` 落盘（Windows `seek_write` / Unix `FileExt` 抽象）。
+  流式读取 `response.chunk()`（异步网络块，不假设固定大小），每个块检查暂停/取消标志，
+  用 `tokio::fs::File` 的 `seek + write_all` 落盘（每 worker 独立文件句柄，`AsyncSeekExt`）。
 - 单块失败：指数退避 + 抖动重试（默认 6 次，1s→32s 上限，`Retry-After` 优先）。
   连续失败且已有块完成 → 保留 `.part`，返回错误，可恢复。
 - 服务器返回 `200`（忽略 Range）时：终止分块，降级为单连接从头下载（覆盖写），
@@ -119,7 +120,7 @@ pub async fn download_with_handle(DownloadRequest, Option<UnboundedSender<Downlo
   多连接共享同一预算（不是每连接限速）。
 - 进度：原子计数（下载字节、活跃 worker、完成块）；单独 reporter 任务每 250ms
   计算滑动窗口速度（EWMA）与 ETA，推 `DownloadEvent::Progress`。
-- 取消：worker 在每 64 KiB 读循环检查 `handle.is_cancelled()/is_paused()`；CancellationToken
+- 取消：worker 在每个网络块之间检查 `handle.is_cancelled()/is_paused()`；CancellationToken
   + 原子标志双保险。停止前 flush 状态。
 
 ### 3.6 正确性/健壮性清单（必须有测试）

@@ -2,6 +2,10 @@
 
 > 纯 Rust 实现的多连接下载器：**GPUI** 桌面端 + Firefox 接管扩展 + 可复现的本地基准。
 > 不套壳 aria2、不依赖 Electron；把「分段下载的正确性、可观测性和浏览器交接」做成可验证的工程。
+>
+> **独立验收（commit b8dfc88）**：构建 PASS，**140/140 测试通过**，`cargo fmt --check` 干净，
+> 引擎行为 7/7、GUI e2e 22/22、1 vs 8 连接 **7.77x**（64MiB release 5 次中位）。
+> 报告：[docs/qa-report.md](docs/qa-report.md)。
 
 ![RDM GUI](docs/evidence/rdm-gui-final.png)
 
@@ -81,7 +85,7 @@ RDM 真正可辩护的是下面四条（逐条对应验证方式）：
 |---|---|---|---|---|
 | 1 | **可复现的正确性**：fixture 故障注入矩阵 + 字节级断言 | 竞品普遍缺故障矩阵，静默损坏/卡死无法复现 | 12 项集成测试（200 降级、ETag 变化、resume 字节 delta、checksum 零残留、429、无长度单流…） | ✅ 已实现并通过 |
 | 2 | **无外部进程的原生栈**：纯 Rust 引擎 + GPUI，无 Electron/CEF、无 aria2 子进程 | 体积/内存/启动/供应链/攻击面 | 产物与进程数可审计；QA 实测 GUI 启动到可交互 ~378ms、空载 WorkingSet 69.1MB、单进程（debug 构建） | ✅ 已实现，release 数据待补 |
-| 3 | **Firefox-first 完整链路**：MV3 扩展 + native host + IPC + 离线 spool | Chromium-first 是红海；Firefox 侧 DTA 已放弃多线程、uGet 半停滞 | `web-ext lint` 0 error、19 项 JS 测试、47+5 项 Rust 测试、headless Firefox 临时加载、安装脚本实测 | ✅ 已实现（真实接管需人工验证） |
+| 3 | **Firefox-first 完整链路**：MV3 扩展 + native host + IPC + 离线 spool | Chromium-first 是红海；Firefox 侧 DTA 已放弃多线程、uGet 半停滞 | `web-ext lint` 0 error、20 项 JS 测试、53+5 项 Rust 测试、headless Firefox 临时加载、native→真实 GUI e2e、安装脚本实测 | ✅ 已实现（真实接管需人工验证） |
 | 4 | **诚实降级与限速语义**：Range 不支持时明确 `range_supported=false`；限速是全局的；256KiB 块级工作窃取 | "假装多线程"与"每连接限速"是常见坑 | 200 降级测试、全局限速测试（实测 1.10x 配置值）、1 vs 8 基准 | ✅ 已实现并通过 |
 
 > 不宣传：任何"比 aria2 快"、"企业级安全"、"全平台已支持"的说法。RDM 目前只验证了
@@ -101,6 +105,10 @@ RDM 真正可辩护的是下面四条（逐条对应验证方式）：
 
 **加速比中位 ≈ 7.5x**；单连接与 8 连接产出的文件 SHA-256 完全一致（`http_version` 均为
 `HTTP/1.1`，即真实多 TCP 连接而非 h2 复用）。
+
+> 独立验收（QA，release 构建，commit b8dfc88）：64 MiB / 每 256 KiB 20 ms / 5 次中位，
+> CLI **7,972 ms → 1,026 ms = 7.77x**；240 个 206 响应全部 HTTP/1.1；所有运行 SHA-256 一致。
+> 两套数字配置不同，只用于证明量级与可复现性。
 
 其他已验证行为：
 
@@ -156,8 +164,8 @@ powershell -ExecutionPolicy Bypass -File scripts/install-firefox-host.ps1
 
 - 扩展默认接管普通 http(s) 下载：观察 `webRequest` 头 → `downloads.onCreated` →
   `cancel/erase` → 经 native messaging 交给 RDM；保留 Cookie/Referer/UA/Content-Disposition。
-- GUI 未运行时会自动拉起（8s 轮询）；仍失败则落 spool 队列（**剥离 Cookie/Authorization**，
-  响应 `credentials_stripped: true`），下次 GUI 启动自动入队。
+- GUI 未运行时会自动拉起（8s 超时、每 200ms 轮询）；仍失败则落 spool 队列（**剥离
+  Cookie/Authorization**，响应 `credentials_stripped: true`），下次 GUI 启动自动入队。
 - 失败回退浏览器原生下载并防循环；右键菜单可手动「使用 RDM 下载」。
 - 上架 AMO 前需处理签名、`data_collection_permissions` 与开发文件排除（见扩展 README）。
 
@@ -194,7 +202,7 @@ Firefox MV3 ──native messaging──► rdm-native ──JSONL+token──�
 ```powershell
 cargo test -p rdm-core          # 18 单元 + 12 集成（fixture 故障矩阵）
 cargo test -p rdm-ipc -p rdm-native -p rdm-gui
-node --test extension/firefox/test/     # 19 项 JS 测试
+node --test "extension/firefox/test/*.test.js"     # 20 项 JS 测试
 npx web-ext lint --source-dir extension/firefox
 ```
 
@@ -205,6 +213,9 @@ npx web-ext lint --source-dir extension/firefox
   pause/resume/cancel、单实例 URL 投递、截图证据。
 - 浏览器侧：53+5 项 Rust 测试、20 项 JS 测试、`web-ext lint` 0 errors / 0 warnings；
   native host → 真实 GUI 端到端 PASS（自动拉起 542ms、8MiB 下载、SHA-256 一致、日志脱敏）。
+- 独立验收（commit b8dfc88）：**140/140 测试通过**，`cargo fmt --check` 0 diff，
+  clippy 0 error/0 warning；引擎 release 行为 7/7、GUI e2e 22/22。详见
+  [docs/qa-report.md](docs/qa-report.md)。
 - 独立验收报告：[docs/qa-report.md](docs/qa-report.md)（QA 独立构建/基准/e2e/文档审计）。
 
 ## 10 · 目录结构
