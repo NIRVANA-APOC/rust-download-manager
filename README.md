@@ -8,10 +8,12 @@
 > 引擎行为 7/7、GUI e2e 22/22、1 vs 8 连接 **7.77x**（64MiB release 5 次中位）。
 > 报告：[docs/qa-report.md](docs/qa-report.md)。
 >
-> **Agent 接口（commit 修复版）**：MCP stdio server（legacy + modern discover）、16 工具、
-> CLI JSON 信封、SKILL；本机 `cargo test --workspace` **277 passed / 0 failed**，
-> MCP stdio e2e **177 assertions / 0 failures**，`rdm selftest` 4/4、`rdm bench` 1→8 连接
-> 8MiB **5.75x**（SHA 一致）。契约：[docs/agent-integration.md](docs/agent-integration.md)，
+> **Agent 接口（commit 5cd4ac1）**：MCP stdio server（legacy + modern discover）、16 工具、
+> CLI JSON 信封、SKILL；**QA 独立验收 292/292 checks PASS**（`docs/qa-report-agent.md`），
+> 本机 `cargo test --workspace` **277 passed / 0 failed**，MCP stdio e2e **177 assertions**，
+> `rdm selftest` 4/4、`rdm bench`（8MiB / 每 256KiB 20ms 本地 fixture，仅演示）1→8 连接
+> **5.75x**，SHA 一致；与 §05 的 32/64MiB 基准口径不同，不可横向相加。
+> 契约：[docs/agent-integration.md](docs/agent-integration.md)，
 > SKILL：[skills/rdm/SKILL.md](skills/rdm/SKILL.md)。
 
 ![RDM GUI](docs/evidence/rdm-gui-final.png)
@@ -291,7 +293,8 @@ npx web-ext lint --source-dir extension/firefox
   `rdm-agent/rdm-mcp/rdm-cli` clippy 0 warning。
 - 独立验收（commit b8dfc88）：**140/140 测试通过**，`cargo fmt --check` 0 diff，
   clippy 0 error/0 warning；引擎 release 行为 7/7、GUI e2e 22/22。详见
-  [docs/qa-report.md](docs/qa-report.md)；agent 接口验收见 `docs/qa-report-agent.md`（单独 QA）。
+  [docs/qa-report.md](docs/qa-report.md)；agent 接口独立验收 **292/292 PASS** 见
+  [docs/qa-report-agent.md](docs/qa-report-agent.md)。
 
 ## 11 · 目录结构
 

@@ -16,7 +16,7 @@ description: 使用 RDM（多连接下载管理器）可靠地下载文件、批
    - 小文件（≤ 策略审批阈值）→ `rdm_download {url, wait:true, expected_sha256?}` → 拿 `task_id`、`path`、`sha256`。
    - 大文件/需要先确认 → `rdm_plan_download {url}` → 若 `approval_required`，拿 `plan_id`+`approval_token` → `rdm_apply_plan`。
 3. 不要轮询 `rdm_get_task`。等待用 `rdm_wait_task`（可带 `_meta.progressToken` 收进度）。
-4. 下载完成后 → `rdm_verify_file {task_id, expected_sha256}`；失败 → 读 `error.code/retryable/hint` 再决定重试/恢复/放弃。
+4. 下载完成后 → `rdm_verify_file {task_id, expected_sha256}`（MCP）；CLI 路径没有 verify 子命令，用系统 `Get-FileHash`/`sha256sum` 校验；失败 → 读 `error.code/retryable/hint` 再决定重试/恢复/放弃。
 5. 进程重启/任务丢失 → `rdm_list_tasks` 找 `task_id`；暂停/取消的任务 → `rdm_resume_task`。
 6. 环境异常/网络异常 → `rdm_doctor`；状态目录疑似损坏 → `rdm_state_maintenance`（默认 dry-run）。
 
@@ -117,7 +117,7 @@ rdm state repair --dry-run --output json
 ```
 
 > CLI JSON 信封字段见 `docs/agent-integration.md` §2（`schema_version/ok/command/task_id/data/error/meta`）。
-> 退出码：0 成功，2 失败，3 被中断/暂停。
+> 退出码：0 成功，2 失败（含 invalid_url/invalid_request），3 被中断/暂停，4 policy_denied/needs_approval/conflict（未执行）。
 
 ## 4. 策略、安全与审批（默认值）
 
@@ -178,7 +178,7 @@ rdm state repair --dry-run --output json
 - [ ] 调过 `rdm_capabilities`（或 CLI `capabilities`），知道 allowed_dirs/审批阈值。
 - [ ] 下载前 `rdm_probe` 或 `rdm_plan_download`（至少拿到总大小/文件名）。
 - [ ] 用 `wait:true` 或 `rdm_wait_task` 等待，未用轮询。
-- [ ] 完成后 `rdm_verify_file`（有 expected_sha256 时 match 必须 true）。
+- [ ] 完成后校验 SHA-256（MCP：`rdm_verify_file`；CLI：系统 `Get-FileHash`/`sha256sum`；有 expected_sha256 时 match 必须 true）。
 - [ ] 返回给用户的路径/大小/`task_id` 来自工具输出，不编造。
 - [ ] 失败时给出 `error.code` + `retryable` + 下一步动作，而不是笼统"下载失败"。
 - [ ] 不声称未验证的能力（真实公网大文件、非 http(s)、release/GUI 接管等）。
