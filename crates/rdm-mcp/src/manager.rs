@@ -53,6 +53,12 @@ struct Inner {
     policy: Policy,
     entries: Mutex<HashMap<String, Arc<TaskEntry>>>,
     notifier: Mutex<Option<NotifyFn>>,
+    /// In-memory `idempotency_key -> task_id` index. Consulted before the
+    /// on-disk scan so two near-simultaneous calls cannot create two tasks
+    /// while the first record is still being written/returned.
+    idempotency_index: Mutex<HashMap<String, String>>,
+    /// Serializes idempotency check + record creation so the winner is unique.
+    idempotency_lock: Mutex<()>,
 }
 
 struct TaskEntry {
@@ -122,6 +128,8 @@ impl TaskManager {
                 policy: policy.normalized(),
                 entries: Mutex::new(HashMap::new()),
                 notifier: Mutex::new(None),
+                idempotency_index: Mutex::new(HashMap::new()),
+                idempotency_lock: Mutex::new(()),
             }),
         }
     }
@@ -181,11 +189,45 @@ impl TaskManager {
         self.inner.store.get(id).is_ok()
     }
 
+    /// Look up a task by idempotency key: in-memory index first (a task whose
+    /// record is still being created is already visible), then the durable
+    /// store (cross-process / restart), backfilling the index on a hit.
     pub fn find_by_idempotency(&self, key: &str) -> Result<Option<TaskRecord>, AgentErrorInfo> {
-        self.inner
+        if let Some(task_id) = self
+            .inner
+            .idempotency_index
+            .lock()
+            .expect("idempotency index poisoned")
+            .get(key)
+            .cloned()
+        {
+            match self.inner.store.get(&task_id) {
+                Ok(record) => return Ok(Some(record)),
+                Err(_) => {
+                    // Stale index entry (record deleted/never written): drop it.
+                    self.inner
+                        .idempotency_index
+                        .lock()
+                        .expect("idempotency index poisoned")
+                        .remove(key);
+                }
+            }
+        }
+        let found = self
+            .inner
             .store
             .find_by_idempotency_key(key)
-            .map_err(store_error)
+            .map_err(store_error)?;
+        if let Some(record) = &found {
+            self.inner
+                .idempotency_index
+                .lock()
+                .expect("idempotency index poisoned")
+                .insert(key.to_string(), record.id.clone());
+            // The caller only needs a snapshot; hand out the durable record.
+            return Ok(Some(record.clone()));
+        }
+        Ok(None)
     }
 
     pub fn save_plan(&self, plan: &DownloadPlan) -> Result<(), AgentErrorInfo> {
@@ -225,6 +267,14 @@ impl TaskManager {
         idempotency_key: Option<String>,
         warnings: Vec<String>,
     ) -> Result<TaskRecord, AgentErrorInfo> {
+        // Serialize check-then-create so concurrent calls with the same
+        // idempotency key always converge on one task, even when both callers
+        // ran their probe/policy checks before either record existed.
+        let _idempotency_guard = self
+            .inner
+            .idempotency_lock
+            .lock()
+            .expect("idempotency lock poisoned");
         if let Some(key) = idempotency_key.as_deref() {
             if let Some(existing) = self.find_by_idempotency(key)? {
                 return Ok(existing);
@@ -237,12 +287,21 @@ impl TaskManager {
         record.total_bytes = total_bytes;
         record.range_supported = range_supported;
         record.http_version = http_version;
-        record.idempotency_key = idempotency_key;
+        record.idempotency_key = idempotency_key.clone();
         record.warnings = warnings;
         record.connections = record.request.connections.max(1);
         record.chunk_size = record.request.chunk_size;
         let entry = Arc::new(TaskEntry::new());
         self.inner.store.create(&record).map_err(store_error)?;
+        // Publish the id -> index mapping immediately after the durable write
+        // and before returning/spawning, so a concurrent/next call reuses it.
+        if let Some(key) = idempotency_key.as_deref() {
+            self.inner
+                .idempotency_index
+                .lock()
+                .expect("idempotency index poisoned")
+                .insert(key.to_string(), record.id.clone());
+        }
         self.append_event(
             &record,
             1,
@@ -667,6 +726,10 @@ async fn run_worker(inner: Arc<Inner>, mut record: TaskRecord, entry: Arc<TaskEn
     let mut last_progress_event = Instant::now();
     let mut metadata_seen = false;
     let mut rx_open = true;
+    // High-water mark of every progress/paused observation: the engine's
+    // final Paused/Cancelled counter can roll back in-flight bytes (even to 0),
+    // but agents must still see how much was transferred before stopping.
+    let mut max_downloaded = record.downloaded_bytes;
 
     let outcome = loop {
         tokio::select! {
@@ -683,6 +746,7 @@ async fn run_worker(inner: Arc<Inner>, mut record: TaskRecord, entry: Arc<TaskEn
                             &mut last_persist,
                             &mut last_progress_event,
                             &mut metadata_seen,
+                            &mut max_downloaded,
                         );
                     }
                     None => rx_open = false,
@@ -701,9 +765,17 @@ async fn run_worker(inner: Arc<Inner>, mut record: TaskRecord, entry: Arc<TaskEn
             &mut last_persist,
             &mut last_progress_event,
             &mut metadata_seen,
+            &mut max_downloaded,
         );
     }
-    finish(&inner, &mut record, outcome, &entry, &mut next_seq);
+    finish(
+        &inner,
+        &mut record,
+        outcome,
+        &entry,
+        &mut next_seq,
+        max_downloaded,
+    );
     entry.running.store(false, Ordering::SeqCst);
 }
 
@@ -717,6 +789,7 @@ fn apply_engine_event(
     last_persist: &mut Instant,
     last_progress_event: &mut Instant,
     metadata_seen: &mut bool,
+    max_downloaded: &mut u64,
 ) {
     match event {
         DownloadEvent::Probing => {}
@@ -843,10 +916,14 @@ fn apply_engine_event(
             );
         }
         DownloadEvent::Paused { downloaded } => {
-            record.downloaded_bytes = downloaded;
+            // Never move the observable counter backwards: the engine reports
+            // completed-chunk bytes here (possibly 0), while progress events
+            // already told the agent how much was transferred.
+            record.downloaded_bytes = record.downloaded_bytes.max(downloaded);
             record.updated_at = now_iso8601();
         }
     }
+    *max_downloaded = (*max_downloaded).max(record.downloaded_bytes);
 }
 
 fn check_size_limit(inner: &Arc<Inner>, record: &TaskRecord, entry: &Arc<TaskEntry>) {
@@ -905,6 +982,7 @@ fn finish(
     outcome: Result<DownloadSummary, DownloadError>,
     entry: &Arc<TaskEntry>,
     next_seq: &mut u64,
+    max_downloaded: u64,
 ) {
     match outcome {
         Ok(summary) => {
@@ -929,8 +1007,12 @@ fn finish(
         }
         Err(DownloadError::Paused { downloaded }) => {
             record.state = TaskState::Paused;
-            let retained = retained_partial_bytes(record, downloaded);
-            record.downloaded_bytes = retained;
+            // Trust the largest of: last observed progress, the engine's
+            // counter, and the bytes actually retained in `.part.json`.
+            let trusted = retained_partial_bytes(record, downloaded)
+                .max(downloaded)
+                .max(max_downloaded);
+            record.downloaded_bytes = trusted;
             record.speed_bps = 0.0;
             record.eta_secs = None;
             record.updated_at = now_iso8601();
@@ -940,12 +1022,13 @@ fn finish(
                 record,
                 next_seq,
                 "paused",
-                json!({ "downloaded": retained }),
+                json!({ "downloaded": trusted, "retained_bytes": retained_partial_bytes(record, downloaded) }),
             );
             notify(inner, record);
         }
         Err(DownloadError::Cancelled { downloaded }) => {
-            record.downloaded_bytes = retained_partial_bytes(record, downloaded);
+            let trusted = downloaded.max(max_downloaded);
+            record.downloaded_bytes = trusted;
             if entry.overflow.load(Ordering::SeqCst) {
                 record.state = TaskState::Failed;
                 record.error = Some(
@@ -958,7 +1041,7 @@ fn finish(
                     )
                     .with_hint("Increase policy.max_bytes_per_task or download a smaller file.")
                     .with_details(json!({
-                        "downloaded_bytes": downloaded,
+                        "downloaded_bytes": trusted,
                         "max_bytes_per_task": inner.policy.max_bytes_per_task,
                     })),
                 );
@@ -971,7 +1054,7 @@ fn finish(
                     "failed",
                     json!({
                         "code": record.error.as_ref().map(|error| error.code.as_str()),
-                        "downloaded_bytes": downloaded,
+                        "downloaded_bytes": trusted,
                     }),
                 );
                 notify(inner, record);
@@ -986,7 +1069,7 @@ fn finish(
                     record,
                     next_seq,
                     "cancelled",
-                    json!({ "downloaded": downloaded }),
+                    json!({ "downloaded": trusted }),
                 );
                 notify(inner, record);
             }
@@ -1316,6 +1399,222 @@ mod tests {
         );
         let settled = wait_settled(&manager, &first.id).await;
         assert_eq!(settled.state, TaskState::Completed);
+        server.shutdown().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_idempotency_key_creates_one_task() {
+        let root = temp_root("idem-race");
+        let manager = manager_for(&root, policy_for(&root, 2));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let manager = manager.clone();
+            let root = root.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                manager
+                    .create_task(
+                        "test",
+                        DownloadRequest::new("http://127.0.0.1:9/race.bin"),
+                        root.join("downloads"),
+                        "race.bin".to_string(),
+                        Some(1024),
+                        Some(true),
+                        None,
+                        Some("race-key".to_string()),
+                        Vec::new(),
+                    )
+                    .map(|record| record.id)
+            }));
+        }
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread").expect("create_task"))
+            .collect();
+        assert_eq!(ids[0], ids[1], "same idempotency key must reuse one task");
+        let records = manager
+            .store()
+            .list(&rdm_agent::TaskFilter {
+                limit: Some(usize::MAX),
+                ..rdm_agent::TaskFilter::default()
+            })
+            .unwrap();
+        assert_eq!(records.len(), 1, "only one task may be created for the key");
+        assert_eq!(records[0].id, ids[0]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn different_idempotency_keys_create_distinct_tasks() {
+        let root = temp_root("idem-distinct");
+        let manager = manager_for(&root, policy_for(&root, 2));
+        let make = |key: &str| {
+            manager
+                .create_task(
+                    "test",
+                    DownloadRequest::new("http://127.0.0.1:9/distinct.bin"),
+                    root.join("downloads"),
+                    "distinct.bin".to_string(),
+                    Some(1024),
+                    Some(true),
+                    None,
+                    Some(key.to_string()),
+                    Vec::new(),
+                )
+                .unwrap()
+        };
+        let first = make("key-a");
+        let second = make("key-b");
+        assert_ne!(first.id, second.id);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn idempotency_retry_after_store_failure_creates_task() {
+        let root = temp_root("idem-retry");
+        std::fs::create_dir_all(root.join("downloads")).unwrap();
+        // Block the `tasks/` directory with a regular file so the first create
+        // fails inside the store; a retry after fixing the layout must work.
+        let blocker = root.join("tasks");
+        std::fs::write(&blocker, b"blocked").unwrap();
+        let manager = TaskManager::new(
+            TaskStore::new(&root),
+            tokio::runtime::Handle::current(),
+            policy_for(&root, 2),
+        );
+        let failed = manager
+            .create_task(
+                "test",
+                DownloadRequest::new("http://127.0.0.1:9/retry.bin"),
+                root.join("downloads"),
+                "retry.bin".to_string(),
+                Some(1024),
+                Some(true),
+                None,
+                Some("retry-key".to_string()),
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(failed.code, ErrorCode::Internal);
+        std::fs::remove_file(&blocker).unwrap();
+        let record = manager
+            .create_task(
+                "test",
+                DownloadRequest::new("http://127.0.0.1:9/retry.bin"),
+                root.join("downloads"),
+                "retry.bin".to_string(),
+                Some(1024),
+                Some(true),
+                None,
+                Some("retry-key".to_string()),
+                Vec::new(),
+            )
+            .expect("retry after fixing the store must create the task");
+        assert!(record.id.starts_with("tsk_"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    async fn wait_until_downloading(manager: &TaskManager, id: &str, min_bytes: u64) {
+        for _ in 0..1200 {
+            let record = manager.get(id).unwrap();
+            if record.state == TaskState::Downloading && record.downloaded_bytes >= min_bytes {
+                return;
+            }
+            assert!(
+                !record.state.is_terminal(),
+                "task finished before reaching {min_bytes} bytes: {record:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("task never reached {min_bytes} downloaded bytes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_pause_persists_positive_downloaded_bytes() {
+        let root = temp_root("pause-bytes");
+        let size = 64 * 1024 * 1024;
+        // One chunk round (~100ms) completes before the 250ms progress report,
+        // so both the observable counter and `.part.json` have real bytes.
+        let server = TestServer::start(Config::new(size).with_delay(20))
+            .await
+            .unwrap();
+        let manager = manager_for(&root, policy_for(&root, 4));
+        let record = manager
+            .create_task(
+                "test",
+                DownloadRequest::new(server.file_url()),
+                root.join("downloads"),
+                "slow-pause.bin".to_string(),
+                Some(size),
+                Some(true),
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        wait_until_downloading(&manager, &record.id, 4 * 1024 * 1024).await;
+        let paused = manager.pause(&record.id).await.unwrap();
+        assert_eq!(paused.state, TaskState::Paused);
+        assert!(
+            paused.downloaded_bytes > 0,
+            "paused task must expose transferred bytes, got 0"
+        );
+        let persisted = manager.get(&record.id).unwrap();
+        assert_eq!(persisted.state, TaskState::Paused);
+        assert!(
+            persisted.downloaded_bytes > 0,
+            "persisted paused record must keep downloaded_bytes > 0"
+        );
+        let target = util::expected_target(&persisted.dest_dir, &persisted.file_name);
+        let (_, state_path) = util::part_paths(&target);
+        let state_value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        let retained = state_value["downloaded_bytes"].as_u64().unwrap();
+        assert!(
+            retained > 0,
+            "`.part.json` should retain completed chunk bytes"
+        );
+        assert!(
+            persisted.downloaded_bytes >= retained,
+            "observable bytes ({}) must cover retained bytes ({retained})",
+            persisted.downloaded_bytes
+        );
+        server.shutdown().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eof_shutdown_persists_positive_paused_bytes() {
+        let root = temp_root("eof-bytes");
+        let size = 64 * 1024 * 1024;
+        let server = TestServer::start(Config::new(size).with_delay(20))
+            .await
+            .unwrap();
+        let manager = manager_for(&root, policy_for(&root, 4));
+        let record = manager
+            .create_task(
+                "test",
+                DownloadRequest::new(server.file_url()),
+                root.join("downloads"),
+                "eof.bin".to_string(),
+                Some(size),
+                Some(true),
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+        wait_until_downloading(&manager, &record.id, 4 * 1024 * 1024).await;
+        manager.shutdown().await;
+        let persisted = manager.get(&record.id).unwrap();
+        assert_eq!(persisted.state, TaskState::Paused);
+        assert!(
+            persisted.downloaded_bytes > 0,
+            "EOF shutdown must persist downloaded_bytes > 0 (got 0)"
+        );
         server.shutdown().await;
         std::fs::remove_dir_all(&root).ok();
     }

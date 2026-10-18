@@ -256,6 +256,9 @@ struct ReadyDownload {
     range_supported: bool,
     http_version: Option<String>,
     warnings: Vec<String>,
+    /// Preserved so the task manager can deduplicate near-simultaneous calls
+    /// with the same key at creation time.
+    idempotency_key: Option<String>,
 }
 
 fn probe_error(error: rdm_core::DownloadError) -> AgentErrorInfo {
@@ -422,6 +425,7 @@ async fn prepare_download(
                 range_supported: meta.supports_ranges,
                 http_version: meta.http_version.clone(),
                 warnings,
+                idempotency_key,
             }))
         }
     }
@@ -446,7 +450,7 @@ fn start_ready_task(ctx: &CallContext, ready: ReadyDownload) -> Result<TaskRecor
         ready.total_bytes,
         Some(ready.range_supported),
         ready.http_version,
-        None,
+        ready.idempotency_key,
         warnings,
     )
 }

@@ -62,20 +62,19 @@ function Add-Step([string]$Name, [bool]$Pass, [string]$Detail = "") {
     Write-Host ("[{0}] {1}{2}" -f $(if ($Pass) { "PASS" } else { "FAIL" }), $Name, $(if ($Detail) { "  ($Detail)" } else { "" })) -ForegroundColor $color
 }
 
-function Run-Logged([string]$Name, [string]$Exe, [string[]]$Args, [int]$TimeoutSec = 1800) {
+function Run-Logged([string]$Name, [string]$Exe, [string[]]$CommandArgs, [int]$TimeoutSec = 1800) {
     $log = Join-Path $logDir "$stamp-$Name.log"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $p = Start-Process -FilePath $Exe -ArgumentList $Args -NoNewWindow -PassThru -Wait `
-        -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ErrorAction Stop
+    # Call operator + `*>` is reliable for console apps on Windows; Start-Process
+    # argument marshalling silently dropped array args in earlier revisions.
+    & $Exe @CommandArgs *> $log
+    $code = $LASTEXITCODE
     $sw.Stop()
-    $code = $p.ExitCode
     $tail = @()
-    foreach ($f in @($log, "$log.err")) {
-        if (Test-Path $f) { $tail += (Get-Content $f -Tail 4) }
-    }
+    if (Test-Path $log) { $tail += (Get-Content $log -Tail 4) }
     return [pscustomobject]@{
         name = $Name; exit = $code; seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-        log = $log; err_log = "$log.err"; tail = ($tail -join " | ")
+        log = $log; err_log = ""; tail = ($tail -join " | ")
     }
 }
 
@@ -101,8 +100,8 @@ $agentBins = @(
 )
 if (-not $SkipBuild) {
     Write-Host "==> cargo build -p rdm-mcp -p rdm-cli -p rdm-fixture-server" -ForegroundColor Cyan
-    $build = Run-Logged -Name "build-agent" -Exe "cargo" -Args @("build", "-p", "rdm-mcp", "-p", "rdm-cli", "-p", "rdm-fixture-server")
-    Add-Step "build.agent_binaries" ($build.exit -eq 0) "exit=$($build.exit) ${($build.seconds)}s log=$($build.log)"
+    $build = Run-Logged -Name "build-agent" -Exe "cargo" -CommandArgs @("build", "-p", "rdm-mcp", "-p", "rdm-cli", "-p", "rdm-fixture-server")
+    Add-Step "build.agent_binaries" ($build.exit -eq 0) "exit=$($build.exit) $($build.seconds)s log=$($build.log)"
     if ($build.exit -ne 0) { Write-Host ($build.tail) -ForegroundColor Red }
 } else {
     Add-Step "build.agent_binaries" $true "skipped (-SkipBuild)"
@@ -172,11 +171,11 @@ if (-not $SkipRegression -and -not $OnlyMcp) {
     Write-Host "`n==> regression: build / test / fmt / clippy" -ForegroundColor Cyan
     $reg = [ordered]@{ build = $null; test = $null; fmt = $null; clippy = $null; test_summary = $null }
 
-    $b = Run-Logged -Name "regression-build-workspace" -Exe "cargo" -Args @("build", "--workspace")
+    $b = Run-Logged -Name "regression-build-workspace" -Exe "cargo" -CommandArgs @("build", "--workspace")
     $reg.build = $b
     Add-Step "regression.build_workspace" ($b.exit -eq 0) "exit=$($b.exit) $($b.seconds)s log=$($b.log)"
 
-    $t = Run-Logged -Name "regression-test-workspace" -Exe "cargo" -Args @("test", "--workspace", "--no-fail-fast")
+    $t = Run-Logged -Name "regression-test-workspace" -Exe "cargo" -CommandArgs @("test", "--workspace", "--no-fail-fast")
     $reg.test = $t
     $testSummary = $null
     if (Test-Path $t.log) {
@@ -192,11 +191,11 @@ if (-not $SkipRegression -and -not $OnlyMcp) {
     }
     Add-Step "regression.test_workspace" ($t.exit -eq 0) "exit=$($t.exit) suites=$($testSummary.suites) passed=$($testSummary.passed) failed=$($testSummary.failed) $($t.seconds)s log=$($t.log)"
 
-    $f = Run-Logged -Name "regression-fmt" -Exe "cargo" -Args @("fmt", "--all", "--check")
+    $f = Run-Logged -Name "regression-fmt" -Exe "cargo" -CommandArgs @("fmt", "--all", "--check")
     $reg.fmt = $f
     Add-Step "regression.fmt_check" ($f.exit -eq 0) "exit=$($f.exit) log=$($f.log)"
 
-    $cl = Run-Logged -Name "regression-clippy" -Exe "cargo" -Args @("clippy", "-p", "rdm-core", "-p", "rdm-cli", "-p", "rdm-agent", "-p", "rdm-mcp", "--all-targets")
+    $cl = Run-Logged -Name "regression-clippy" -Exe "cargo" -CommandArgs @("clippy", "-p", "rdm-core", "-p", "rdm-cli", "-p", "rdm-agent", "-p", "rdm-mcp", "--all-targets")
     $reg.clippy = $cl
     $clippyWarnings = 0
     if (Test-Path $cl.log) {
@@ -225,4 +224,5 @@ if ($summary.fail -gt 0) {
     exit 1
 }
 exit 0
+
 

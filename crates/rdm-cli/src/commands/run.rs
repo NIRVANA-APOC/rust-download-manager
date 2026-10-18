@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use rdm_agent::{
-    AgentErrorInfo, ErrorCode, Policy, PolicyDecision, TaskState, TaskStore, TaskView,
-};
+use rdm_agent::{AgentErrorInfo, ErrorCode, Policy, TaskState, TaskStore, TaskView};
 use rdm_core::{DownloadEvent, DownloadRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -258,7 +256,7 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: RunArgs) -> u8 {
         && errors.iter().all(|error| {
             matches!(
                 error.code,
-                ErrorCode::PolicyDenied | ErrorCode::NeedsApproval
+                ErrorCode::PolicyDenied | ErrorCode::NeedsApproval | ErrorCode::Conflict
             )
         });
     let exit_error: Option<AgentErrorInfo> = if let Some(error) = runtime_failure {
@@ -420,6 +418,9 @@ fn build_spec(index: usize, task: BatchTask) -> Result<TaskSpec, AgentErrorInfo>
         .into_request()
         .map_err(|message| invalid_request(format!("task #{index}: {message}")))?;
 
+    // URL syntax/scheme first (invalid_url/exit 2), then policy (exit 4).
+    util::validate_http_url(&request.url).map_err(|error| error_with_task_index(error, index))?;
+
     if let Some(expected) = &request.expected_sha256 {
         super::download::validate_sha256(expected)
             .map_err(|message| invalid_request(format!("task #{index}: {message}")))?;
@@ -444,6 +445,13 @@ fn build_spec(index: usize, task: BatchTask) -> Result<TaskSpec, AgentErrorInfo>
         file_name,
         idempotency_key,
     })
+}
+
+/// Prefix a validation error with the batch task index while keeping its
+/// stable error code (`invalid_url` must not become policy_denied).
+fn error_with_task_index(mut error: AgentErrorInfo, index: usize) -> AgentErrorInfo {
+    error.message = format!("task #{index}: {}", error.message);
+    error
 }
 
 fn file_name_from_url(url: &str) -> String {
@@ -537,30 +545,36 @@ async fn run_one(
     }
 
     // Policy pre-checks (only when an explicit policy.json is present).
+    let mut unknown_length_monitor: Option<(rdm_agent::Policy, PathBuf)> = None;
     if let Some(policy) = policy {
-        if let Err(info) = policy_precheck(policy, &spec.request, &spec.dest_dir).await {
-            tracker.apply_failed(&info);
-            send_update(
-                &updates,
-                &task_id,
-                "failed",
-                json!({ "error": serde_json::to_value(&info).unwrap_or(Value::Null) }),
-            );
-            return Ok(TaskOutcome {
-                index: spec.index,
-                view: tracker.view(),
-                error: Some(info),
-                reused: false,
-            });
+        match policy_precheck(policy, &spec.request, &spec.dest_dir).await {
+            Ok(monitor) => unknown_length_monitor = monitor,
+            Err(info) => {
+                tracker.apply_failed(&info);
+                send_update(
+                    &updates,
+                    &task_id,
+                    "failed",
+                    json!({ "error": serde_json::to_value(&info).unwrap_or(Value::Null) }),
+                );
+                return Ok(TaskOutcome {
+                    index: spec.index,
+                    view: tracker.view(),
+                    error: Some(info),
+                    reused: false,
+                });
+            }
         }
     }
 
     // Execute the download.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let request = spec.request.clone();
-    let download = rdm_core::download_with_handle(request, Some(event_tx), Default::default());
+    let handle = rdm_core::DownloadHandle::new();
+    let download = rdm_core::download_with_handle(request, Some(event_tx), handle.clone());
     tokio::pin!(download);
 
+    let mut policy_violation: Option<AgentErrorInfo> = None;
     let result;
     loop {
         tokio::select! {
@@ -570,15 +584,27 @@ async fn run_one(
                 break;
             }
             Some(event) = event_rx.recv() => {
+                enforce_unknown_length_limit(
+                    &event,
+                    &unknown_length_monitor,
+                    &mut policy_violation,
+                    &handle,
+                );
                 handle_engine_event(&mut tracker, &updates, &task_id, &event);
             }
         }
     }
     while let Ok(event) = event_rx.try_recv() {
+        enforce_unknown_length_limit(
+            &event,
+            &unknown_length_monitor,
+            &mut policy_violation,
+            &handle,
+        );
         handle_engine_event(&mut tracker, &updates, &task_id, &event);
     }
 
-    let error = match result {
+    let mut error = match result {
         Ok(summary) => {
             tracker.apply_completed(&summary);
             send_update(
@@ -628,6 +654,16 @@ async fn run_one(
             Some(info)
         }
     };
+    if let Some(violation) = policy_violation.take() {
+        tracker.apply_failed(&violation);
+        send_update(
+            &updates,
+            &task_id,
+            "failed",
+            json!({ "error": serde_json::to_value(&violation).unwrap_or(Value::Null) }),
+        );
+        error = Some(violation);
+    }
     tracker.persist(true);
 
     Ok(TaskOutcome {
@@ -638,68 +674,59 @@ async fn run_one(
     })
 }
 
+/// Policy pre-checks shared with `rdm download` (URL, destination, probe-time
+/// size gate, overwrite gate). Returns an unknown-length monitor when the
+/// remote size is unavailable but `max_bytes_per_task` needs streaming
+/// enforcement.
 async fn policy_precheck(
     policy: &Policy,
     request: &DownloadRequest,
     dest_dir: &Path,
-) -> Result<(), AgentErrorInfo> {
-    match policy.check_url(&request.url) {
-        PolicyDecision::Allow => {}
-        PolicyDecision::Deny { reason } => {
-            return Err(AgentErrorInfo::new(
-                ErrorCode::PolicyDenied,
-                format!("URL denied by policy: {reason}"),
-            )
-            .with_hint("add the host to `policy.json` allowed_hosts")
-            .with_details(json!({ "allowed_hosts": policy.allowed_hosts })));
-        }
-        PolicyDecision::NeedsApproval {
-            reason,
-            total_bytes,
-        } => {
-            return Err(needs_approval(reason, total_bytes, policy));
-        }
-    }
-    if !policy.check_dest_dir(dest_dir) {
-        return Err(AgentErrorInfo::new(
-            ErrorCode::PolicyDenied,
-            format!(
-                "destination `{}` is outside policy.allowed_dirs",
-                dest_dir.display()
-            ),
-        )
-        .with_hint("pick a destination inside an allowed dir, or update `policy.json`")
-        .with_details(json!({ "allowed_dirs": policy.allowed_dirs })));
-    }
+) -> Result<Option<(Policy, PathBuf)>, AgentErrorInfo> {
+    util::policy_precheck(policy, &request.url, Some(dest_dir))?;
 
     // Size gate needs the remote size: probe first (cheap HEAD).
-    match rdm_core::probe(request).await {
-        Ok(meta) => match policy.gate(meta.total_bytes) {
-            PolicyDecision::Allow => Ok(()),
-            PolicyDecision::Deny { reason } => Err(AgentErrorInfo::new(
-                ErrorCode::PolicyDenied,
-                format!("size denied by policy: {reason}"),
-            )
-            .with_hint("raise `max_bytes_per_task` in policy.json")
-            .with_details(json!({ "total_bytes": meta.total_bytes }))),
-            PolicyDecision::NeedsApproval {
-                reason,
-                total_bytes,
-            } => Err(needs_approval(reason, total_bytes, policy)),
-        },
-        Err(error) => Err(engine_error(&error)),
+    let meta = rdm_core::probe(request)
+        .await
+        .map_err(|error| engine_error(&error))?;
+    util::policy_gate_size(policy, meta.total_bytes)?;
+    let target =
+        util::candidate_target_path(dest_dir, request.file_name.as_deref(), &meta.file_name);
+    util::policy_overwrite_gate(policy, &target)?;
+
+    if meta.total_bytes.is_none() && policy.max_bytes_per_task.is_some() {
+        Ok(Some((policy.clone(), target)))
+    } else {
+        Ok(None)
     }
 }
 
-fn needs_approval(reason: String, total_bytes: Option<u64>, policy: &Policy) -> AgentErrorInfo {
-    AgentErrorInfo::new(ErrorCode::NeedsApproval, format!("approval required: {reason}"))
-        .with_hint(
-            "raise `require_approval_over_bytes` in policy.json or use `rdm download` for an explicit one-off",
-        )
-        .with_details(json!({
-            "total_bytes": total_bytes,
-            "require_approval_over_bytes": policy.require_approval_over_bytes,
-        }))
+/// Enforce `max_bytes_per_task` while streaming an unknown-length response.
+fn enforce_unknown_length_limit(
+    event: &DownloadEvent,
+    monitor: &Option<(Policy, PathBuf)>,
+    violation: &mut Option<AgentErrorInfo>,
+    handle: &rdm_core::DownloadHandle,
+) {
+    if violation.is_some() {
+        return;
+    }
+    let Some((policy, target)) = monitor else {
+        return;
+    };
+    let DownloadEvent::Progress { downloaded, .. } = event else {
+        return;
+    };
+    if let Some(max) = policy.max_bytes_per_task {
+        if *downloaded > max {
+            *violation = Some(util::policy_size_exceeded_error(
+                policy,
+                *downloaded,
+                target,
+            ));
+            handle.pause();
+        }
+    }
 }
 
 fn handle_engine_event(

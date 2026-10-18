@@ -413,6 +413,13 @@ async fn stdio_end_to_end_download_lifecycle() {
     assert_eq!(modern_tools["result"]["resultType"], "complete");
     let modern_ping = client.request("ping", json!({ "_meta": modern_meta }));
     assert_eq!(modern_ping["error"]["code"], -32601);
+    // This client completed the legacy handshake, so after probing the modern
+    // era a request without `_meta` still falls back to legacy semantics.
+    let legacy_fallback = client.request("tools/list", json!({}));
+    assert!(
+        legacy_fallback.get("result").is_some(),
+        "initialized legacy client must keep working after a modern probe: {legacy_fallback}"
+    );
 
     // --- stdin EOF: pause running tasks, persist, exit cleanly -------
     let background = client.tool(
@@ -424,6 +431,25 @@ async fn stdio_end_to_end_download_lifecycle() {
         .as_str()
         .unwrap()
         .to_string();
+    // Wait until bytes are actually transferred so the EOF assertion checks
+    // persisted progress rather than a still-queued task.
+    let mut progressed = false;
+    for _ in 0..200 {
+        let current = client.tool("rdm_get_task", json!({ "task_id": background_id }));
+        if structured(&current)["data"]["task"]["downloaded_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            progressed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        progressed,
+        "background task never transferred bytes before EOF"
+    );
     let exit = client.close();
     assert_eq!(exit, 0, "rdm-mcp should exit 0 on stdin EOF");
     let mut eof_record = None;
@@ -441,6 +467,10 @@ async fn stdio_end_to_end_download_lifecycle() {
     assert_eq!(
         eof_record["state"], "paused",
         "EOF must pause running tasks before exit: {eof_record}"
+    );
+    assert!(
+        eof_record["downloaded_bytes"].as_u64().unwrap_or(0) > 0,
+        "EOF paused task must persist downloaded_bytes > 0: {eof_record}"
     );
     fixture.shutdown().await;
     std::fs::remove_dir_all(&root).ok();
@@ -633,6 +663,20 @@ async fn wait_cancellation_and_pause_resume_over_stdio() {
     let paused = client.tool("rdm_pause_task", json!({ "task_id": pause_id }));
     assert_tool_ok(&paused);
     assert_eq!(structured(&paused)["data"]["task"]["state"], "paused");
+    assert!(
+        structured(&paused)["data"]["task"]["downloaded_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "paused task must expose downloaded_bytes > 0: {paused}"
+    );
+    let persisted_pause = client.tool("rdm_get_task", json!({ "task_id": pause_id }));
+    assert!(
+        structured(&persisted_pause)["data"]["task"]["downloaded_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
     let resumed = client.tool("rdm_resume_task", json!({ "task_id": pause_id }));
     assert_tool_ok(&resumed);
     let settled = client.tool(
@@ -651,4 +695,31 @@ async fn wait_cancellation_and_pause_resume_over_stdio() {
 fn sha256_of(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_only_client_requires_per_request_meta() {
+    let root = temp_root("modern-meta");
+    let mut client = Client::start(&root);
+    // Modern clients do not perform the legacy initialize handshake.
+    let modern_meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let discover = client.request("server/discover", json!({ "_meta": modern_meta }));
+    assert_eq!(discover["result"]["resultType"], "complete");
+
+    // Missing per-request `_meta` on a modern-only connection is malformed
+    // params: -32602, never the legacy "not initialized" -32002.
+    let no_meta = client.request("tools/list", json!({}));
+    assert_eq!(no_meta["error"]["code"], -32602, "{no_meta}");
+    assert_ne!(no_meta["error"]["code"], -32002);
+
+    // A modern request with the required _meta keeps working.
+    let with_meta = client.request("tools/list", json!({ "_meta": modern_meta }));
+    assert_eq!(with_meta["result"]["resultType"], "complete");
+    assert_eq!(with_meta["result"]["tools"].as_array().unwrap().len(), 16);
+
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
 }

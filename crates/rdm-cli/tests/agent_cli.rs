@@ -81,6 +81,27 @@ async fn run(args: &[&str], state_dir: &Path) -> RunOutput {
     run_with_stdin(args, state_dir, None).await
 }
 
+/// Run without `--state-dir`, with explicit environment overrides (used to
+/// reproduce the QA `LOCALAPPDATA` isolation setup).
+async fn run_with_env(args: &[&str], envs: &[(&str, String)]) -> RunOutput {
+    let mut command = Command::new(rdm_bin());
+    command
+        .args(args)
+        .env_remove("RDM_AGENT_STATE_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().await.expect("run rdm");
+    RunOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
 async fn run_with_stdin(args: &[&str], state_dir: &Path, stdin: Option<&str>) -> RunOutput {
     let mut command = Command::new(rdm_bin());
     command
@@ -124,6 +145,400 @@ async fn fixture(size: u64) -> TestServer {
     TestServer::start(Config::new(size))
         .await
         .expect("start fixture server")
+}
+
+// ---------------------------------------------------------------------------
+// Policy enforcement (task-11)
+// ---------------------------------------------------------------------------
+
+fn write_policy(state_dir: &Path, policy: serde_json::Value) {
+    std::fs::write(
+        state_dir.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Baseline policy that allows the loopback fixture and one output dir.
+fn allowed_policy(out_dir: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "rdm.agent/v1",
+        "allowed_hosts": ["*"],
+        "allowed_dirs": [out_dir],
+        "max_bytes_per_task": 1024 * 1024,
+        "require_approval_over_bytes": null,
+        "max_concurrent_tasks": 2,
+        "default_connections": 2,
+        "allow_private_hosts": true,
+        "allow_overwrite": false
+    })
+}
+
+/// QA reproduction policy: only public example.com hosts, no overwrite.
+fn public_only_policy(out_dir: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "rdm.agent/v1",
+        "allowed_hosts": ["*.example.com"],
+        "allowed_dirs": [out_dir],
+        "max_bytes_per_task": null,
+        "require_approval_over_bytes": null,
+        "max_concurrent_tasks": 2,
+        "default_connections": 2,
+        "allow_private_hosts": false,
+        "allow_overwrite": false
+    })
+}
+
+#[tokio::test]
+async fn download_policy_denies_private_host() {
+    let fixture = fixture(128 * 1024).await;
+    let state = TempDir::new("policy-denied");
+    let out = TempDir::new("policy-denied-out");
+    write_policy(state.path(), public_only_policy(out.path()));
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "policy_denied");
+    assert_eq!(value["data"], Value::Null);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_policy_allowed_succeeds() {
+    let fixture = fixture(128 * 1024).await;
+    let state = TempDir::new("policy-allowed");
+    let out = TempDir::new("policy-allowed-out");
+    write_policy(state.path(), allowed_policy(out.path()));
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 0,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["data"]["state"], "completed");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_policy_size_denied_before_download() {
+    let fixture = fixture(256 * 1024).await;
+    let state = TempDir::new("policy-size");
+    let out = TempDir::new("policy-size-out");
+    let mut policy = allowed_policy(out.path());
+    policy["max_bytes_per_task"] = serde_json::json!(1024);
+    write_policy(state.path(), policy);
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["error"]["code"], "policy_denied");
+    assert_eq!(value["error"]["details"]["total_bytes"], 256 * 1024);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_policy_needs_approval_and_does_not_download() {
+    let fixture = fixture(256 * 1024).await;
+    let state = TempDir::new("policy-approval");
+    let out = TempDir::new("policy-approval-out");
+    let mut policy = allowed_policy(out.path());
+    policy["max_bytes_per_task"] = Value::Null;
+    policy["require_approval_over_bytes"] = serde_json::json!(1024);
+    write_policy(state.path(), policy);
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["error"]["code"], "needs_approval");
+    assert_eq!(
+        value["error"]["details"]["require_approval_over_bytes"],
+        1024
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_policy_conflict_when_target_exists() {
+    let fixture = fixture(128 * 1024).await;
+    let state = TempDir::new("policy-conflict");
+    let out = TempDir::new("policy-conflict-out");
+    write_policy(state.path(), allowed_policy(out.path()));
+    let target = out.path().join("existing.bin");
+    std::fs::write(&target, b"KEEP").unwrap();
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--name",
+            "existing.bin",
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["error"]["code"], "conflict");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "KEEP");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_policy_unknown_length_is_cancelled_when_over_budget() {
+    let fixture = TestServer::start(
+        Config::new(1024 * 1024)
+            .without_length()
+            .without_ranges()
+            .with_delay(100),
+    )
+    .await
+    .unwrap();
+    let state = TempDir::new("policy-stream");
+    let out = TempDir::new("policy-stream-out");
+    let mut policy = allowed_policy(out.path());
+    policy["max_bytes_per_task"] = serde_json::json!(128 * 1024);
+    write_policy(state.path(), policy);
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["error"]["code"], "policy_denied");
+    // The completed target must not exist; a resumable .part may remain.
+    assert!(!out.path().join("file").exists());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn probe_policy_denies_private_host() {
+    let fixture = fixture(64 * 1024).await;
+    let state = TempDir::new("policy-probe");
+    let out = TempDir::new("policy-probe-out");
+    write_policy(state.path(), public_only_policy(out.path()));
+
+    let output = run(
+        &["probe", &fixture.file_url(), "--output", "json"],
+        state.path(),
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "stderr: {}; stdout: {}",
+        output.stderr, output.stdout
+    );
+    let value = output.json();
+    assert_eq!(value["error"]["code"], "policy_denied");
+    assert_eq!(value["data"], Value::Null);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn corrupt_policy_is_invalid_request() {
+    let fixture = TempDir::new("policy-corrupt-fixture");
+    let _ = fixture; // no server needed: policy parsing fails before networking
+    let state = TempDir::new("policy-corrupt");
+    std::fs::write(state.path().join("policy.json"), b"{not json").unwrap();
+
+    let output = run(
+        &["download", "http://127.0.0.1:1/file", "--output", "json"],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 2, "stdout: {}", output.stdout);
+    assert_eq!(output.json()["error"]["code"], "invalid_request");
+
+    let output = run(
+        &["probe", "http://127.0.0.1:1/file", "--output", "json"],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 2, "stdout: {}", output.stdout);
+    assert_eq!(output.json()["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn no_policy_warns_but_still_downloads() {
+    let fixture = fixture(64 * 1024).await;
+    let state = TempDir::new("policy-absent");
+    let out = TempDir::new("policy-absent-out");
+
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--name",
+            "absent.bin",
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+    let value = output.json();
+    let warnings = value["data"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .unwrap_or("")
+            .starts_with("policy-file-absent")),
+        "expected policy-file-absent warning, got {warnings:?}"
+    );
+
+    let output = run(
+        &["probe", &fixture.file_url(), "--output", "json"],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 0);
+    let value = output.json();
+    assert_eq!(value["data"]["policy_enforced"], false);
+    let warnings = value["data"]["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| warning
+        .as_str()
+        .unwrap_or("")
+        .starts_with("policy-file-absent")));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn qa_repro_isolated_localappdata_enforces_policy() {
+    let fixture = fixture(128 * 1024).await;
+    let local = TempDir::new("qa-localappdata");
+    let state_dir = local.path().join("RDM").join("agent");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let out = TempDir::new("qa-localappdata-out");
+    write_policy(&state_dir, public_only_policy(out.path()));
+
+    // No --state-dir: the CLI must resolve %LOCALAPPDATA%\RDM\agent itself.
+    let output = run_with_env(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        &[("LOCALAPPDATA", local.path().to_string_lossy().into_owned())],
+    )
+    .await;
+    assert_eq!(
+        output.code, 4,
+        "policy from isolated LOCALAPPDATA was not enforced: stdout: {} stderr: {}",
+        output.stdout, output.stderr
+    );
+    assert_eq!(output.json()["error"]["code"], "policy_denied");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+    // Removing the file restores the documented "no policy -> warning+success".
+    std::fs::remove_file(state_dir.join("policy.json")).unwrap();
+    let output = run_with_env(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out.path().to_str().unwrap(),
+            "--name",
+            "allowed.bin",
+            "--output",
+            "json",
+        ],
+        &[("LOCALAPPDATA", local.path().to_string_lossy().into_owned())],
+    )
+    .await;
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+    assert_eq!(output.json()["ok"], true);
+    fixture.shutdown().await;
 }
 
 fn assert_no_secret(output: &RunOutput, secret: &str) {
@@ -885,4 +1300,115 @@ async fn download_rejects_bad_sha256() {
     .await;
     assert_eq!(output.code, 2);
     assert_eq!(output.json()["error"]["code"], "invalid_request");
+}
+
+// ---------------------------------------------------------------------------
+// URL validation must precede policy (task-12 regression)
+// ---------------------------------------------------------------------------
+
+const BAD_URLS: [&str; 5] = [
+    "ftp://example.com/x",
+    "file:///C:/x",
+    "example.com/x",
+    "",
+    "http://[broken",
+];
+
+async fn assert_invalid_url(args: &[&str], state_dir: &Path) {
+    let output = run(args, state_dir).await;
+    assert_eq!(
+        output.code, 2,
+        "expected invalid_url/exit2 for {args:?}: stdout={} stderr={}",
+        output.stdout, output.stderr
+    );
+    let value = output.json();
+    assert_eq!(value["ok"], false);
+    assert_eq!(
+        value["error"]["code"], "invalid_url",
+        "expected invalid_url for {args:?}: {}",
+        value["error"]
+    );
+    assert!(value["error"]["hint"].is_string());
+}
+
+#[tokio::test]
+async fn probe_and_download_reject_bad_urls_as_invalid_url() {
+    let state = TempDir::new("url-validation");
+    for url in BAD_URLS {
+        assert_invalid_url(&["probe", url, "--output", "json"], state.path()).await;
+        assert_invalid_url(&["download", url, "--output", "json"], state.path()).await;
+    }
+}
+
+#[tokio::test]
+async fn invalid_url_wins_over_policy_denial() {
+    let state = TempDir::new("url-vs-policy");
+    let out = TempDir::new("url-vs-policy-out");
+    write_policy(state.path(), public_only_policy(out.path()));
+
+    // Scheme error: invalid_url (exit 2), not policy_denied (exit 4).
+    assert_invalid_url(
+        &["probe", "ftp://example.com/x", "--output", "json"],
+        state.path(),
+    )
+    .await;
+    assert_invalid_url(
+        &[
+            "download",
+            "ftp://example.com/x",
+            "-d",
+            out.path().to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+
+    // A syntactically valid but policy-blocked URL still yields exit 4.
+    let output = run(
+        &["probe", "http://127.0.0.1:1/x", "--output", "json"],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 4, "stdout: {}", output.stdout);
+    assert_eq!(output.json()["error"]["code"], "policy_denied");
+}
+
+#[tokio::test]
+async fn run_rejects_bad_urls_as_invalid_url() {
+    let state = TempDir::new("url-validation-run");
+    for url in BAD_URLS {
+        let batch = serde_json::json!({
+            "schema_version": "rdm.agent/v1",
+            "tasks": [{"url": url}]
+        });
+        let batch_path = write_batch(state.path(), &batch);
+        let output = run(
+            &[
+                "run",
+                "--input",
+                batch_path.to_str().unwrap(),
+                "--output",
+                "json",
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!(
+            output.code, 2,
+            "run should reject {url:?} as invalid_url: stdout={} stderr={}",
+            output.stdout, output.stderr
+        );
+        let value = output.json();
+        assert_eq!(
+            value["error"]["code"], "invalid_url",
+            "run {url:?}: {}",
+            value["error"]
+        );
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("task #0:"));
+    }
 }

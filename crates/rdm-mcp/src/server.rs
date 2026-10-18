@@ -120,6 +120,10 @@ pub struct ServerState {
     pub manager: Arc<TaskManager>,
     pub runtime: tokio::runtime::Handle,
     pub initialized: AtomicBool,
+    /// Set once a valid modern request/discover is observed. Later requests
+    /// without the required per-request `_meta` are modern attempts and must
+    /// fail with `-32602`, not the legacy "not initialized" `-32002`.
+    pub modern_seen: AtomicBool,
     pub shutdown: AtomicBool,
     pub client_protocol: Mutex<Option<String>>,
     pub client_info: Mutex<Option<Value>>,
@@ -151,6 +155,7 @@ impl ServerState {
             manager,
             runtime,
             initialized: AtomicBool::new(false),
+            modern_seen: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             client_protocol: Mutex::new(None),
             client_info: Mutex::new(None),
@@ -386,10 +391,32 @@ fn modern_wrap_result(mut result: Value) -> Value {
     result
 }
 
-fn era_for_request(request: &Request) -> Result<Era, RpcError> {
+/// Era decision.
+///
+/// * `modern_seen`: this connection already performed a valid modern request.
+/// * `legacy_initialized`: the connection completed the legacy `initialize`
+///   handshake. A legacy-capable client keeps working after a modern probe;
+///   a modern-only client that never initialized must send `_meta` on every
+///   request (`-32602` otherwise, never the legacy `-32002`).
+fn era_for_request_with(
+    request: &Request,
+    modern_seen: bool,
+    legacy_initialized: bool,
+) -> Result<Era, RpcError> {
     if request.method == "initialize" {
         return Ok(Era::Legacy);
     }
+    // `_meta` is also a legal legacy carrier (e.g. `progressToken`), so only a
+    // modern namespaced key marks a modern (attempted) request.
+    let modern_meta_attempt = request
+        .params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .map(|meta| {
+            meta.keys()
+                .any(|key| key.starts_with("io.modelcontextprotocol/"))
+        })
+        .unwrap_or(false);
     match request_meta_version(&request.params) {
         Some(version) if version == MODERN_PROTOCOL_VERSION => {
             validate_modern_meta(&request.params)?;
@@ -401,9 +428,14 @@ fn era_for_request(request: &Request) -> Result<Era, RpcError> {
             json!({ "supported": [MODERN_PROTOCOL_VERSION], "requested": version }),
         )),
         None => {
-            if request.method == "server/discover" {
+            if request.method == "server/discover"
+                || modern_meta_attempt
+                || (modern_seen && !legacy_initialized)
+            {
                 Err(RpcError::invalid_params(
-                    "server/discover requires params._meta with protocolVersion and clientCapabilities",
+                    "modern requests require params._meta with \
+                     \"io.modelcontextprotocol/protocolVersion\" and \
+                     \"io.modelcontextprotocol/clientCapabilities\"",
                 ))
             } else {
                 Ok(Era::Legacy)
@@ -413,7 +445,12 @@ fn era_for_request(request: &Request) -> Result<Era, RpcError> {
 }
 
 fn handle_request(state: &Arc<ServerState>, request: Request) {
-    let era = match era_for_request(&request) {
+    let modern_seen = state.modern_seen.load(Ordering::SeqCst);
+    let era = match era_for_request_with(
+        &request,
+        modern_seen,
+        state.initialized.load(Ordering::SeqCst),
+    ) {
         Ok(era) => era,
         Err(error) => {
             state
@@ -422,6 +459,9 @@ fn handle_request(state: &Arc<ServerState>, request: Request) {
             return;
         }
     };
+    if era == Era::Modern {
+        state.modern_seen.store(true, Ordering::SeqCst);
+    }
 
     // Legacy lifecycle gate: everything except initialize/ping needs the
     // handshake. Modern requests are stateless and always accepted.
@@ -769,7 +809,10 @@ mod tests {
             method: "tools/list".to_string(),
             params: json!({}),
         };
-        assert_eq!(era_for_request(&legacy).unwrap(), Era::Legacy);
+        assert_eq!(
+            era_for_request_with(&legacy, false, false).unwrap(),
+            Era::Legacy
+        );
         let modern = Request {
             id: json!(2),
             method: "tools/list".to_string(),
@@ -780,19 +823,25 @@ mod tests {
                 }
             }),
         };
-        assert_eq!(era_for_request(&modern).unwrap(), Era::Modern);
+        assert_eq!(
+            era_for_request_with(&modern, false, false).unwrap(),
+            Era::Modern
+        );
         let initialize = Request {
             id: json!(3),
             method: "initialize".to_string(),
             params: json!({}),
         };
-        assert_eq!(era_for_request(&initialize).unwrap(), Era::Legacy);
+        assert_eq!(
+            era_for_request_with(&initialize, false, false).unwrap(),
+            Era::Legacy
+        );
         let discover_without_meta = Request {
             id: json!(4),
             method: "server/discover".to_string(),
             params: json!({}),
         };
-        assert!(era_for_request(&discover_without_meta).is_err());
+        assert!(era_for_request_with(&discover_without_meta, false, false).is_err());
         let wrong = Request {
             id: json!(5),
             method: "tools/list".to_string(),
@@ -801,8 +850,93 @@ mod tests {
             }),
         };
         assert_eq!(
-            era_for_request(&wrong).unwrap_err().code,
+            era_for_request_with(&wrong, false, false).unwrap_err().code,
             MODERN_UNSUPPORTED_VERSION
+        );
+    }
+
+    #[test]
+    fn modern_missing_meta_is_invalid_params_not_legacy_not_initialized() {
+        // A request without `_meta` after the connection has spoken modern is a
+        // malformed modern request: -32602, and never the legacy -32002.
+        let tools_without_meta = Request {
+            id: json!(1),
+            method: "tools/list".to_string(),
+            params: json!({}),
+        };
+        let error = era_for_request_with(&tools_without_meta, true, false).unwrap_err();
+        assert_eq!(error.code, protocol::INVALID_PARAMS);
+        assert_ne!(error.code, protocol::RESOURCE_NOT_FOUND);
+        // Before any modern request it is a legacy client (backward compat).
+        assert_eq!(
+            era_for_request_with(&tools_without_meta, false, false).unwrap(),
+            Era::Legacy
+        );
+        // A legacy client that already completed `initialize` keeps working
+        // even after it probed the modern era (dual-era fallback).
+        assert_eq!(
+            era_for_request_with(&tools_without_meta, true, true).unwrap(),
+            Era::Legacy
+        );
+        // `_meta` present but missing required fields is also -32602.
+        let partial_meta = Request {
+            id: json!(2),
+            method: "tools/list".to_string(),
+            params: json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION
+                }
+            }),
+        };
+        assert_eq!(
+            era_for_request_with(&partial_meta, false, false)
+                .unwrap_err()
+                .code,
+            protocol::INVALID_PARAMS
+        );
+        // server/discover without _meta stays -32602 in all cases.
+        let discover = Request {
+            id: json!(3),
+            method: "server/discover".to_string(),
+            params: json!({}),
+        };
+        assert_eq!(
+            era_for_request_with(&discover, false, false)
+                .unwrap_err()
+                .code,
+            protocol::INVALID_PARAMS
+        );
+        // Unknown versions still get -32022 with the supported list.
+        let wrong = Request {
+            id: json!(4),
+            method: "tools/list".to_string(),
+            params: json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }),
+        };
+        let error = era_for_request_with(&wrong, true, false).unwrap_err();
+        assert_eq!(error.code, MODERN_UNSUPPORTED_VERSION);
+        assert_eq!(
+            error.data.as_ref().unwrap()["supported"][0],
+            MODERN_PROTOCOL_VERSION
+        );
+        // Legacy `_meta` carriers (progressToken) must not be mistaken for a
+        // malformed modern request.
+        let progress_only = Request {
+            id: json!(5),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "rdm_capabilities",
+                "arguments": {},
+                "_meta": { "progressToken": "p1" }
+            }),
+        };
+        assert_eq!(
+            era_for_request_with(&progress_only, false, false).unwrap(),
+            Era::Legacy
         );
     }
 

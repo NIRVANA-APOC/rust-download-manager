@@ -35,7 +35,7 @@ pub const EXIT_POLICY: u8 = 4;
 /// Map a stable agent error code onto the CLI exit-code contract.
 pub fn exit_code_for(code: ErrorCode) -> u8 {
     match code {
-        ErrorCode::PolicyDenied | ErrorCode::NeedsApproval => EXIT_POLICY,
+        ErrorCode::PolicyDenied | ErrorCode::NeedsApproval | ErrorCode::Conflict => EXIT_POLICY,
         ErrorCode::Paused | ErrorCode::Cancelled => EXIT_CONTROL_FLOW,
         _ => EXIT_FAILED,
     }
@@ -322,6 +322,7 @@ mod tests {
         assert_eq!(exit_code_for(ErrorCode::Cancelled), EXIT_CONTROL_FLOW);
         assert_eq!(exit_code_for(ErrorCode::PolicyDenied), EXIT_POLICY);
         assert_eq!(exit_code_for(ErrorCode::NeedsApproval), EXIT_POLICY);
+        assert_eq!(exit_code_for(ErrorCode::Conflict), EXIT_POLICY);
     }
 
     #[test]

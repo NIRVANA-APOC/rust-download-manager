@@ -1,11 +1,18 @@
 # RDM — Rust Download Manager
 
-> 纯 Rust 实现的多连接下载器：**GPUI** 桌面端 + Firefox 接管扩展 + 可复现的本地基准。
-> 不套壳 aria2、不依赖 Electron；把「分段下载的正确性、可观测性和浏览器交接」做成可验证的工程。
+> 纯 Rust 实现的多连接下载器：**GPUI** 桌面端 + Firefox 接管扩展 + **agent 接口（MCP/CLI/SKILL）**
+> + 可复现的本地基准。不套壳 aria2、不依赖 Electron；把「分段下载的正确性、可观测性和
+> agent/浏览器交接」做成可验证的工程。
 >
 > **独立验收（commit b8dfc88）**：构建 PASS，**140/140 测试通过**，`cargo fmt --check` 干净，
 > 引擎行为 7/7、GUI e2e 22/22、1 vs 8 连接 **7.77x**（64MiB release 5 次中位）。
 > 报告：[docs/qa-report.md](docs/qa-report.md)。
+>
+> **Agent 接口（commit 修复版）**：MCP stdio server（legacy + modern discover）、16 工具、
+> CLI JSON 信封、SKILL；本机 `cargo test --workspace` **277 passed / 0 failed**，
+> MCP stdio e2e **177 assertions / 0 failures**，`rdm selftest` 4/4、`rdm bench` 1→8 连接
+> 8MiB **5.75x**（SHA 一致）。契约：[docs/agent-integration.md](docs/agent-integration.md)，
+> SKILL：[skills/rdm/SKILL.md](skills/rdm/SKILL.md)。
 
 ![RDM GUI](docs/evidence/rdm-gui-final.png)
 
@@ -277,10 +284,10 @@ npx web-ext lint --source-dir extension/firefox
   pause/resume/cancel、单实例 URL 投递、截图证据。
 - 浏览器侧：53+5 项 Rust 测试、20 项 JS 测试、`web-ext lint` 0 errors / 0 warnings；
   native host → 真实 GUI 端到端 PASS（自动拉起 542ms、8MiB 下载、SHA-256 一致、日志脱敏）。
-- **Agent 接口**：`rdm-agent` 28 + `rdm-cli` 29+21 + `rdm-mcp` 34+3 项测试；MCP stdio
-  e2e 164 assertions / 0 failures（initialize/16 tools/下载/wait/verify/进度/取消/pause/resume/
+- **Agent 接口**：`rdm-agent` 28 + `rdm-cli` 31+34 + `rdm-mcp` 40+4 项测试；MCP stdio
+  e2e 177 assertions / 0 failures（initialize/16 tools/下载/wait/verify/进度/取消/pause/resume/
   审批/冲突/脱敏/dual-era/EOF）；QA 独立 conformance harness（`scripts/mcp_e2e.mjs`）。
-- 本机全量 `cargo test --workspace`：**255 passed / 0 failed**；`cargo fmt --check` 0 diff；
+- 本机全量 `cargo test --workspace`：**277 passed / 0 failed**；`cargo fmt --check` 0 diff；
   `rdm-agent/rdm-mcp/rdm-cli` clippy 0 warning。
 - 独立验收（commit b8dfc88）：**140/140 测试通过**，`cargo fmt --check` 0 diff，
   clippy 0 error/0 warning；引擎 release 行为 7/7、GUI e2e 22/22。详见

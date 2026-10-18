@@ -1,21 +1,41 @@
 //! `rdm probe` — remote metadata without downloading.
 
+use std::path::Path;
+
 use serde_json::{json, Value};
 
 use crate::cli::ProbeArgs;
 use crate::output::{engine_error, invalid_request, OutputMode, Reporter};
 use crate::util;
 
-pub async fn run(mode: OutputMode, args: ProbeArgs) -> u8 {
+pub async fn run(mode: OutputMode, store_root: &Path, args: ProbeArgs) -> u8 {
     let mut reporter = Reporter::new(mode, "probe");
     let request = match super::download::request_from_parts(args.url, args.net) {
         Ok(request) => request,
         Err(message) => return reporter.finish_err(invalid_request(message)),
     };
+    // URL syntax/scheme first (invalid_url/exit 2), then policy (exit 4).
+    if let Err(error) = util::validate_http_url(&request.url) {
+        return reporter.finish_err(error);
+    }
+
+    // Policy: probes are read-only but must not become an SSRF/绕过 surface.
+    let policy = match util::load_effective_policy(store_root) {
+        Ok(policy) => policy,
+        Err(error) => return reporter.finish_err(error),
+    };
+    if let Some(policy) = &policy {
+        if let Err(error) = util::policy_precheck(policy, &request.url, None) {
+            return reporter.finish_err(error);
+        }
+    }
 
     match rdm_core::probe(&request).await {
         Ok(meta) => {
             let mut warnings: Vec<&str> = Vec::new();
+            if policy.is_none() {
+                warnings.push(util::POLICY_ABSENT_WARNING);
+            }
             if !meta.supports_ranges {
                 warnings.push("range_unsupported");
             }
@@ -31,6 +51,7 @@ pub async fn run(mode: OutputMode, args: ProbeArgs) -> u8 {
                 "etag": meta.etag,
                 "last_modified": meta.last_modified,
                 "http_version": meta.http_version,
+                "policy_enforced": policy.is_some(),
                 "warnings": warnings,
             });
 

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rdm_agent::{Policy, TaskState};
+use rdm_agent::{AgentErrorInfo, ErrorCode, Policy, PolicyDecision, TaskState};
 
 // ---------------------------------------------------------------------------
 // Output macros that never panic on a closed pipe
@@ -406,6 +406,216 @@ pub enum GuiIpcStatus {
     Invalid(String),
 }
 
+// ---------------------------------------------------------------------------
+// Agent policy enforcement helpers (shared by download / probe / run)
+// ---------------------------------------------------------------------------
+
+/// Warning recorded when no `policy.json` exists: the safe defaults are NOT
+/// enforced by direct CLI commands (accepted by the agent contract).
+pub const POLICY_ABSENT_WARNING: &str =
+    "policy-file-absent: default policy limits are not enforced by this command";
+
+/// Load the effective policy of a task-store root.
+///
+/// `Ok(None)` means "no policy file" (CLI proceeds with a warning);
+/// `Err` means the file exists but cannot be read/parsed. Corrupt policy must
+/// never be silently ignored: agents rely on it as a security boundary.
+pub fn load_effective_policy(store_root: &Path) -> Result<Option<Policy>, AgentErrorInfo> {
+    match load_policy(store_root) {
+        Ok(policy) => Ok(policy.map(Policy::normalized)),
+        Err(message) => Err(crate::output::invalid_request(format!(
+            "invalid policy.json: {message}"
+        ))
+        .with_hint("fix `<state-dir>/policy.json`, or delete it to use built-in defaults")),
+    }
+}
+
+/// Parse/validate the URL *before* any policy decision: only `http`/`https`
+/// are supported. Invalid syntax and unsupported schemes are `invalid_url`
+/// (exit 2) — never `policy_denied` (exit 4), so agents can distinguish a bad
+/// request from a policy block.
+pub fn validate_http_url(raw: &str) -> Result<(), AgentErrorInfo> {
+    let parsed = url::Url::parse(raw).map_err(|error| {
+        AgentErrorInfo::new(
+            ErrorCode::InvalidUrl,
+            format!("invalid URL `{raw}`: {error}"),
+        )
+        .with_hint("pass an absolute http(s) URL, e.g. https://example.com/file.iso")
+        .with_details(serde_json::json!({ "url": raw }))
+    })?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(AgentErrorInfo::new(
+            ErrorCode::InvalidUrl,
+            format!("unsupported URL scheme `{scheme}`: only http/https are supported"),
+        )
+        .with_hint("pass an absolute http(s) URL, e.g. https://example.com/file.iso")
+        .with_details(serde_json::json!({ "url": raw, "scheme": scheme })));
+    }
+    Ok(())
+}
+
+/// URL/host + destination-directory policy pre-check.
+pub fn policy_precheck(
+    policy: &Policy,
+    url: &str,
+    dest_dir: Option<&Path>,
+) -> Result<(), AgentErrorInfo> {
+    match policy.check_url(url) {
+        PolicyDecision::Allow => {}
+        PolicyDecision::Deny { reason } => {
+            return Err(AgentErrorInfo::new(
+                ErrorCode::PolicyDenied,
+                format!("URL denied by policy: {reason}"),
+            )
+            .with_hint(
+                "add the host to `policy.json` allowed_hosts, or set allow_private_hosts=true",
+            )
+            .with_details(serde_json::json!({
+                "allowed_hosts": policy.allowed_hosts,
+                "allow_private_hosts": policy.allow_private_hosts,
+            })));
+        }
+        PolicyDecision::NeedsApproval {
+            reason,
+            total_bytes,
+        } => {
+            return Err(needs_approval_error(reason, total_bytes, policy));
+        }
+    }
+
+    if let Some(dir) = dest_dir {
+        if !policy.check_dest_dir(dir) {
+            return Err(AgentErrorInfo::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "destination `{}` is outside policy.allowed_dirs",
+                    dir.display()
+                ),
+            )
+            .with_hint("pick a destination inside an allowed dir, or update `policy.json`")
+            .with_details(serde_json::json!({ "allowed_dirs": policy.allowed_dirs })));
+        }
+    }
+    Ok(())
+}
+
+/// Size gate applied after `probe` learned the remote length.
+pub fn policy_gate_size(policy: &Policy, total_bytes: Option<u64>) -> Result<(), AgentErrorInfo> {
+    match policy.gate(total_bytes) {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny { reason } => Err(AgentErrorInfo::new(
+            ErrorCode::PolicyDenied,
+            format!("size denied by policy: {reason}"),
+        )
+        .with_hint("raise `max_bytes_per_task` in policy.json")
+        .with_details(serde_json::json!({
+            "total_bytes": total_bytes,
+            "max_bytes_per_task": policy.max_bytes_per_task,
+        }))),
+        PolicyDecision::NeedsApproval {
+            reason,
+            total_bytes,
+        } => Err(needs_approval_error(reason, total_bytes, policy)),
+    }
+}
+
+/// `allow_overwrite=false`: refuse *before* downloading when the target exists.
+pub fn policy_overwrite_gate(policy: &Policy, target: &Path) -> Result<(), AgentErrorInfo> {
+    if policy.allow_overwrite || !target.exists() {
+        return Ok(());
+    }
+    Err(AgentErrorInfo::new(
+        ErrorCode::Conflict,
+        format!("target file already exists: {}", target.display()),
+    )
+    .with_hint(
+        "remove/rename the existing file, choose another `--name`/dir, or set allow_overwrite=true in policy.json",
+    )
+    .with_details(serde_json::json!({
+        "path": target.display().to_string(),
+        "allow_overwrite": false,
+    })))
+}
+
+/// Error returned when streaming exceeds `max_bytes_per_task` (unknown length).
+pub fn policy_size_exceeded_error(
+    policy: &Policy,
+    downloaded: u64,
+    target: &Path,
+) -> AgentErrorInfo {
+    AgentErrorInfo::new(
+        ErrorCode::PolicyDenied,
+        format!(
+            "download exceeded policy.max_bytes_per_task ({downloaded} bytes downloaded) while streaming unknown length"
+        ),
+    )
+    .with_hint("raise `max_bytes_per_task` in policy.json; the partial `.part` file was kept")
+    .with_details(serde_json::json!({
+        "downloaded_bytes": downloaded,
+        "max_bytes_per_task": policy.max_bytes_per_task,
+        "part_path": target.display().to_string(),
+    }))
+}
+
+pub fn needs_approval_error(
+    reason: String,
+    total_bytes: Option<u64>,
+    policy: &Policy,
+) -> AgentErrorInfo {
+    AgentErrorInfo::new(
+        ErrorCode::NeedsApproval,
+        format!("approval required: {reason}"),
+    )
+    .with_hint(
+        "raise `require_approval_over_bytes` in policy.json; approval tokens are only available through the MCP plan/apply flow",
+    )
+    .with_details(serde_json::json!({
+        "total_bytes": total_bytes,
+        "require_approval_over_bytes": policy.require_approval_over_bytes,
+    }))
+}
+
+/// Approximate the engine's target filename for pre-download policy checks
+/// (the engine still performs its own Windows-safe sanitisation + de-dupe).
+pub fn candidate_target_path(dir: &Path, requested_name: Option<&str>, meta_name: &str) -> PathBuf {
+    let desired = requested_name.unwrap_or(meta_name);
+    dir.join(sanitize_file_name(desired))
+}
+
+/// Windows-safe filename sanitisation mirroring the engine's rules (used only
+/// for policy pre-checks; the engine remains authoritative).
+pub fn sanitize_file_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.trim().chars() {
+        if ch.is_control() {
+            out.push('_');
+            continue;
+        }
+        match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => out.push('_'),
+            _ => out.push(ch),
+        }
+    }
+    while out.ends_with(' ') || out.ends_with('.') {
+        out.pop();
+    }
+    let out = out.trim_start().to_string();
+    if out.is_empty() || out == "." || out == ".." {
+        return "download.bin".to_string();
+    }
+    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{out}")
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,14 +653,88 @@ mod tests {
     }
 
     #[test]
-    fn parses_task_states() {
-        assert_eq!(
-            parse_states(&["completed,failed".to_string(), "paused".to_string()])
-                .unwrap()
-                .unwrap(),
-            vec![TaskState::Completed, TaskState::Failed, TaskState::Paused]
-        );
-        assert!(parse_states(&["nope".to_string()]).is_err());
-        assert!(parse_states(&[]).unwrap().is_none());
+    fn validates_http_urls_before_policy() {
+        assert!(validate_http_url("https://example.com/a.bin").is_ok());
+        assert!(validate_http_url("http://127.0.0.1:9/a").is_ok());
+        for bad in [
+            "ftp://example.com/x",
+            "file:///C:/x",
+            "example.com/x",
+            "",
+            "http://[broken",
+        ] {
+            let error = validate_http_url(bad).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidUrl, "url: {bad}");
+        }
+    }
+
+    #[test]
+    fn sanitizes_policy_target_names() {
+        assert_eq!(sanitize_file_name("a/b:c*?.bin"), "a_b_c__.bin");
+        assert_eq!(sanitize_file_name("CON"), "_CON");
+        assert_eq!(sanitize_file_name("  ..  "), "download.bin");
+        assert_eq!(sanitize_file_name("report.bin"), "report.bin");
+    }
+
+    #[test]
+    fn policy_helpers_enforce_hosts_size_and_overwrite() {
+        let default = Policy::default();
+        let denied = policy_precheck(&default, "http://127.0.0.1:9/file", None).unwrap_err();
+        assert_eq!(denied.code, ErrorCode::PolicyDenied);
+
+        let allow_private = Policy {
+            allow_private_hosts: true,
+            ..Policy::default()
+        };
+        assert!(policy_precheck(&allow_private, "http://127.0.0.1:9/file", None).is_ok());
+
+        let target = std::env::temp_dir().join(format!(
+            "rdm-policy-target-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&target, b"x").unwrap();
+        let conflict = policy_overwrite_gate(&allow_private, &target).unwrap_err();
+        assert_eq!(conflict.code, ErrorCode::Conflict);
+        let overwrite = Policy {
+            allow_overwrite: true,
+            ..allow_private
+        };
+        assert!(policy_overwrite_gate(&overwrite, &target).is_ok());
+        let _ = std::fs::remove_file(&target);
+
+        let size_denied = policy_gate_size(
+            &Policy {
+                max_bytes_per_task: Some(10),
+                ..Policy::default()
+            },
+            Some(11),
+        )
+        .unwrap_err();
+        assert_eq!(size_denied.code, ErrorCode::PolicyDenied);
+
+        let approval = policy_gate_size(
+            &Policy {
+                max_bytes_per_task: None,
+                require_approval_over_bytes: Some(5),
+                ..Policy::default()
+            },
+            Some(10),
+        )
+        .unwrap_err();
+        assert_eq!(approval.code, ErrorCode::NeedsApproval);
+
+        assert!(policy_gate_size(
+            &Policy {
+                max_bytes_per_task: None,
+                require_approval_over_bytes: None,
+                ..Policy::default()
+            },
+            None,
+        )
+        .is_ok());
     }
 }

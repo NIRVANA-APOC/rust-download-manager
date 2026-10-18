@@ -30,8 +30,51 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
         Ok(request) => request,
         Err(message) => return reporter.finish_err(invalid_request(message)),
     };
+    // URL syntax/scheme first (invalid_url/exit 2), then policy (exit 4).
+    if let Err(error) = util::validate_http_url(&request.url) {
+        return reporter.finish_err(error);
+    }
     if let Err(error) = super::validate_connections(request.connections) {
         return reporter.finish_err(error);
+    }
+
+    // ---- Agent policy (only enforced when an explicit policy.json exists) ---
+    let dest_dir = request
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let policy = match util::load_effective_policy(store_root) {
+        Ok(policy) => policy,
+        Err(error) => return reporter.finish_err(error),
+    };
+    let policy_warning = if policy.is_none() {
+        Some(util::POLICY_ABSENT_WARNING)
+    } else {
+        None
+    };
+    // Unknown-length streams cannot be size-gated up-front: watch progress and
+    // pause as soon as the download passes `max_bytes_per_task`.
+    let mut unknown_length_monitor: Option<(rdm_agent::Policy, PathBuf)> = None;
+    if let Some(policy) = &policy {
+        if let Err(error) = util::policy_precheck(policy, &request.url, Some(&dest_dir)) {
+            return reporter.finish_err(error);
+        }
+        // Probe once so size / overwrite gates run before any bytes hit disk.
+        let meta = match rdm_core::probe(&request).await {
+            Ok(meta) => meta,
+            Err(error) => return reporter.finish_err(engine_error(&error)),
+        };
+        if let Err(error) = util::policy_gate_size(policy, meta.total_bytes) {
+            return reporter.finish_err(error);
+        }
+        let target =
+            util::candidate_target_path(&dest_dir, request.file_name.as_deref(), &meta.file_name);
+        if let Err(error) = util::policy_overwrite_gate(policy, &target) {
+            return reporter.finish_err(error);
+        }
+        if meta.total_bytes.is_none() && policy.max_bytes_per_task.is_some() {
+            unknown_length_monitor = Some((policy.clone(), target));
+        }
     }
 
     // Idempotency: reuse a completed task with the same key.
@@ -59,10 +102,6 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
         }
     }
 
-    let dest_dir = request
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let fallback_name = request
         .file_name
         .clone()
@@ -77,6 +116,12 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
     );
     reporter.set_task_id(tracker.id());
     let store_warning = tracker.take_warning();
+    if let Some(warning) = policy_warning {
+        tracker.push_warning(warning);
+        if reporter.is_text() {
+            crate::errln!("warning: {warning} (download continues)");
+        }
+    }
 
     let mut human = HumanOutput::new(quiet);
     if reporter.is_text() {
@@ -94,6 +139,7 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
     tokio::pin!(ctrl_c);
 
     let mut interrupted = false;
+    let mut policy_violation: Option<AgentErrorInfo> = None;
     let result;
     loop {
         tokio::select! {
@@ -103,6 +149,12 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
                 break;
             }
             Some(event) = rx.recv() => {
+                observe_unknown_length(
+                    &event,
+                    &unknown_length_monitor,
+                    &mut policy_violation,
+                    &handle,
+                );
                 handle_event(&mut reporter, &mut tracker, &mut human, &event);
             }
             signal = &mut ctrl_c, if !interrupted => {
@@ -121,10 +173,16 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
         }
     }
     while let Ok(event) = rx.try_recv() {
+        observe_unknown_length(
+            &event,
+            &unknown_length_monitor,
+            &mut policy_violation,
+            &handle,
+        );
         handle_event(&mut reporter, &mut tracker, &mut human, &event);
     }
 
-    let error_info: Option<AgentErrorInfo> = match &result {
+    let mut error_info: Option<AgentErrorInfo> = match &result {
         Ok(summary) => {
             tracker.apply_completed(summary);
             reporter.event("completed", summary_event_json(summary));
@@ -158,6 +216,16 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
             Some(info)
         }
     };
+    // A streamed unknown-length response that crossed `max_bytes_per_task` was
+    // paused by us; report it as a policy denial (exit 4), not a user pause.
+    if let Some(violation) = policy_violation.take() {
+        tracker.apply_failed(&violation);
+        reporter.event(
+            "failed",
+            json!({ "error": serde_json::to_value(&violation).unwrap_or(Value::Null) }),
+        );
+        error_info = Some(violation);
+    }
     tracker.persist(true);
 
     match error_info {
@@ -195,6 +263,35 @@ fn summary_event_json(summary: &DownloadSummary) -> Value {
         "range_supported": summary.range_supported,
         "http_version": summary.http_version,
     })
+}
+
+/// Enforce `max_bytes_per_task` for unknown-length streams by watching progress
+/// and pausing the download as soon as the budget is crossed.
+fn observe_unknown_length(
+    event: &DownloadEvent,
+    monitor: &Option<(rdm_agent::Policy, PathBuf)>,
+    violation: &mut Option<AgentErrorInfo>,
+    handle: &DownloadHandle,
+) {
+    if violation.is_some() {
+        return;
+    }
+    let Some((policy, target)) = monitor else {
+        return;
+    };
+    let DownloadEvent::Progress { downloaded, .. } = event else {
+        return;
+    };
+    if let Some(max) = policy.max_bytes_per_task {
+        if *downloaded > max {
+            *violation = Some(util::policy_size_exceeded_error(
+                policy,
+                *downloaded,
+                target,
+            ));
+            handle.pause();
+        }
+    }
 }
 
 fn metadata_event_json(meta: &rdm_core::RemoteMeta) -> Value {

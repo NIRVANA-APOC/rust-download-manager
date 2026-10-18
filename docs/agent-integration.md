@@ -179,6 +179,16 @@
 - 成功与失败都返回 `structuredContent`；失败同时 `isError: true` 且 `content[0].text` 为人类摘要；
 - 所有金额/大小用字节，时间用 ISO-8601 带时区；ID 稳定。
 
+**annotations 的实际取值（v1，MCP 语义）**：
+
+| 属性 | 取值 |
+|---|---|
+| `readOnlyHint=true` | capabilities / probe / plan_download / list_tasks / get_task / wait_task / verify_file / doctor / selftest / bench |
+| `destructiveHint=true` | download / apply_plan / cancel_task / state_maintenance |
+| `destructiveHint=false`（但仍写状态） | pause_task / resume_task（暂停/继续不是破坏性操作，`idempotentHint=true`） |
+| `openWorldHint=true` | probe / download / plan_download / apply_plan / resume_task / doctor（会访问外部网络） |
+| `idempotentHint=true` | 除 download/apply_plan 外的只读或状态幂等工具；download 由 `idempotency_key` 提供应用级幂等 |
+
 `rdm_download` 输入参数（与 `DownloadRequest` 对齐 + agent 字段）：
 
 ```jsonc

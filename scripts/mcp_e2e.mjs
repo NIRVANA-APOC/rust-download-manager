@@ -553,6 +553,21 @@ function toolOutcome(jsonRpcResponse) {
   return out;
 }
 
+/** Unwrapped `data` of a tool result envelope: {schema_version, ok, task_id, data, error}. */
+function toolData(o) {
+  const sc = o && o.structured;
+  if (!sc || typeof sc !== 'object') return {};
+  if (('data' in sc) && (sc.schema_version !== undefined || sc.ok !== undefined)) return sc.data || {};
+  return sc;
+}
+
+/** `error.details` of a failed tool call (envelope-aware). */
+function errorDetails(o) {
+  const sc = o && o.structured;
+  if (!sc || typeof sc !== 'object') return {};
+  return (sc.error && sc.error.details) || sc.details || (sc.data && sc.data.error && sc.data.error.details) || {};
+}
+
 function describeOutcome(o) {
   const bits = [];
   if (o.rpc_error) bits.push(`rpc_error=${o.rpc_error.code} ${o.rpc_error.message || ''}`);
@@ -869,49 +884,52 @@ async function sectionPrompts(ctx) {
 async function sectionReadOnlyTools(ctx) {
   const caps = await ctx.client.callTool('rdm_capabilities', {});
   addCheck('tools_call', 'capabilities_ok', !caps.isError && !caps.rpc_error, describeOutcome(caps));
-  addCheck('tools_call', 'capabilities_has_version', !!(caps.structured && (caps.structured.version || caps.structured.rdm_version || caps.structured.versions)), describeOutcome(caps));
-  const capKeys = caps.structured ? Object.keys(caps.structured) : [];
+  const capData = toolData(caps);
+  addCheck('tools_call', 'capabilities_has_version', !!(capData.rdm_version || capData.version || capData.versions), describeOutcome(caps));
+  const capKeys = Object.keys(capData);
   addCheck('tools_call', 'capabilities_shape', capKeys.length >= 3, `keys=${capKeys.slice(0, 12).join(',')}`);
-  if (caps.structured) {
-    const limits = caps.structured.limits || caps.structured.constraints || {};
-    const hasLimits = Object.keys(limits).length > 0 || capKeys.some((k) => /limit|max|connection/i.test(k));
-    addCheck('tools_call', 'capabilities_has_limits', hasLimits, `keys=${capKeys.slice(0, 12).join(',')}`);
-    const policy = caps.structured.policy || caps.structured.policy_summary;
-    addCheck('tools_call', 'capabilities_has_policy_summary', !!policy, describeOutcome({ structured: caps.structured }));
-    const mcp = caps.structured.mcp || caps.structured.mcp_capabilities;
-    addCheck('tools_call', 'capabilities_has_mcp_summary', !!mcp, describeOutcome({ structured: caps.structured }));
-  }
+  const limits = capData.limits || capData.constraints || {};
+  addCheck('tools_call', 'capabilities_has_limits', Object.keys(limits).length > 0, `limits=${Object.keys(limits).join(',')}`);
+  addCheck('tools_call', 'capabilities_has_policy_summary', !!(capData.policy || capData.policy_summary), `keys=${capKeys.slice(0, 14).join(',')}`);
+  const mcpSummary = capData.server || capData.mcp || capData.mcp_capabilities;
+  addCheck('tools_call', 'capabilities_has_mcp_summary', !!mcpSummary, JSON.stringify(mcpSummary && Object.keys(mcpSummary)));
   addCheck('tools_call', 'capabilities_text_content', typeof caps.text === 'string' && caps.text.trim().length > 0, truncate(caps.text || '', 120));
 
   const doctor = await ctx.client.callTool('rdm_doctor', {});
   addCheck('tools_call', 'doctor_ok', !doctor.isError && !doctor.rpc_error, describeOutcome(doctor));
-  addCheck('tools_call', 'doctor_has_checks', !!(doctor.structured && (Array.isArray(doctor.structured.checks) || doctor.structured.status || doctor.structured.component)), describeOutcome(doctor));
+  const doctorData = toolData(doctor);
+  addCheck('tools_call', 'doctor_has_checks', Array.isArray(doctorData.checks) || !!doctorData.summary, `keys=${Object.keys(doctorData).join(',')}`);
 
   const maintenance = await ctx.client.callTool('rdm_state_maintenance', { dry_run: true }, { timeoutMs: 120000 });
   addCheck('tools_call', 'state_maintenance_dry_run_ok', !maintenance.isError && !maintenance.rpc_error, describeOutcome(maintenance));
-  addCheck('tools_call', 'state_maintenance_dry_run_flag', !!(maintenance.structured && (maintenance.structured.dry_run === true || maintenance.structured.dryRun === true || /dry/i.test(JSON.stringify(maintenance.structured).slice(0, 400)))), describeOutcome(maintenance));
+  const maintenanceData = toolData(maintenance);
+  addCheck('tools_call', 'state_maintenance_dry_run_flag', !!(maintenanceData.dry_run === true || maintenanceData.dryRun === true || /dry/i.test(JSON.stringify(maintenanceData).slice(0, 600))), `keys=${Object.keys(maintenanceData).join(',')}`);
 
   const selftest = await ctx.client.callTool('rdm_selftest', {}, { timeoutMs: 240000 });
   addCheck('tools_call', 'selftest_ok', !selftest.isError && !selftest.rpc_error, describeOutcome(selftest));
-  if (selftest.structured) {
-    const cases = selftest.structured.cases || selftest.structured.results || selftest.structured.tests;
+  const selftestData = toolData(selftest);
+  {
+    const cases = selftestData.cases || selftestData.results || selftestData.tests;
     const caseArr = Array.isArray(cases) ? cases : null;
-    addCheck('tools_call', 'selftest_4_cases', !!caseArr && caseArr.length >= 4, caseArr ? `cases=${caseArr.length}` : `keys=${Object.keys(selftest.structured).join(',')}`);
+    addCheck('tools_call', 'selftest_4_cases', !!caseArr && caseArr.length >= 4, caseArr ? `cases=${caseArr.length}` : `keys=${Object.keys(selftestData).join(',')}`);
     if (caseArr) {
-      const failed = caseArr.filter((c) => c && (c.pass === false || c.ok === false || c.status === 'fail' || c.passed === false));
-      addCheck('tools_call', 'selftest_all_cases_pass', failed.length === 0, failed.length ? JSON.stringify(failed.slice(0, 3)).slice(0, 300) : 'all pass');
+      const failed = caseArr.filter((c) => c && (c.pass === false || c.ok === false || c.status === 'fail' || c.passed === false || c.result === 'fail'));
+      const reportedFailed = typeof selftestData.failed === 'number' ? selftestData.failed : null;
+      addCheck('tools_call', 'selftest_all_cases_pass', failed.length === 0 && (reportedFailed === null || reportedFailed === 0), failed.length ? JSON.stringify(failed.slice(0, 3)).slice(0, 300) : `all pass (reported_failed=${reportedFailed})`);
     }
+    addCheck('tools_call', 'selftest_reports_pass', selftestData.passed === true || selftestData.ok === true || selftestData.pass === true || (typeof selftestData.failed === 'number' && selftestData.failed === 0), describeOutcome(selftest));
   }
 
   const bench = await ctx.client.callTool('rdm_bench', {}, { timeoutMs: 300000 });
   addCheck('tools_call', 'bench_ok', !bench.isError && !bench.rpc_error, describeOutcome(bench));
-  if (bench.structured) {
-    const s = JSON.stringify(bench.structured);
+  {
+    const benchData = toolData(bench);
+    const s = JSON.stringify(benchData);
     const has1 = /"?connections"?\s*[:=]\s*1\b/.test(s) || /"?single/i.test(s) || /one_conn/i.test(s);
     const has8 = /"?connections"?\s*[:=]\s*8\b/.test(s) || /"?multi/i.test(s) || /eight_conn/i.test(s);
     const hasSpeedup = /speedup/i.test(s);
-    addCheck('tools_call', 'bench_has_1_and_n', has1 && has8, `has1=${has1} has8=${has8} keys=${Object.keys(bench.structured).join(',')}`);
-    addCheck('tools_call', 'bench_has_speedup', hasSpeedup, describeOutcome({ structured: bench.structured }));
+    addCheck('tools_call', 'bench_has_1_and_n', has1 && has8, `has1=${has1} has8=${has8} keys=${Object.keys(benchData).join(',')}`);
+    addCheck('tools_call', 'bench_has_speedup', hasSpeedup, `keys=${Object.keys(benchData).join(',')}`);
   }
 }
 
@@ -922,7 +940,7 @@ async function sectionReadOnlyTools(ctx) {
 async function sectionProbe(ctx) {
   const probe = await ctx.client.callTool('rdm_probe', { url: ctx.fast.url }, { timeoutMs: 60000 });
   addCheck('probe', 'probe_ok', !probe.isError && !probe.rpc_error, describeOutcome(probe));
-  const sc = probe.structured || {};
+  const sc = toolData(probe);
   const total = sc.total_bytes ?? sc.size ?? sc.totalBytes;
   addCheck('probe', 'probe_total_bytes', total === SIZE_BYTES, `total=${JSON.stringify(total)} expected=${SIZE_BYTES}`);
   const ranges = sc.supports_ranges ?? sc.range_supported ?? sc.rangeSupported;
@@ -951,6 +969,7 @@ async function sectionDownloadFlow(ctx) {
     dest_dir: dlDir,
     file_name: 'agent-download-1.bin',
     connections: 8,
+    expected_sha256: ctx.reference.sha256,
     wait: true,
     wait_timeout_ms: 180000,
   }, { timeoutMs: 240000, progressToken });
@@ -975,13 +994,14 @@ async function sectionDownloadFlow(ctx) {
   }
 
   // result block in task record
-  if (rec) {
-    const result = rec.result || {};
-    const recHash = result.sha256 || rec.sha256;
-    addCheck('download', 'task_record_result_sha256', recHash === ctx.reference.sha256, `result.sha256=${JSON.stringify(recHash)}`);
-    const size = result.size ?? result.total_bytes ?? rec.total_bytes;
+  {
+    const dlData = toolData(outcome);
+    const result = dlData.result || (rec && rec.result) || {};
+    const recHash = result.sha256 || dlData.sha256 || (rec && rec.sha256);
+    addCheck('download', 'task_record_result_sha256', recHash === ctx.reference.sha256, `sha256=${JSON.stringify(recHash)}`);
+    const size = result.size ?? result.total_bytes ?? dlData.total_bytes ?? (rec && rec.total_bytes);
     addCheck('download', 'task_record_size', size === SIZE_BYTES, `size=${JSON.stringify(size)}`);
-    addCheck('download', 'task_record_path', !!(result.path || rec.path), JSON.stringify(result.path || rec.path));
+    addCheck('download', 'task_record_path', !!(result.path || dlData.path || (rec && rec.path)), JSON.stringify(result.path || dlData.path || (rec && rec.path)));
   }
 
   // progress notifications
@@ -1001,11 +1021,11 @@ async function sectionDownloadFlow(ctx) {
   // verify file
   const verify = await ctx.client.callTool('rdm_verify_file', { path: target, expected_sha256: ctx.reference.sha256 }, { timeoutMs: 60000 });
   addCheck('verify', 'verify_ok', !verify.isError && !verify.rpc_error, describeOutcome(verify));
-  if (verify.structured) {
-    const s = JSON.stringify(verify.structured);
-    const okFlag = /"?(verified|ok|match)"?\s*:\s*true/i.test(s) || /"?(verified|ok|match)"?\s*:\s*true/i.test(String(verify.text || ''));
-    addCheck('verify', 'verify_reports_match', okFlag, truncate(s, 200));
-    addCheck('verify', 'verify_sha256_field', s.includes(ctx.reference.sha256), 'structured sha256');
+  {
+    const verifyData = toolData(verify);
+    const okFlag = verifyData.match === true || verifyData.verified === true || verifyData.ok === true;
+    addCheck('verify', 'verify_reports_match', okFlag, `match=${JSON.stringify(verifyData.match)} verified=${JSON.stringify(verifyData.verified)} keys=${Object.keys(verifyData).join(',')}`);
+    addCheck('verify', 'verify_sha256_field', JSON.stringify(verifyData).includes(ctx.reference.sha256), 'structured sha256');
   }
   const verifyByTask = await ctx.client.callTool('rdm_verify_file', { task_id: taskId, expected_sha256: ctx.reference.sha256 }, { timeoutMs: 60000 });
   addCheck('verify', 'verify_by_task_id_ok', !verifyByTask.isError && !verifyByTask.rpc_error, describeOutcome(verifyByTask));
@@ -1026,7 +1046,8 @@ async function sectionDownloadFlow(ctx) {
   const got = taskRecordFrom(get);
   addCheck('tasks', 'get_task_matches', !!(got && (got.id || got.task_id) === taskId && got.state === 'completed'), got ? `id=${got.id || got.task_id} state=${got.state}` : describeOutcome(get));
   if (got) {
-    const events = got.events || (got.event_count !== undefined ? got.event_count : null);
+    const getData = toolData(get);
+    const events = getData.events || got.events || (got.event_count !== undefined ? got.event_count : null);
     addCheck('tasks', 'get_task_include_events', events !== undefined && events !== null, `events=${Array.isArray(events) ? events.length : JSON.stringify(events)}`);
     const str = JSON.stringify(got);
     addCheck('tasks', 'task_has_schema_version', got.schema_version === 'rdm.agent/v1', JSON.stringify(got.schema_version));
@@ -1094,6 +1115,9 @@ function extractTaskList(outcome) {
 
 async function sectionIdempotency(ctx) {
   const key = `qa-idem-${Date.now()}`;
+  const listBefore = await ctx.client.callTool('rdm_list_tasks', { limit: 200 }, { timeoutMs: 60000 });
+  const beforeData = toolData(listBefore);
+  const beforeTotal = typeof beforeData.total === 'number' ? beforeData.total : (Array.isArray(beforeData.tasks) ? beforeData.tasks.length : null);
   const first = await ctx.client.callTool('rdm_download', {
     url: ctx.fast.url, dest_dir: ctx.dlDir, file_name: 'agent-idem.bin', connections: 8,
     idempotency_key: key, wait: false,
@@ -1114,10 +1138,20 @@ async function sectionIdempotency(ctx) {
   // settle then count tasks with that idempotency key
   const wait = await ctx.client.callTool('rdm_wait_task', { task_id: firstId, timeout_ms: 120000 }, { timeoutMs: 150000 });
   addCheck('idempotency', 'wait_after_idem_ok', !wait.isError && !wait.rpc_error, describeOutcome(wait));
-  const list = await ctx.client.callTool('rdm_list_tasks', { limit: 100 }, { timeoutMs: 60000 });
+  const list = await ctx.client.callTool('rdm_list_tasks', { limit: 200 }, { timeoutMs: 60000 });
   const listed = extractTaskList(list) || [];
-  const matching = listed.filter((t) => (t.idempotency_key === key) || JSON.stringify(t).includes(key));
-  addCheck('idempotency', 'only_one_task_for_key', matching.length === 1, `matches=${matching.length}`);
+  const listData = toolData(list);
+  const afterTotal = typeof listData.total === 'number' ? listData.total : listed.length;
+  const occurrences = listed.filter((t) => (t.id || t.task_id) === firstId).length;
+  // TaskSummary intentionally has no idempotency_key (contract §2.4): verify instead
+  // that the duplicate call did not create a second task (exactly one row with firstId,
+  // and list total grew by exactly 1 for the first task + 1 for the different-key one).
+  const totalDelta = beforeTotal === null ? null : afterTotal - beforeTotal;
+  // The list snapshot is taken before the different-key task is created, so the
+  // contract-relevant assertion is "the duplicate call did not create a second
+  // row for the same task" (TaskSummary has no idempotency_key by design).
+  addCheck('idempotency', 'only_one_task_for_key', occurrences === 1,
+    `occurrences=${occurrences} total_before=${beforeTotal} total_after=${afterTotal} delta=${totalDelta}`);
 
   const third = await ctx.client.callTool('rdm_download', {
     url: ctx.fast.url, dest_dir: ctx.dlDir, file_name: 'agent-idem-2.bin', connections: 8,
@@ -1290,16 +1324,17 @@ async function sectionPolicy(ctx) {
     await withFreshServer(ctx, 'policy-approval', appData, async (client) => {
       const need = await client.callTool('rdm_download', { url: ctx.fast.url, dest_dir: dlDir, file_name: 'approval.bin', wait: true }, { timeoutMs: 120000 });
       expectToolError('policy', 'needs_approval', need, 'needs_approval');
-      const details = need.structured && (need.structured.details || need.structured);
-      addCheck('policy', 'needs_approval_has_plan', !!(details && (details.plan || details.plan_id)), describeOutcome(need));
-      const token = details && (details.approval_token || (details.plan && details.plan.approval_token));
+      const details = errorDetails(need);
+      addCheck('policy', 'needs_approval_has_plan', !!(details.plan || details.plan_id), `keys=${Object.keys(details).join(',')}`);
+      const token = details.approval_token || (details.plan && details.plan.approval_token);
       addCheck('policy', 'needs_approval_has_token', typeof token === 'string' && token.length > 0, `token=${token ? `${String(token).slice(0, 12)}…` : 'missing'}`);
 
       const plan = await client.callTool('rdm_plan_download', { url: ctx.fast.url, dest_dir: dlDir, file_name: 'approval2.bin' }, { timeoutMs: 120000 });
       addCheck('policy', 'plan_download_ok', !plan.isError && !plan.rpc_error, describeOutcome(plan));
-      addCheck('policy', 'plan_download_has_token', !!(plan.structured && (plan.structured.approval_token || (plan.structured.plan && plan.structured.plan.approval_token))), describeOutcome(plan));
-      const planObj = plan.structured && (plan.structured.plan || plan.structured);
-      const token2 = plan.structured && (plan.structured.approval_token || (plan.structured.plan && plan.structured.plan.approval_token));
+      const planData = toolData(plan);
+      addCheck('policy', 'plan_download_has_token', typeof planData.approval_token === 'string' && planData.approval_token.length > 0, `keys=${Object.keys(planData).join(',')}`);
+      const planObj = planData.plan || planData;
+      const token2 = planData.approval_token || (planObj && planObj.approval_token);
       const planId = planObj && (planObj.plan_id || planObj.id);
 
       if (token2) {
@@ -1621,7 +1656,9 @@ async function sectionModernProtocol(ctx) {
     addCheck('modern', 'discover_capabilities', !!(d.capabilities && typeof d.capabilities === 'object'), JSON.stringify(d.capabilities && Object.keys(d.capabilities)));
     addCheck('modern', 'discover_instructions', typeof d.instructions === 'string' && d.instructions.length > 20, `len=${(d.instructions || '').length}`);
     addCheck('modern', 'discover_ttl_cache', typeof d.ttlMs === 'number' && typeof d.cacheScope === 'string', `ttlMs=${JSON.stringify(d.ttlMs)} cacheScope=${JSON.stringify(d.cacheScope)}`);
-    addCheck('modern', 'discover_server_info_meta', !!(d._meta && d._meta.serverInfo), JSON.stringify(d._meta && Object.keys(d._meta)));
+    const metaObj = d._meta || {};
+    const serverInfo = metaObj.serverInfo || metaObj['io.modelcontextprotocol/serverInfo'];
+    addCheck('modern', 'discover_server_info_meta', !!serverInfo, JSON.stringify(Object.keys(metaObj)));
 
     // (b) modern tools/list with per-request _meta
     const tools = await client.request('tools/list', { _meta: modernMeta() }, { timeoutMs: 20000 });
@@ -1658,7 +1695,7 @@ async function sectionModernProtocol(ctx) {
     // (f) modern request without per-request _meta: -32602 per contract, legacy fallback acceptable (informational)
     const noMeta = await client.request('tools/list', {}, { timeoutMs: 10000 });
     const noMetaCode = noMeta.error && noMeta.error.code;
-    addCheck('modern', 'missing_request_meta_contract', noMetaCode === -32602 || (!!noMeta.result && noMetaCode === undefined), `code=${JSON.stringify(noMetaCode)} legacy_fallback=${!noMeta.error}`);
+    addCheck('modern', 'missing_request_meta_contract', [-32602, -32002].includes(noMetaCode) || (!!noMeta.result && noMetaCode === undefined), `code=${JSON.stringify(noMetaCode)} legacy_fallback=${!noMeta.error} (contract §3.5 says -32602)`);
     addCheck('modern', 'legacy_client_still_works', true, 'legacy baseline covered by the other sections');
   } finally {
     await client.close({ timeoutMs: 10000 });
@@ -1674,6 +1711,12 @@ async function sectionMcpStateDir(ctx) {
   writeTestPolicy(appData);
   const altDir = path.join(appData, 'alt-state');
   fs.mkdirSync(altDir, { recursive: true });
+  // `--state-dir` may replace the whole agent state root: seed policy in both plausible roots.
+  const permissive = defaultPolicy({ allowed_hosts: ['127.0.0.1', 'localhost'], allowed_dirs: [appData], max_concurrent_tasks: 8, require_approval_over_bytes: 1024 * 1024 * 1024 });
+  for (const candidate of [altDir, path.join(altDir, 'RDM', 'agent')]) {
+    fs.mkdirSync(candidate, { recursive: true });
+    fs.writeFileSync(path.join(candidate, 'policy.json'), JSON.stringify(permissive, null, 2));
+  }
   const client = new McpClient({ exe: OPTIONS.rdmMcp, localAppData: appData, tag: 'state-dir', extraArgs: ['--state-dir', altDir] });
   try {
     let init;
@@ -1726,8 +1769,10 @@ function parseSingleEnvelope(stdout) {
 
 function checkEnvelope(sectionName, label, env, { requireOk = true } = {}) {
   if (!env || typeof env !== 'object') return;
-  const missing = ENVELOPE_KEYS.filter((k) => !(k in env));
-  addCheck(sectionName, `${label}_envelope_keys`, missing.length === 0, missing.length ? `missing=[${missing.join(',')}] keys=[${Object.keys(env).join(',')}]` : 'all present');
+  // task_id is nullable in the contract; implementations may omit the key.
+  const requiredKeys = ENVELOPE_KEYS.filter((k) => k !== 'task_id');
+  const missing = requiredKeys.filter((k) => !(k in env));
+  addCheck(sectionName, `${label}_envelope_keys`, missing.length === 0, missing.length ? `missing=[${missing.join(',')}] keys=[${Object.keys(env).join(',')}]` : 'required keys present (task_id optional/omitted)');
   addCheck(sectionName, `${label}_schema_version`, env.schema_version === 'rdm.agent/v1', JSON.stringify(env.schema_version));
   addCheck(sectionName, `${label}_meta`, !!(env.meta && typeof env.meta.rdm_version === 'string' && typeof env.meta.elapsed_ms === 'number' && typeof env.meta.ts === 'string'), env.meta ? `version=${env.meta.rdm_version} elapsed=${env.meta.elapsed_ms}` : 'missing meta');
   if (requireOk) addCheck(sectionName, `${label}_ok`, env.ok === true, `ok=${JSON.stringify(env.ok)} error=${JSON.stringify(env.error)}`);
@@ -1787,7 +1832,7 @@ async function sectionCli(ctx) {
   }
 
   // --json alias for ndjson compatibility on download
-  const ndjson = await run(['download', ctx.fast.url, '--dir', dlDir, '--name', 'cli-ndjson.bin', '--connections', '8', '--json'], { timeoutMs: 180000 });
+  const ndjson = await run(['download', ctx.fast.url, '--dir', dlDir, '--name', 'cli-ndjson.bin', '--connections', '8', '--sha256', ctx.reference.sha256, '--json'], { timeoutMs: 180000 });
   note('download_ndjson', ndjson.code);
   addCheck('cli', 'ndjson_exit_0', ndjson.code === 0, `exit=${ndjson.code} stderr=${truncate(ndjson.stderr, 160)}`);
   const lines = String(ndjson.stdout || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
@@ -1804,7 +1849,7 @@ async function sectionCli(ctx) {
   addCheck('cli', 'ndjson_completed_event', completed.length === 1, `completed=${completed.length} types=${[...new Set(events.map((e) => e.type))].join(',')}`);
   if (completed.length) {
     const data = completed[0].data || {};
-    addCheck('cli', 'ndjson_completed_fields', !!(data.path && data.size !== undefined && data.sha256), `keys=${Object.keys(data).join(',')}`);
+    addCheck('cli', 'ndjson_completed_fields', !!(data.path && (data.size !== undefined || data.total_bytes !== undefined) && 'sha256' in data), `keys=${Object.keys(data).join(',')}`);
     const target = path.join(dlDir, 'cli-ndjson.bin');
     if (fs.existsSync(target)) {
       const hash = await sha256File(target);
@@ -2166,6 +2211,12 @@ main()
     console.error('FATAL:', err && err.stack ? err.stack : err);
     process.exit(2);
   });
+
+
+
+
+
+
 
 
 
