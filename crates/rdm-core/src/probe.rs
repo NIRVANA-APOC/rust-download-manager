@@ -9,6 +9,8 @@
 //! 3. Filename priority: `Content-Disposition` `filename*` → `filename` →
 //!    final URL's last path segment → `download.bin`.
 
+use std::collections::BTreeMap;
+
 use reqwest::header::{
     HeaderMap, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
     ETAG, LAST_MODIFIED, RANGE,
@@ -17,7 +19,7 @@ use reqwest::{Client, StatusCode};
 
 use crate::client::validate_url;
 use crate::filename;
-use crate::{DownloadError, DownloadRequest, RemoteMeta};
+use crate::{DetailedMeta, DownloadError, DownloadRequest, RemoteMeta};
 
 /// Parsed `Content-Range` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +161,20 @@ pub(crate) async fn probe_with(
                 head_version,
             ));
         }
+        if request.single_stream {
+            // `single_stream` downloads never use ranges, so do not spend a
+            // ranged GET just to prove range support: that request would carry
+            // a `Range` header (and could consume a one-time link). Report what
+            // HEAD told us; an unknown length simply streams to EOF.
+            let final_url = head_final_url;
+            return Ok(build_meta(
+                final_url,
+                snapshot.content_length,
+                false,
+                snapshot,
+                head_version,
+            ));
+        }
         // Missing length or missing/ambiguous Accept-Ranges: verify with a
         // one-byte ranged GET.
         return ranged_fallback(client, &url, &snapshot).await;
@@ -168,12 +184,70 @@ pub(crate) async fn probe_with(
         head_status,
         StatusCode::FORBIDDEN | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
     ) {
+        if request.single_stream {
+            // The server refuses HEAD but the transfer itself is a plain GET:
+            // proceed with what we have instead of spending a ranged GET.
+            return Ok(build_meta(
+                head_final_url,
+                snapshot.content_length,
+                false,
+                snapshot,
+                head_version,
+            ));
+        }
         return ranged_fallback(client, &url, &snapshot).await;
     }
 
     Err(DownloadError::Status {
         status: head_status.as_u16(),
         url: head_final_url,
+    })
+}
+
+/// HEAD-only probe used by [`crate::probe_detailed`].
+///
+/// Never falls back to a ranged `GET` (that would consume a one-time link), and
+/// returns non-2xx responses as [`DetailedMeta`] data instead of errors.
+pub(crate) async fn probe_detailed_with(
+    client: &Client,
+    request: &DownloadRequest,
+) -> Result<DetailedMeta, DownloadError> {
+    let url = validate_url(&request.url)?;
+    let response = client
+        .head(url)
+        .send()
+        .await
+        .map_err(|error| DownloadError::Http(error.to_string()))?;
+
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+    let http_version = version_string(response.version());
+    let mut headers = BTreeMap::new();
+    for (name, value) in response.headers() {
+        let key = name.as_str().to_ascii_lowercase();
+        // Header values are opaque bytes; keep them lossily and treat the map
+        // as untrusted in the public type documentation.
+        let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        headers
+            .entry(key)
+            .and_modify(|existing: &mut String| {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    let snapshot = HeaderSnapshot::capture(response.headers());
+    Ok(DetailedMeta {
+        file_name: filename::derive(snapshot.content_disposition.as_deref(), &final_url),
+        final_url,
+        status,
+        headers,
+        content_type: snapshot.content_type,
+        content_length: snapshot.content_length,
+        supports_ranges: snapshot.accept_ranges == Some(true),
+        etag: snapshot.etag,
+        last_modified: snapshot.last_modified,
+        http_version,
     })
 }
 

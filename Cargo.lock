@@ -3714,6 +3714,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdm-ai"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "rdm-cli"
 version = "0.1.0"
 dependencies = [
@@ -3721,9 +3735,11 @@ dependencies = [
  "clap",
  "hex",
  "rdm-agent",
+ "rdm-ai",
  "rdm-core",
  "rdm-fixture-server",
  "rdm-ipc",
+ "rdm-resolve",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3774,13 +3790,20 @@ dependencies = [
  "anyhow",
  "futures-util",
  "gpui",
+ "raw-window-handle",
+ "rdm-ai",
  "rdm-core",
+ "rdm-fixture-server",
  "rdm-ipc",
+ "rdm-resolve",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "windows",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -3801,9 +3824,11 @@ dependencies = [
  "hex",
  "rand 0.8.8",
  "rdm-agent",
+ "rdm-ai",
  "rdm-core",
  "rdm-fixture-server",
  "rdm-ipc",
+ "rdm-resolve",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3822,6 +3847,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "url",
+]
+
+[[package]]
+name = "rdm-resolve"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rdm-ai",
+ "rdm-core",
+ "rdm-fixture-server",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
  "url",
 ]
 

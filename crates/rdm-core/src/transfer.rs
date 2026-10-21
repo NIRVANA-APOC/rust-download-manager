@@ -5,14 +5,14 @@
 //! (.part + .part.json), §3.5 (rate limiting, progress, cancellation).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use reqwest::header::{CONTENT_RANGE, RANGE, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
@@ -20,6 +20,7 @@ use crate::client;
 use crate::event::{Counters, EventSink, ProgressReporter};
 use crate::filename;
 use crate::plan::ChunkPlan;
+use crate::planner::{ConcurrencyPlanner, WindowSample, PLANNER_WINDOW};
 use crate::probe::{self, parse_content_range};
 use crate::rate::TokenBucket;
 use crate::state::{self, ResumeState};
@@ -41,6 +42,9 @@ const CONTROL_POLL: Duration = Duration::from_millis(50);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 /// Saver tick.
 const SAVER_TICK: Duration = Duration::from_millis(200);
+/// A parked worker re-checks the gate at this cadence. The release/target-change
+/// notifications are the fast path; this is only a lost-wakeup safety net.
+const GATE_POLL: Duration = Duration::from_millis(10);
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -51,8 +55,28 @@ pub(crate) async fn run(
     events: EventSink,
     handle: DownloadHandle,
 ) -> Result<DownloadSummary, DownloadError> {
+    run_entry(request, None, events, handle).await
+}
+
+/// Download with caller-verified metadata: no probe is performed, `meta` is
+/// used as-is (but the transfer still enforces its `total_bytes`).
+pub(crate) async fn run_with_meta(
+    request: DownloadRequest,
+    meta: RemoteMeta,
+    events: EventSink,
+    handle: DownloadHandle,
+) -> Result<DownloadSummary, DownloadError> {
+    run_entry(request, Some(meta), events, handle).await
+}
+
+async fn run_entry(
+    request: DownloadRequest,
+    preset_meta: Option<RemoteMeta>,
+    events: EventSink,
+    handle: DownloadHandle,
+) -> Result<DownloadSummary, DownloadError> {
     let sink = events.clone();
-    let result = run_inner(request, events, handle).await;
+    let result = run_inner(request, preset_meta, events, handle).await;
     match &result {
         Ok(_) => {}
         Err(DownloadError::Paused { downloaded }) => sink.emit(DownloadEvent::Paused {
@@ -68,6 +92,7 @@ pub(crate) async fn run(
 
 async fn run_inner(
     request: DownloadRequest,
+    preset_meta: Option<RemoteMeta>,
     events: EventSink,
     handle: DownloadHandle,
 ) -> Result<DownloadSummary, DownloadError> {
@@ -76,10 +101,24 @@ async fn run_inner(
         return Err(DownloadError::Cancelled { downloaded: 0 });
     }
 
-    events.emit(DownloadEvent::Probing);
+    // `download_with_meta` already carries the caller-verified metadata, so
+    // there is nothing to probe (and re-probing could consume a one-time link).
+    let strict_meta = preset_meta.is_some();
+    if !strict_meta {
+        events.emit(DownloadEvent::Probing);
+    }
     let http = client::build(&request)?;
-    let meta = probe::probe_with(&http, &request).await?;
-    events.emit(DownloadEvent::Metadata(meta.clone()));
+    let meta = match preset_meta {
+        Some(meta) => {
+            events.emit(DownloadEvent::Metadata(meta.clone()));
+            meta
+        }
+        None => {
+            let meta = probe::probe_with(&http, &request).await?;
+            events.emit(DownloadEvent::Metadata(meta.clone()));
+            meta
+        }
+    };
     if handle.is_cancelled() {
         return Err(DownloadError::Cancelled { downloaded: 0 });
     }
@@ -114,10 +153,15 @@ async fn run_inner(
         handle,
         limiter,
         started,
+        strict_meta,
     };
 
     match ctx.meta.total_bytes {
-        Some(total) if ctx.meta.supports_ranges => chunked(ctx, total).await,
+        // `single_stream` deliberately skips chunk planning and the worker
+        // pool: exactly one rangeless GET.
+        Some(total) if ctx.meta.supports_ranges && !ctx.request.single_stream => {
+            chunked(ctx, total).await
+        }
         Some(total) => single(ctx, Some(total), false).await,
         None => single(ctx, None, false).await,
     }
@@ -139,6 +183,10 @@ struct Context {
     handle: DownloadHandle,
     limiter: Option<Arc<TokenBucket>>,
     started: Instant,
+    /// `meta` came from the caller (`download_with_meta`): a transfer that
+    /// disagrees with its `total_bytes` is a changed remote, not a retryable
+    /// protocol oddity.
+    strict_meta: bool,
 }
 
 impl Context {
@@ -146,6 +194,9 @@ impl Context {
         self.request.connections.max(1)
     }
 
+    /// Build the final summary. The flat signature mirrors the summary fields;
+    /// a one-use input struct would add more noise than it removes.
+    #[allow(clippy::too_many_arguments)]
     fn summary(
         &self,
         total_bytes: u64,
@@ -153,6 +204,7 @@ impl Context {
         resumed_chunks: u64,
         range_supported: bool,
         connections: usize,
+        peak_connections: usize,
         http_version: Option<String>,
     ) -> DownloadSummary {
         let elapsed = self.started.elapsed();
@@ -164,6 +216,7 @@ impl Context {
             elapsed_ms,
             avg_speed_bps: total_bytes as f64 / seconds,
             connections,
+            peak_connections: peak_connections.min(u32::MAX as usize) as u32,
             sha256,
             resumed_chunks,
             range_supported,
@@ -303,6 +356,81 @@ impl Drop for ControlWatcher {
 }
 
 // ---------------------------------------------------------------------------
+// Concurrency gate (dynamic connection planning)
+// ---------------------------------------------------------------------------
+
+/// Admission gate for chunk workers.
+///
+/// A fixed pool of workers is spawned, but at most `target` may be transferring
+/// at any moment: a worker reserves a slot before requesting a chunk and
+/// releases it once the chunk attempt (including retries) finishes. The
+/// planner task moves `target` up and down; parked workers are woken on every
+/// target change and every release, and always wake up for pause/cancel/stop.
+///
+/// `active` intentionally *is* [`Counters::active_workers`], so progress
+/// events, `DownloadEvent::Concurrency` and `peak_connections` all observe the
+/// same number.
+struct Gate {
+    target: AtomicUsize,
+    stopped: AtomicBool,
+    counters: Arc<Counters>,
+    wake: Notify,
+}
+
+impl Gate {
+    fn new(target: usize, counters: Arc<Counters>) -> Self {
+        Self {
+            target: AtomicUsize::new(target.max(1)),
+            stopped: AtomicBool::new(false),
+            counters,
+            wake: Notify::new(),
+        }
+    }
+
+    fn active(&self) -> usize {
+        self.counters.active_workers.load(Ordering::SeqCst)
+    }
+
+    fn set_target(&self, target: usize) {
+        self.target.store(target.max(1), Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    /// Wait until a concurrency slot is free and take it. Returns `false` when
+    /// the transfer is stopping (pause/cancel/downgrade/failure).
+    async fn acquire(&self, controls: &Controls) -> bool {
+        loop {
+            if self.stopped.load(Ordering::SeqCst) || controls.stopped() {
+                return false;
+            }
+            if self
+                .counters
+                .try_enter_active(self.target.load(Ordering::SeqCst).max(1))
+            {
+                return true;
+            }
+            tokio::select! {
+                _ = self.wake.notified() => {}
+                _ = controls.wait_stop() => return false,
+                // Lost-wakeup safety: never park indefinitely if a notification
+                // raced with the atomic check above.
+                _ = sleep(GATE_POLL) => {}
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.counters.leave_active();
+        self.wake.notify_waiters();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Chunked transfer
 // ---------------------------------------------------------------------------
 
@@ -333,11 +461,18 @@ struct ChunkTransfer {
     counters: Arc<Counters>,
     events: EventSink,
     controls: Controls,
+    /// Admission gate implementing the current connection target.
+    gate: Arc<Gate>,
+    /// 429/503 notifications for the planner task (`None` in static mode).
+    rate_limit_tx: Option<mpsc::UnboundedSender<()>>,
     limiter: Option<Arc<TokenBucket>>,
     failure: StdMutex<Option<DownloadError>>,
     /// Protocol observed on the first successful ranged response; must be
     /// HTTP/1.1 because chunked mode uses an h1-only client.
     http_version: StdMutex<Option<String>>,
+    /// Caller-verified metadata: a `Content-Range` total that disagrees with
+    /// `total` is reported as `RemoteChanged` instead of retried.
+    strict_meta: bool,
     downgrade: AtomicBool,
     save_gate: Mutex<()>,
     last_save: StdMutex<Instant>,
@@ -394,6 +529,13 @@ impl ChunkTransfer {
 
     fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Tell the planner a chunk hit 429/503 (used for immediate back-off).
+    fn signal_rate_limited(&self) {
+        if let Some(tx) = &self.rate_limit_tx {
+            let _ = tx.send(());
+        }
     }
 
     /// Persist after a completed chunk: honours the 16-chunk and 500 ms rules.
@@ -535,6 +677,28 @@ async fn chunked(ctx: Context, total: u64) -> Result<DownloadSummary, DownloadEr
         resumed_chunks,
     });
 
+    // Dynamic planning decides how many of the spawned workers may transfer at
+    // once; static mode admits all of them from the first chunk. The planner
+    // can never plan more connections than there are chunks, which also keeps
+    // `peak_connections` within `connections`.
+    let dynamic = ctx.request.dynamic_connections && connections_used > 1;
+    let mut planner = dynamic.then(|| ConcurrencyPlanner::new(connections_used));
+    let initial_target = planner
+        .as_ref()
+        .map(ConcurrencyPlanner::target)
+        .unwrap_or(connections_used);
+    ctx.events.emit(DownloadEvent::Concurrency {
+        target: initial_target,
+        active: 0,
+    });
+    let (rate_limit_tx, rate_limit_rx) = if dynamic {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let gate = Arc::new(Gate::new(initial_target, Arc::clone(&counters)));
+
     let reporter = ProgressReporter::start(Arc::clone(&counters), Some(total), ctx.events.clone());
     let controls = Controls::new(ctx.handle.clone());
     let watcher = controls.spawn_watcher();
@@ -564,9 +728,12 @@ async fn chunked(ctx: Context, total: u64) -> Result<DownloadSummary, DownloadEr
         counters: Arc::clone(&counters),
         events: ctx.events.clone(),
         controls,
+        gate,
+        rate_limit_tx,
         limiter: ctx.limiter.clone(),
         failure: StdMutex::new(None),
         http_version: StdMutex::new(None),
+        strict_meta: ctx.strict_meta,
         downgrade: AtomicBool::new(false),
         save_gate: Mutex::new(()),
         last_save: StdMutex::new(Instant::now()),
@@ -574,7 +741,22 @@ async fn chunked(ctx: Context, total: u64) -> Result<DownloadSummary, DownloadEr
         dirty: AtomicBool::new(false),
     });
 
-    // ---- 4. Workers + saver -------------------------------------------------
+    // ---- 4. Workers + planner + saver ---------------------------------------
+    let planner_done = Arc::new(Notify::new());
+    let planner_task = match (planner.take(), rate_limit_rx) {
+        (Some(planner), Some(rate_limit_rx)) => {
+            let shared = Arc::clone(&shared);
+            let done = Arc::clone(&planner_done);
+            Some(tokio::spawn(planner_loop(
+                shared,
+                planner,
+                rate_limit_rx,
+                done,
+            )))
+        }
+        _ => None,
+    };
+
     let saver_done = Arc::new(Notify::new());
     let saver = {
         let shared = Arc::clone(&shared);
@@ -595,6 +777,12 @@ async fn chunked(ctx: Context, total: u64) -> Result<DownloadSummary, DownloadEr
         }
     }
 
+    // Wake every parked worker and stop the planning machinery.
+    shared.gate.stop();
+    planner_done.notify_waiters();
+    if let Some(task) = planner_task {
+        let _ = timeout(Duration::from_secs(2), task).await;
+    }
     saver_done.notify_waiters();
     let _ = timeout(Duration::from_secs(2), saver).await;
     watcher.stop().await;
@@ -644,6 +832,7 @@ async fn finish_chunked(
         shared.resumed_chunks,
         true,
         shared.connections_used,
+        shared.counters.peak(),
         shared.http_version(),
     );
     ctx.events.completed(&summary);
@@ -660,6 +849,61 @@ async fn saver_loop(shared: Arc<ChunkTransfer>, done: Arc<Notify>) {
             _ = ticker.tick() => shared.save_if_due_by_time().await,
         }
     }
+}
+
+/// Periodic dynamic-plan driver: samples throughput once per window, applies
+/// 429/503 back-off immediately, and emits one `Concurrency` event per change.
+async fn planner_loop(
+    shared: Arc<ChunkTransfer>,
+    mut planner: ConcurrencyPlanner,
+    mut rate_limit: mpsc::UnboundedReceiver<()>,
+    done: Arc<Notify>,
+) {
+    let mut ticker = interval(PLANNER_WINDOW);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first interval tick resolves immediately; discard it so the first
+    // sample covers a real window.
+    ticker.tick().await;
+
+    let mut last_bytes = shared.counters.downloaded();
+    let mut last_at = Instant::now();
+    loop {
+        tokio::select! {
+            _ = done.notified() => break,
+            message = rate_limit.recv() => {
+                if message.is_none() {
+                    break;
+                }
+                apply_planner_target(&shared, planner.note_rate_limited());
+            }
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let downloaded = shared.counters.downloaded();
+                let remaining_chunks = shared.plan.total_chunks.saturating_sub(
+                    shared.counters.completed_chunks.load(Ordering::Relaxed),
+                );
+                let sample = WindowSample {
+                    bytes: downloaded.saturating_sub(last_bytes),
+                    interval: now.saturating_duration_since(last_at),
+                    remaining_chunks,
+                };
+                apply_planner_target(&shared, planner.observe(sample));
+                last_bytes = downloaded;
+                last_at = now;
+            }
+        }
+    }
+}
+
+fn apply_planner_target(shared: &ChunkTransfer, next: Option<usize>) {
+    let Some(target) = next else {
+        return;
+    };
+    shared.gate.set_target(target);
+    shared.events.emit(DownloadEvent::Concurrency {
+        target,
+        active: shared.gate.active(),
+    });
 }
 
 async fn worker(shared: Arc<ChunkTransfer>) {
@@ -679,23 +923,23 @@ async fn worker(shared: Arc<ChunkTransfer>) {
         if shared.is_stopped() {
             return;
         }
+        // Wait for a concurrency slot: dynamic mode may keep most workers
+        // parked while the plan ramps up (or after a 429/503 back-off).
+        if !shared.gate.acquire(&shared.controls).await {
+            return;
+        }
         let index = shared.next.fetch_add(1, Ordering::SeqCst);
         if index >= shared.plan.total_chunks {
+            shared.gate.release();
             return;
         }
         if shared.completed[index as usize].load(Ordering::SeqCst) {
+            shared.gate.release();
             continue;
         }
 
-        shared
-            .counters
-            .active_workers
-            .fetch_add(1, Ordering::SeqCst);
         let outcome = fetch_chunk(&shared, &mut file, index).await;
-        shared
-            .counters
-            .active_workers
-            .fetch_sub(1, Ordering::SeqCst);
+        shared.gate.release();
 
         match outcome {
             ChunkOutcome::Done => {
@@ -780,6 +1024,12 @@ async fn fetch_chunk(
                             });
                             return ChunkOutcome::Failed;
                         }
+                        // 429/503 means the server is pushing back: back off one
+                        // connection immediately instead of waiting for the
+                        // next measurement window.
+                        if matches!(status, Some(429) | Some(503)) {
+                            shared.signal_rate_limited();
+                        }
                         let delay = retry_after.unwrap_or_else(|| backoff(attempt));
                         shared.events.emit(DownloadEvent::Retrying {
                             chunk: index,
@@ -834,6 +1084,17 @@ async fn attempt_chunk(
             .get(CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .and_then(parse_content_range);
+        // With caller-verified metadata the remote length is a contract: a
+        // different total means the resource changed after verification, and
+        // retrying would only produce a generic failure (or, worse, another
+        // silently-different file).
+        if shared.strict_meta {
+            if let Some(total) = content_range.and_then(|range| range.total) {
+                if total != shared.total {
+                    return Err((AttemptError::Fatal(DownloadError::RemoteChanged), 0));
+                }
+            }
+        }
         let valid = match content_range {
             Some(range) => {
                 range.start == start
@@ -1070,7 +1331,7 @@ async fn single(
     let sha256 = verify_checksum(&ctx, &ctx.part).await?;
     tokio::fs::rename(&ctx.part, &ctx.target).await?;
     let _ = tokio::fs::remove_file(&ctx.state_path).await;
-    let summary = ctx.summary(downloaded, sha256, 0, range_supported, 1, http_version);
+    let summary = ctx.summary(downloaded, sha256, 0, range_supported, 1, 1, http_version);
     ctx.events.completed(&summary);
     Ok(summary)
 }
@@ -1120,6 +1381,18 @@ async fn single_attempt(
     }
 
     let http_version = response.version();
+    // Caller-verified metadata: the advertised length is a contract. Check it
+    // before touching the `.part` file so a changed remote never truncates a
+    // previous payload. A `206` on a rangeless GET is unexpected (documented
+    // limitation); its `Content-Length` describes the partial body, not the
+    // remote total, so only plain `200` responses are pre-checked here.
+    if ctx.strict_meta && status == StatusCode::OK {
+        if let (Some(expected), Some(advertised)) = (total, response.content_length()) {
+            if advertised != expected {
+                return Err(SingleError::Fatal(DownloadError::RemoteChanged));
+            }
+        }
+    }
     let mut file = tokio::fs::File::create(&ctx.part)
         .await
         .map_err(|error| SingleError::Fatal(DownloadError::Io(error)))?;
@@ -1145,6 +1418,9 @@ async fn single_attempt(
         let len = bytes.len() as u64;
         if let Some(expected) = total {
             if counters.downloaded() + len > expected {
+                if ctx.strict_meta {
+                    return Err(SingleError::Fatal(DownloadError::RemoteChanged));
+                }
                 return Err(SingleError::Retry {
                     reason: format!("server sent more than the advertised {expected} bytes"),
                     retry_after: None,
@@ -1166,6 +1442,9 @@ async fn single_attempt(
 
     if let Some(expected) = total {
         if counters.downloaded() != expected {
+            if ctx.strict_meta {
+                return Err(SingleError::Fatal(DownloadError::RemoteChanged));
+            }
             return Err(SingleError::Retry {
                 reason: format!(
                     "single-stream length mismatch: got {} of {expected} bytes",
@@ -1264,4 +1543,126 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 425 | 500 | 502 | 504)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn park_acquire(gate: &Arc<Gate>, controls: &Controls) -> tokio::task::JoinHandle<bool> {
+        let gate = Arc::clone(gate);
+        let controls = controls.clone();
+        tokio::spawn(async move { gate.acquire(&controls).await })
+    }
+
+    #[tokio::test]
+    async fn gate_parks_overflow_workers_until_the_target_grows() {
+        let counters = Arc::new(Counters::default());
+        let gate = Arc::new(Gate::new(2, Arc::clone(&counters)));
+        let controls = Controls::new(DownloadHandle::new());
+
+        assert!(gate.acquire(&controls).await);
+        assert!(gate.acquire(&controls).await);
+        assert_eq!(counters.active_workers.load(Ordering::SeqCst), 2);
+
+        let mut parked = park_acquire(&gate, &controls);
+        assert!(
+            timeout(Duration::from_millis(50), &mut parked)
+                .await
+                .is_err(),
+            "the third worker must be parked while target=2"
+        );
+        assert_eq!(counters.active_workers.load(Ordering::SeqCst), 2);
+
+        // A target raise wakes the parked worker and is reflected in the peak.
+        gate.set_target(3);
+        let admitted = timeout(Duration::from_secs(1), &mut parked)
+            .await
+            .expect("parked worker should wake on a target increase")
+            .expect("acquire task panicked");
+        assert!(admitted);
+        assert_eq!(counters.peak(), 3);
+
+        for _ in 0..3 {
+            gate.release();
+        }
+        assert_eq!(counters.active_workers.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn gate_stop_wakes_parked_workers_with_false() {
+        let counters = Arc::new(Counters::default());
+        let gate = Arc::new(Gate::new(1, Arc::clone(&counters)));
+        let controls = Controls::new(DownloadHandle::new());
+
+        assert!(gate.acquire(&controls).await);
+        let mut parked = park_acquire(&gate, &controls);
+        assert!(
+            timeout(Duration::from_millis(50), &mut parked)
+                .await
+                .is_err(),
+            "worker must wait while the only slot is taken"
+        );
+
+        gate.stop();
+        let admitted = timeout(Duration::from_secs(1), &mut parked)
+            .await
+            .expect("parked worker should wake on stop")
+            .expect("acquire task panicked");
+        assert!(!admitted, "a stopped gate admits nobody");
+        gate.release();
+    }
+
+    #[tokio::test]
+    async fn gate_release_wakes_a_parked_worker() {
+        let counters = Arc::new(Counters::default());
+        let gate = Arc::new(Gate::new(1, Arc::clone(&counters)));
+        let controls = Controls::new(DownloadHandle::new());
+
+        assert!(gate.acquire(&controls).await);
+        let mut parked = park_acquire(&gate, &controls);
+        assert!(timeout(Duration::from_millis(50), &mut parked)
+            .await
+            .is_err());
+
+        gate.release();
+        let admitted = timeout(Duration::from_secs(1), &mut parked)
+            .await
+            .expect("parked worker should wake on release")
+            .expect("acquire task panicked");
+        assert!(admitted);
+        gate.release();
+    }
+
+    #[tokio::test]
+    async fn gate_respects_a_shrinking_target() {
+        let counters = Arc::new(Counters::default());
+        let gate = Arc::new(Gate::new(3, Arc::clone(&counters)));
+        let controls = Controls::new(DownloadHandle::new());
+
+        assert!(gate.acquire(&controls).await);
+        assert!(gate.acquire(&controls).await);
+        assert!(gate.acquire(&controls).await);
+        // Shrinking the target never evicts running workers; it only stops new
+        // ones from being admitted.
+        gate.set_target(1);
+        let mut parked = park_acquire(&gate, &controls);
+        assert!(timeout(Duration::from_millis(50), &mut parked)
+            .await
+            .is_err());
+        for _ in 0..2 {
+            gate.release();
+        }
+        // Even with two slots physically free, active(1) == target(1) parks it.
+        assert!(timeout(Duration::from_millis(50), &mut parked)
+            .await
+            .is_err());
+        gate.release();
+        let admitted = timeout(Duration::from_secs(1), &mut parked)
+            .await
+            .expect("parked worker should wake once active < target")
+            .expect("acquire task panicked");
+        assert!(admitted);
+        gate.release();
+    }
 }

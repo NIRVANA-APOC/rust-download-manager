@@ -96,6 +96,14 @@ struct MockIpcServer {
 
 impl MockIpcServer {
     fn start(token: &str) -> Self {
+        Self::start_with_status_data(token, default_status_data())
+    }
+
+    /// Start a mock GUI whose `Request::Status` answer is `status_data`.
+    ///
+    /// Used to emulate an **old GUI** (before the additive thread-count
+    /// fields) while keeping every other method identical.
+    fn start_with_status_data(token: &str, status_data: serde_json::Value) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock IPC listener");
         listener
             .set_nonblocking(true)
@@ -108,12 +116,14 @@ impl MockIpcServer {
             let recorded = Arc::clone(&recorded);
             let stop = Arc::clone(&stop);
             let expected_token = token.to_string();
+            let status_data = Arc::new(status_data);
             thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
-                            if let Err(err) = handle_connection(stream, &expected_token, &recorded)
+                            if let Err(err) =
+                                handle_connection(stream, &expected_token, &recorded, &status_data)
                             {
                                 eprintln!("mock IPC connection error: {err}");
                             }
@@ -172,10 +182,33 @@ impl Drop for MockIpcServer {
     }
 }
 
+/// `Request::Status` payload of a current (v0.2) GUI, including the additive
+/// thread-count fields (`active_connections`/`target_connections`/
+/// `peak_connections`).
+fn default_status_data() -> serde_json::Value {
+    serde_json::json!({
+        "downloads": [{
+            "id": "dl_000001",
+            "file_name": "a.bin",
+            "state": "downloading",
+            "downloaded": 1_048_576u64,
+            "total": 10_485_760u64,
+            "speed_bps": 524_288.0,
+            "connections": 8u64,
+            "active_connections": 6u64,
+            "target_connections": 12u64,
+            "peak_connections": 16u64,
+        }],
+        "global_speed_bps": 1_048_576.0,
+        "active": 2u64,
+    })
+}
+
 fn handle_connection(
     stream: TcpStream,
     expected_token: &str,
     recorded: &Arc<Mutex<Vec<RecordedRequest>>>,
+    status_data: &serde_json::Value,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -225,6 +258,16 @@ fn handle_connection(
             "{{\"id\":{},\"ok\":true,\"data\":{{\"download_id\":\"dl_42\"}}}}\n",
             envelope.id
         ),
+        Request::AiParse { .. } => format!(
+            "{{\"id\":{},\"ok\":true,\"data\":{{\"accepted\":true,\"request_id\":12}}}}\n",
+            envelope.id
+        ),
+        Request::Status => {
+            format!(
+                "{{\"id\":{},\"ok\":true,\"data\":{status_data}}}\n",
+                envelope.id
+            )
+        }
         _ => format!("{{\"id\":{},\"ok\":true,\"data\":null}}\n", envelope.id),
     };
     writer.write_all(response.as_bytes())?;
@@ -358,6 +401,151 @@ fn ping_reports_gui_offline_without_starting_anything() {
 
     let log = state.log_text();
     assert!(log.contains("ping: RDM GUI offline"), "log: {log}");
+}
+
+#[test]
+fn status_end_to_end_through_mock_gui() {
+    let state = TempState::new("status");
+    let server = MockIpcServer::start("test-token-status");
+    state.write_ipc_info(&server.ipc_info());
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    host.send_json(r#"{"type":"status","id":51}"#);
+    let response = host.recv_json();
+    assert_eq!(response["type"], "status");
+    assert_eq!(response["id"], 51);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["gui_running"], true);
+    assert_eq!(response["active"], 2);
+    assert_eq!(
+        response["global_speed_bps"].as_f64(),
+        Some(1_048_576.0),
+        "global_speed_bps must stay a floating point field"
+    );
+    let downloads = response["downloads"]
+        .as_array()
+        .expect("status response must carry a downloads array");
+    assert_eq!(downloads.len(), 1);
+    let download = &downloads[0];
+    assert_eq!(download["id"], "dl_000001");
+    assert_eq!(download["file_name"], "a.bin");
+    assert_eq!(download["state"], "downloading");
+    assert_eq!(download["downloaded"], 1_048_576);
+    assert_eq!(download["total"], 10_485_760);
+    assert_eq!(download["speed_bps"].as_f64(), Some(524_288.0));
+    assert_eq!(download["connections"], 8);
+    // Additive v0.2 thread counts must be forwarded verbatim.
+    assert_eq!(download["active_connections"], 6);
+    assert_eq!(download["target_connections"], 12);
+    assert_eq!(download["peak_connections"], 16);
+
+    // A status poll is a direct IPC query: it must not probe with `ping`
+    // first (the extension polls it once per second), and it must not spool.
+    let requests = server.wait_for_requests(1, RESPONSE_TIMEOUT);
+    assert_eq!(
+        requests.len(),
+        1,
+        "status must be the only request, got {requests:?}"
+    );
+    assert!(
+        matches!(&requests[0].request, Request::Status),
+        "expected Request::Status, got {:?}",
+        requests[0].request
+    );
+    assert_eq!(requests[0].token.as_deref(), Some("test-token-status"));
+    assert!(
+        !state.rdm_dir().join("queue").exists(),
+        "status polls must never spool"
+    );
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+}
+
+#[test]
+fn status_from_old_gui_defaults_thread_fields_to_zero() {
+    let state = TempState::new("status-legacy");
+    // Pre-v0.2 GUI: the status payload has none of the additive thread-count
+    // fields. The host must still answer with the full shape (0 = unknown).
+    let legacy_status_data = serde_json::json!({
+        "downloads": [{
+            "id": "dl_legacy",
+            "file_name": "legacy.bin",
+            "state": "downloading",
+            "downloaded": 1024u64,
+            "total": 2048u64,
+            "speed_bps": 64.0,
+            "connections": 8u64,
+        }],
+        "global_speed_bps": 64.0,
+        "active": 1u64,
+    });
+    let server = MockIpcServer::start_with_status_data("test-token-legacy", legacy_status_data);
+    state.write_ipc_info(&server.ipc_info());
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    host.send_json(r#"{"type":"status","id":61}"#);
+    let response = host.recv_json();
+    assert_eq!(response["type"], "status");
+    assert_eq!(response["id"], 61);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["gui_running"], true);
+    let downloads = response["downloads"]
+        .as_array()
+        .expect("status response must carry a downloads array");
+    assert_eq!(downloads.len(), 1);
+    let download = &downloads[0];
+    // Existing fields keep being forwarded unchanged.
+    assert_eq!(download["id"], "dl_legacy");
+    assert_eq!(download["connections"], 8);
+    assert_eq!(download["total"], 2048);
+    // The three thread-count keys are always serialized; an old GUI yields 0,
+    // which the extension interprets as "unknown" (falls back to connections).
+    assert_eq!(download["active_connections"], 0);
+    assert_eq!(download["target_connections"], 0);
+    assert_eq!(download["peak_connections"], 0);
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+}
+
+#[test]
+fn status_without_gui_returns_empty_snapshot() {
+    let state = TempState::new("status-offline");
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    let started = Instant::now();
+    host.send_json(r#"{"type":"status","id":52}"#);
+    let response = host.recv_json();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a missing GUI must fail fast for a status poll"
+    );
+    assert_eq!(response["type"], "status");
+    assert_eq!(response["id"], 52);
+    assert_eq!(
+        response["ok"], true,
+        "GUI offline must still be ok:true so a 1 Hz poll does not spam errors"
+    );
+    assert_eq!(response["gui_running"], false);
+    assert_eq!(response["active"], 0);
+    assert_eq!(response["global_speed_bps"].as_f64(), Some(0.0));
+    assert_eq!(
+        response["downloads"]
+            .as_array()
+            .map(|downloads| downloads.len()),
+        Some(0)
+    );
+    assert!(
+        !state.rdm_dir().join("queue").exists(),
+        "a status poll must never spool, even when the GUI is missing"
+    );
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+
+    let log = state.log_text();
+    assert!(log.contains("status: RDM GUI unavailable"), "log: {log}");
 }
 
 #[test]
@@ -577,6 +765,215 @@ fn invalid_requests_get_structured_errors_and_host_keeps_serving() {
     assert_eq!(response["type"], "pong");
     assert_eq!(response["id"], 22);
     assert_eq!(response["gui_running"], false);
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+}
+
+#[test]
+fn ai_parse_end_to_end_through_mock_gui() {
+    let state = TempState::new("ai-parse");
+    let server = MockIpcServer::start("test-token-ai");
+    state.write_ipc_info(&server.ipc_info());
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    host.send_json(
+        r#"{
+            "type": "ai_parse",
+            "id": 31,
+            "url": "https://example.com/page?signature=secret-signature",
+            "title": "Example Page",
+            "source_page": "https://example.com/list",
+            "include_credentials": true,
+            "cookie": "sid=topsecret; theme=dark",
+            "referer": "https://example.com/list",
+            "user_agent": "Mozilla/5.0 (test)",
+            "page_url": "https://example.com/page?signature=secret-signature",
+            "page_title": "Example Page",
+            "page_links": ["https://cdn.example.com/a.mp4", "https://cdn.example.com/b.zip?token=secret-signature"]
+        }"#,
+    );
+    let response = host.recv_json();
+    assert_eq!(response["type"], "ai_parse_accepted");
+    assert_eq!(response["id"], 31);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["request_id"], 12);
+    assert_eq!(response["gui_running"], true);
+
+    let requests = server.wait_for_requests(2, RESPONSE_TIMEOUT);
+    assert!(
+        requests.len() >= 2,
+        "expected a ping followed by an ai_parse, got {requests:?}"
+    );
+    assert!(matches!(&requests[0].request, Request::Ping));
+    let ai_parse = requests
+        .iter()
+        .find_map(|recorded| match &recorded.request {
+            Request::AiParse {
+                url,
+                source_page,
+                title,
+                include_credentials,
+                cookie,
+                referer,
+                user_agent,
+                page_url,
+                page_title,
+                page_links,
+            } => Some((
+                url.clone(),
+                source_page.clone(),
+                title.clone(),
+                *include_credentials,
+                cookie.clone(),
+                referer.clone(),
+                user_agent.clone(),
+                page_url.clone(),
+                page_title.clone(),
+                page_links.clone(),
+            )),
+            _ => None,
+        })
+        .expect("an ai_parse request must reach the GUI");
+    assert_eq!(
+        ai_parse.0, "https://example.com/page?signature=secret-signature",
+        "the URL (including its query) must reach the GUI verbatim"
+    );
+    assert_eq!(ai_parse.1.as_deref(), Some("https://example.com/list"));
+    assert_eq!(ai_parse.2.as_deref(), Some("Example Page"));
+    assert!(ai_parse.3, "include_credentials must be forwarded");
+    assert_eq!(ai_parse.4.as_deref(), Some("sid=topsecret; theme=dark"));
+    assert_eq!(ai_parse.5.as_deref(), Some("https://example.com/list"));
+    assert_eq!(ai_parse.6.as_deref(), Some("Mozilla/5.0 (test)"));
+    // P4b-b2: the validated page link snapshot reaches the GUI.
+    assert_eq!(
+        ai_parse.7.as_deref(),
+        Some("https://example.com/page?signature=secret-signature")
+    );
+    assert_eq!(ai_parse.8.as_deref(), Some("Example Page"));
+    assert_eq!(
+        ai_parse.9,
+        vec![
+            "https://cdn.example.com/a.mp4".to_string(),
+            "https://cdn.example.com/b.zip?token=secret-signature".to_string()
+        ]
+    );
+
+    // AI parse is a live GUI-only operation: nothing may be spooled to disk.
+    assert!(
+        !state.rdm_dir().join("queue").exists(),
+        "AI parse requests must never be spooled"
+    );
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+
+    // Privacy: the log may mention the request but never credential values,
+    // URL query parameters or snapshot link values.
+    let log = state.log_text();
+    assert!(log.contains("ai_parse request accepted"), "log: {log}");
+    for secret in [
+        "topsecret",
+        "secret-signature",
+        "sid=",
+        "cdn.example.com/a.mp4",
+    ] {
+        assert!(!log.contains(secret), "native.log leaked {secret}: {log}");
+    }
+}
+
+#[test]
+fn ai_parse_without_gui_returns_gui_unavailable_and_never_spools() {
+    let state = TempState::new("ai-parse-offline");
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    let started = Instant::now();
+    host.send_json(
+        r#"{"type":"ai_parse","id":32,"url":"https://example.com/page",
+            "include_credentials":true,"cookie":"sid=topsecret"}"#,
+    );
+    let response = host.recv_json();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a missing GUI must fail fast for AI parse"
+    );
+    assert_eq!(response["type"], "error");
+    assert_eq!(response["id"], 32);
+    assert_eq!(response["code"], "gui_unavailable");
+    assert!(
+        !state.rdm_dir().join("queue").exists(),
+        "AI parse must not fall back to the spool queue"
+    );
+
+    let log = state.log_text();
+    assert!(log.contains("AI parse cannot be queued"), "log: {log}");
+    assert!(!log.contains("topsecret"), "cookie value leaked: {log}");
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+}
+
+#[test]
+fn ai_parse_drops_cookie_when_credentials_are_not_requested() {
+    let state = TempState::new("ai-parse-nocreds");
+    let server = MockIpcServer::start("test-token-ai-nocreds");
+    state.write_ipc_info(&server.ipc_info());
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    host.send_json(
+        r#"{"type":"ai_parse","id":33,"url":"https://example.com/page",
+            "include_credentials":false,"cookie":"sid=topsecret"}"#,
+    );
+    let response = host.recv_json();
+    assert_eq!(response["type"], "ai_parse_accepted");
+
+    let requests = server.wait_for_requests(2, RESPONSE_TIMEOUT);
+    let cookie = requests
+        .iter()
+        .find_map(|recorded| match &recorded.request {
+            Request::AiParse {
+                include_credentials,
+                cookie,
+                ..
+            } => Some((*include_credentials, cookie.clone())),
+            _ => None,
+        });
+    let (include_credentials, cookie) = cookie.expect("ai_parse must reach the GUI");
+    assert!(!include_credentials);
+    assert_eq!(cookie, None, "cookie must not be forwarded without consent");
+
+    host.close_stdin();
+    assert!(host.wait_for_exit(EXIT_TIMEOUT).success());
+    let log = state.log_text();
+    assert!(!log.contains("topsecret"), "cookie value leaked: {log}");
+}
+
+#[test]
+fn ai_parse_rejects_invalid_and_oversized_urls_and_keeps_serving() {
+    let state = TempState::new("ai-parse-badurl");
+    let mut host = HostProcess::spawn(&state, &unreachable_gui_path(&state));
+
+    for (id, url) in [
+        (41, "file:///C:/Windows/win.ini".to_string()),
+        (42, format!("https://example.com/{}", "a".repeat(5000))),
+    ] {
+        let message = serde_json::json!({
+            "type": "ai_parse",
+            "id": id,
+            "url": url,
+        });
+        host.send_json(&message.to_string());
+        let response = host.recv_json();
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["id"], id);
+        assert_eq!(response["code"], "invalid_request");
+    }
+
+    // The channel stays usable after a rejected AI parse.
+    host.send_json(r#"{"type":"ping","id":43}"#);
+    let response = host.recv_json();
+    assert_eq!(response["type"], "pong");
+    assert_eq!(response["id"], 43);
 
     host.close_stdin();
     assert!(host.wait_for_exit(EXIT_TIMEOUT).success());

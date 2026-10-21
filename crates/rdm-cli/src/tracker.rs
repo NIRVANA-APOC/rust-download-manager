@@ -129,6 +129,16 @@ impl TaskTracker {
         self.set_state(TaskState::Downloading);
     }
 
+    /// Track the observed dynamic-plan peak. `target` is informational (the
+    /// `connections` contract keeps its `min(chunks, requested)` semantics).
+    pub fn apply_concurrency(&mut self, target: usize, active: usize) {
+        self.record.peak_connections = self
+            .record
+            .peak_connections
+            .max(active.min(u32::MAX as usize) as u32);
+        let _ = target;
+    }
+
     pub fn apply_progress(
         &mut self,
         downloaded: u64,
@@ -178,12 +188,14 @@ impl TaskTracker {
         if let Some(name) = summary.path.file_name().and_then(|name| name.to_str()) {
             self.record.file_name = name.to_string();
         }
+        self.record.peak_connections = self.record.peak_connections.max(summary.peak_connections);
         self.record.result = Some(TaskResult {
             path: summary.path.display().to_string(),
             size: summary.total_bytes,
             sha256: summary.sha256.clone(),
             elapsed_ms: summary.elapsed_ms,
             avg_speed_bps: summary.avg_speed_bps,
+            peak_connections: summary.peak_connections,
         });
         self.record.finished_at = Some(rdm_agent::now_iso8601());
         self.record.updated_at = rdm_agent::now_iso8601();
@@ -194,6 +206,8 @@ impl TaskTracker {
                 "size": summary.total_bytes,
                 "sha256": summary.sha256,
                 "elapsed_ms": summary.elapsed_ms,
+                "connections": summary.connections,
+                "peak_connections": summary.peak_connections,
             }),
         );
         self.persist(true);
@@ -311,6 +325,8 @@ mod tests {
         assert_eq!(tracker.record.state, TaskState::Downloading);
         tracker.apply_progress(512, Some(1024), 1.0, Some(0.5));
         assert_eq!(tracker.record.downloaded_bytes, 512);
+        tracker.apply_concurrency(4, 3);
+        assert_eq!(tracker.record.peak_connections, 3);
 
         let summary = rdm_core::DownloadSummary {
             path: root.join("out").join("file"),
@@ -318,6 +334,7 @@ mod tests {
             elapsed_ms: 10,
             avg_speed_bps: 1024.0,
             connections: 4,
+            peak_connections: 4,
             sha256: None,
             resumed_chunks: 0,
             range_supported: true,
@@ -326,6 +343,13 @@ mod tests {
         tracker.apply_completed(&summary);
         assert_eq!(tracker.record.state, TaskState::Completed);
         assert_eq!(tracker.record.result.as_ref().unwrap().size, 1024);
+        assert_eq!(tracker.record.peak_connections, 4);
+        assert_eq!(tracker.record.result.as_ref().unwrap().peak_connections, 4);
+        // Agent-visible view exposes the peak and the dynamic flag.
+        let view = serde_json::to_value(tracker.view()).unwrap();
+        assert_eq!(view["peak_connections"], 4);
+        assert_eq!(view["result"]["peak_connections"], 4);
+        assert_eq!(view["dynamic_connections"], true);
         // Journal contains the lifecycle events.
         let events = store.events(&id, 50).unwrap();
         let kinds: Vec<&str> = events.iter().map(|event| event.r#type.as_str()).collect();

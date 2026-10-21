@@ -334,6 +334,11 @@ pub fn build_request(
         }
         request.speed_limit_bps = optional_u64(args, "speed_limit_bps")?;
         request.resume = optional_bool(args, "resume", true)?;
+        request.dynamic_connections = optional_bool(args, "dynamic_connections", true)?;
+        // One-time / signed links: one plain GET with no Range header. The
+        // engine normalizes connections/dynamic/chunk and skips the ranged
+        // probe; a legacy payload without the field keeps streaming normally.
+        request.single_stream = optional_bool(args, "single_stream", false)?;
     }
     request.headers = optional_headers(args)?;
     request.cookie = optional_str(args, "cookie")?;
@@ -341,7 +346,14 @@ pub fn build_request(
     request.user_agent = optional_str(args, "user_agent")?;
     request.proxy = optional_str(args, "proxy")?;
     request.insecure = optional_bool(args, "insecure", false)?;
-    Ok(request)
+    // Normalize before it is persisted in a plan/task: `single_stream` forces
+    // connections=1, dynamic_connections=false and no chunk plan, so the
+    // TaskView/plan must report the transfer that really executes.
+    Ok(if include_download_fields {
+        request.normalized()
+    } else {
+        request
+    })
 }
 
 /// Apply the URL + destination policy gates for a download request.
@@ -830,6 +842,57 @@ mod tests {
         );
         assert!(validate_expected_sha256(&"a".repeat(64)).is_ok());
         assert!(validate_expected_sha256("abc").is_err());
+    }
+
+    #[test]
+    fn build_request_passes_dynamic_connections_through() {
+        let policy = Policy::default();
+        let args = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "dynamic_connections": false
+        }))
+        .unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert!(!request.dynamic_connections);
+
+        let args = args_object(&serde_json::json!({"url": "https://example.com/a.bin"})).unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert!(request.dynamic_connections, "default must be true");
+
+        // Non-boolean values are rejected with the stable invalid_request code.
+        let bad = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "dynamic_connections": "yes"
+        }))
+        .unwrap();
+        let error = build_request(&bad, &policy, true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("dynamic_connections"));
+    }
+
+    #[test]
+    fn build_request_passes_single_stream_through() {
+        let policy = Policy::default();
+        let args = args_object(&serde_json::json!({
+            "url": "https://example.com/one-time.bin",
+            "single_stream": true
+        }))
+        .unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert!(request.single_stream);
+
+        let args = args_object(&serde_json::json!({"url": "https://example.com/a.bin"})).unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert!(!request.single_stream, "default must be false");
+
+        let bad = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "single_stream": "yes"
+        }))
+        .unwrap();
+        let error = build_request(&bad, &policy, true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("single_stream"));
     }
 
     #[test]

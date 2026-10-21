@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use rdm_core::{
     download, download_with_handle, probe, DownloadError, DownloadEvent, DownloadHandle,
-    DownloadRequest, RemoteMeta,
+    DownloadRequest, DownloadSummary, RemoteMeta,
 };
 use rdm_fixture_server::{Config, TestServer};
 use tokio::sync::mpsc;
@@ -659,5 +659,126 @@ async fn unknown_length_uses_single_stream() {
     assert_eq!(summary.connections, 1);
     assert_eq!(summary.total_bytes, total);
     assert_payload_eq(&summary.path, &server.content(), "payload");
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// §2 — dynamic concurrency planning
+// ---------------------------------------------------------------------------
+
+/// Run a download while draining its event channel, so assertions can inspect
+/// `DownloadEvent::Concurrency` after completion.
+async fn download_collecting(
+    request: DownloadRequest,
+) -> (Result<DownloadSummary, DownloadError>, Vec<DownloadEvent>) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let result = download_with_handle(request, Some(tx), DownloadHandle::new()).await;
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    (result, events)
+}
+
+fn concurrency_events(events: &[DownloadEvent]) -> Vec<(usize, usize)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DownloadEvent::Concurrency { target, active } => Some((*target, *active)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn dynamic_plan_emits_concurrency_and_respects_limit() {
+    let total = 8 * 1024 * 1024u64;
+    let server = TestServer::start(Config::new(total).with_delay(5))
+        .await
+        .unwrap();
+    let dir = TempDir::new("dynamic");
+    let mut request = request_for(&server, dir.path(), 8);
+    request.chunk_size = Some(256 * 1024); // 32 chunks
+    request.dynamic_connections = true;
+
+    let (result, events) = download_collecting(request).await;
+    let summary = result.expect("dynamic download");
+
+    assert_payload_eq(&summary.path, &server.content(), "dynamic payload");
+    // `connections` keeps its old semantics: min(chunks, requested).
+    assert_eq!(summary.connections, 8);
+    // The adaptive plan starts below the ceiling but reaches real parallelism.
+    assert!(
+        (2..=8).contains(&summary.peak_connections),
+        "peak {} outside the dynamic plan's 2..=8 range",
+        summary.peak_connections
+    );
+
+    let plan = concurrency_events(&events);
+    assert!(
+        !plan.is_empty(),
+        "expected at least one DownloadEvent::Concurrency"
+    );
+    assert_eq!(
+        plan[0],
+        (4, 0),
+        "max=8 must start at half the plan (4), with no workers active yet"
+    );
+    for (target, active) in &plan {
+        assert!(
+            (1..=8).contains(target),
+            "planned target {target} exceeds the 8-connection ceiling"
+        );
+        assert!(*active <= 8, "active workers {active} exceed the ceiling");
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn static_plan_uses_all_connections_and_reports_peak() {
+    let total = 8 * 1024 * 1024u64;
+    let server = TestServer::start(Config::new(total)).await.unwrap();
+    let dir = TempDir::new("static");
+    let mut request = request_for(&server, dir.path(), 8);
+    request.chunk_size = Some(256 * 1024); // 32 chunks
+    request.dynamic_connections = false;
+
+    let (result, events) = download_collecting(request).await;
+    let summary = result.expect("static download");
+
+    assert_payload_eq(&summary.path, &server.content(), "static payload");
+    assert_eq!(summary.connections, 8);
+    assert_eq!(
+        summary.peak_connections, 8,
+        "static mode must use every connection from the start"
+    );
+
+    let plan = concurrency_events(&events);
+    assert_eq!(plan, vec![(8, 0)], "static mode has no plan changes");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn static_plan_peak_is_capped_by_available_chunks() {
+    let total = 512 * 1024u64;
+    let server = TestServer::start(Config::new(total)).await.unwrap();
+    let dir = TempDir::new("static-small");
+    let mut request = request_for(&server, dir.path(), 8);
+    request.chunk_size = Some(256 * 1024); // only 2 chunks exist
+    request.dynamic_connections = false;
+
+    let (result, events) = download_collecting(request).await;
+    let summary = result.expect("small static download");
+
+    assert_payload_eq(&summary.path, &server.content(), "small payload");
+    assert_eq!(
+        summary.connections, 2,
+        "connections = min(chunks, requested)"
+    );
+    assert_eq!(summary.peak_connections, 2);
+    assert_eq!(concurrency_events(&events), vec![(2, 0)]);
+
     server.shutdown().await;
 }

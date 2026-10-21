@@ -17,7 +17,9 @@ path = "src/main.rs"
 [dependencies]
 rdm-core.workspace = true
 rdm-ipc.workspace = true
+rdm-ai.workspace = true
 rdm-agent.workspace = true
+rdm-resolve.workspace = true
 rdm-fixture-server = { path = "../rdm-fixture-server" }
 serde.workspace = true
 serde_json.workspace = true

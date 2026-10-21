@@ -525,6 +525,9 @@ pub(crate) async fn selftest(
     let passed = cases.iter().filter(|case| case.status == "pass").count();
     let ok = passed == cases.len();
     let elapsed_ms = util::elapsed_ms(started);
+    // Additive (v1.4, architecture §11.10): read-only recipe self-test report.
+    // Recipe failures are reported only and never change `ok`/`passed`.
+    let recipes = recipe_selftest_report(&rdm_ipc::state_dir());
     let data = json!({
         "ok": ok,
         "cases": cases.iter().map(CaseResult::to_value).collect::<Vec<_>>(),
@@ -532,6 +535,7 @@ pub(crate) async fn selftest(
         "failed": cases.len() - passed,
         "fixture": { "transport": "loopback-random-port", "size_bytes": size },
         "elapsed_ms": elapsed_ms,
+        "recipes": recipes,
     });
     let mut text = format!(
         "selftest: {} ({passed}/{} cases, {} ms)",
@@ -545,7 +549,61 @@ pub(crate) async fn selftest(
             case.name, case.status, case.detail
         ));
     }
+    text.push_str(&format!(
+        "\n- recipes: {} checked / {} passed / {} failed / {} skipped",
+        recipes["checked"].as_u64().unwrap_or(0),
+        recipes["passed"].as_u64().unwrap_or(0),
+        recipes["failed"].as_u64().unwrap_or(0),
+        recipes["skipped"].as_u64().unwrap_or(0),
+    ));
     Ok(ToolOk::new(data, text))
+}
+
+/// Maximum failure rows kept in the recipe report (contract: capped list).
+const MAX_RECIPE_FAILURES: usize = 50;
+
+/// Read-only recipe self-test report (`docs/architecture.md` §11.10).
+///
+/// Loads `<state>/resolve/recipes` (missing/bad files are tolerated by the
+/// registry) and runs `Recipe::check_tests`: pure applicability checks only —
+/// no network, no model, no recipe step execution. Failures are reported, never
+/// folded into the engine `passed`/`failed` fields.
+fn recipe_selftest_report(state_dir: &Path) -> Value {
+    let dir = state_dir.join("resolve").join("recipes");
+    let registry = rdm_resolve::RecipeRegistry::load(&dir);
+    let mut checked = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut failures: Vec<Value> = Vec::new();
+    for recipe in registry.all() {
+        checked += 1;
+        for result in recipe.check_tests() {
+            if result.skipped {
+                skipped += 1;
+            } else if result.ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                if failures.len() < MAX_RECIPE_FAILURES {
+                    failures.push(json!({
+                        "recipe_id": recipe.id,
+                        "version": recipe.version,
+                        "test": result.name,
+                        "message": result.message,
+                    }));
+                }
+            }
+        }
+    }
+    json!({
+        "dir": dir.display().to_string(),
+        "checked": checked,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "failures": failures,
+    })
 }
 
 /// Pause mid-transfer, then resume; verify the resumed run does not re-fetch

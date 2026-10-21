@@ -59,6 +59,10 @@ struct BatchTask {
     #[serde(default)]
     connections: Option<usize>,
     #[serde(default)]
+    dynamic_connections: Option<bool>,
+    #[serde(default)]
+    single_stream: Option<bool>,
+    #[serde(default)]
     chunk_size: Option<u64>,
     #[serde(default)]
     expected_sha256: Option<String>,
@@ -377,6 +381,8 @@ impl BatchTask {
             dest_dir,
             file_name,
             connections,
+            dynamic_connections,
+            single_stream,
             chunk_size,
             expected_sha256,
             speed_limit_bps,
@@ -394,6 +400,12 @@ impl BatchTask {
         request.output_dir = dest_dir;
         request.file_name = file_name;
         request.connections = super::download::normalize_connections(connections)?;
+        if let Some(dynamic) = dynamic_connections {
+            request.dynamic_connections = dynamic;
+        }
+        if let Some(single) = single_stream {
+            request.single_stream = single;
+        }
         request.chunk_size = chunk_size;
         request.expected_sha256 = expected_sha256;
         request.speed_limit_bps = speed_limit_bps;
@@ -408,7 +420,9 @@ impl BatchTask {
         if let Some(insecure) = insecure {
             request.insecure = insecure;
         }
-        Ok(request)
+        // Keep the persisted/tracked view aligned with the executed transfer
+        // (`single_stream` forces one connection, no chunk plan).
+        Ok(request.normalized())
     }
 }
 
@@ -532,7 +546,12 @@ async fn run_one(
                     &updates,
                     &task_id,
                     "completed",
-                    json!({ "reused": true, "path": tracker.record.path }),
+                    json!({
+                        "reused": true,
+                        "path": tracker.record.path,
+                        "connections": tracker.record.connections,
+                        "peak_connections": tracker.record.peak_connections,
+                    }),
                 );
                 return Ok(TaskOutcome {
                     index: spec.index,
@@ -616,6 +635,8 @@ async fn run_one(
                     "size": summary.total_bytes,
                     "sha256": summary.sha256,
                     "elapsed_ms": summary.elapsed_ms,
+                    "connections": summary.connections,
+                    "peak_connections": summary.peak_connections,
                 }),
             );
             None
@@ -806,6 +827,18 @@ fn handle_engine_event(
                     "attempt": attempt,
                     "delay_ms": delay_ms,
                     "reason": reason,
+                }),
+            );
+        }
+        DownloadEvent::Concurrency { target, active } => {
+            tracker.apply_concurrency(*target, *active);
+            send_update(
+                updates,
+                task_id,
+                "concurrency",
+                json!({
+                    "target": target,
+                    "active": active,
                 }),
             );
         }

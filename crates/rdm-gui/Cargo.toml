@@ -10,8 +10,16 @@ description = "RDM desktop GUI built with GPUI"
 name = "rdm-gui"
 path = "src/main.rs"
 
+[features]
+# 无控制台构建：debug 也用 GUI 子系统（安装版/双击启动不弹命令行窗口）。
+# release 构建本身已是 GUI 子系统；release 需要 Windows SDK 的 fxc.exe（GPUI 编译期着色器）。
+windows-subsystem = []
+
 [dependencies]
 rdm-core.workspace = true
+rdm-ai.workspace = true
+# P5：GUI「AI 解析」先走 resolver（`docs/architecture.md` §8.5）。
+rdm-resolve.workspace = true
 rdm-ipc.workspace = true
 gpui.workspace = true
 anyhow.workspace = true
@@ -21,3 +29,24 @@ tokio.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# P4a：从输入 URL 解析 host，构造仅内存的 resolver `HostCredentials`。
+url.workspace = true
+
+[dev-dependencies]
+# P5 测试：本地可控 HTTP fixture（字节级、随机端口，不访问公网）。
+# 根 workspace 未声明 rdm-fixture-server 的 workspace 依赖，按其它 crate 的写法直接 path。
+rdm-fixture-server = { path = "../rdm-fixture-server" }
+
+# Windows 系统集成（`src/desktop/windows_impl.rs`）：托盘图标 / 窗口显隐 / 开机自启动。
+# 这里启用的 windows feature 集合是 gpui 已启用的子集，不会额外编译 windows crate 模块。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# 开机自启动走 HKCU\Software\Microsoft\Windows\CurrentVersion\Run。
+windows-registry = "0.5"
+# 从 GPUI 窗口取 Win32 HWND（`desktop::raw_hwnd`）。
+raw-window-handle = "0.6"

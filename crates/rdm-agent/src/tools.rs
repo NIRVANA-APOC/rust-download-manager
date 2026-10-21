@@ -1,6 +1,6 @@
 //! The RDM agent tool catalog (`docs/agent-integration.md` §3.1).
 //!
-//! This module is the **single source of truth** for the 16 tools exposed by
+//! This module is the **single source of truth** for the 17 tools exposed by
 //! the MCP server (`tools/list`, `rdm-mcp`) and by the CLI (`rdm schema`).
 //! Both consumers build their machine contract from [`tool_definitions`], so
 //! the two surfaces cannot drift apart.
@@ -141,7 +141,8 @@ fn task_result_schema() -> Value {
             "size": { "type": "integer", "minimum": 0 },
             "sha256": { "type": "string" },
             "elapsed_ms": { "type": "integer", "minimum": 0 },
-            "avg_speed_bps": { "type": "number", "minimum": 0 }
+            "avg_speed_bps": { "type": "number", "minimum": 0 },
+            "peak_connections": { "type": "integer", "minimum": 0 }
         },
         "additionalProperties": true
     })
@@ -169,6 +170,8 @@ fn task_view_schema() -> Value {
             "total_bytes": nullable(json!({ "type": "integer", "minimum": 0 })),
             "downloaded_bytes": { "type": "integer", "minimum": 0 },
             "connections": { "type": "integer", "minimum": 1 },
+            "peak_connections": { "type": "integer", "minimum": 0 },
+            "dynamic_connections": { "type": "boolean" },
             "chunk_size": nullable(json!({ "type": "integer", "minimum": 1 })),
             "range_supported": nullable(json!({ "type": "boolean" })),
             "http_version": nullable(json!({ "type": "string" })),
@@ -204,6 +207,7 @@ fn task_summary_schema() -> Value {
             "total_bytes": nullable(json!({ "type": "integer", "minimum": 0 })),
             "downloaded_bytes": { "type": "integer", "minimum": 0 },
             "connections": { "type": "integer", "minimum": 1 },
+            "peak_connections": { "type": "integer", "minimum": 0 },
             "speed_bps": { "type": "number", "minimum": 0 },
             "created_at": { "type": "string" },
             "updated_at": { "type": "string" }
@@ -259,6 +263,8 @@ fn plan_schema() -> Value {
             "dest_dir": nullable(json!({ "type": "string" })),
             "file_name": nullable(json!({ "type": "string" })),
             "connections": { "type": "integer", "minimum": 1 },
+            "dynamic_connections": { "type": "boolean" },
+            "single_stream": { "type": "boolean" },
             "chunk_size": nullable(json!({ "type": "integer", "minimum": 1 })),
             "expected_sha256": nullable(json!({ "type": "string" })),
             "speed_limit_bps": nullable(json!({ "type": "integer", "minimum": 0 })),
@@ -376,6 +382,22 @@ fn prop_resume() -> Value {
     })
 }
 
+fn prop_dynamic_connections() -> Value {
+    json!({
+        "type": "boolean",
+        "default": true,
+        "description": "Dynamically add/remove parallel connections based on observed throughput (default true). Set false to use a fixed `connections` count for the whole transfer."
+    })
+}
+
+fn prop_single_stream() -> Value {
+    json!({
+        "type": "boolean",
+        "default": false,
+        "description": "Download with exactly one plain `GET` and NO `Range` header: for one-time/signed links and anti-hotlink servers that reject ranged requests. Forces connections=1, dynamic_connections=false and no chunk plan (a pre-existing .part is restarted from zero). The probe still sends its normal HEAD first."
+    })
+}
+
 fn prop_idempotency_key() -> Value {
     json!({
         "type": "string",
@@ -489,10 +511,11 @@ fn merge_props(base: Value, extra: Value) -> Value {
 // Catalog
 // ---------------------------------------------------------------------------
 
-/// All 16 tool names in contract order.
-pub const TOOL_NAMES: [&str; 16] = [
+/// All 17 tool names in contract order.
+pub const TOOL_NAMES: [&str; 17] = [
     "rdm_capabilities",
     "rdm_probe",
+    "rdm_resolve",
     "rdm_download",
     "rdm_plan_download",
     "rdm_apply_plan",
@@ -514,6 +537,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         capabilities_tool(),
         probe_tool(),
+        resolve_tool(),
         download_tool(),
         plan_download_tool(),
         apply_plan_tool(),
@@ -542,7 +566,7 @@ fn capabilities_tool() -> ToolDefinition {
     ToolDefinition {
         name: "rdm_capabilities".to_string(),
         title: "RDM capabilities".to_string(),
-        description: "Return the machine-readable capability manifest: RDM version, the 16 tools, \
+        description: "Return the machine-readable capability manifest: RDM version, the 17 tools, \
 resources/prompts, hard limits, effective policy summary, transports and supported MCP protocol \
 versions. Call this first in a new session instead of guessing parameters. Read-only and cheap. \
 Do not use it as a network or environment health check — use rdm_doctor for that."
@@ -624,6 +648,290 @@ Content-Length yield total_bytes=null; those are facts, not errors."
     }
 }
 
+fn resolve_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "rdm_resolve".to_string(),
+        title: "Resolve a link to a resource manifest".to_string(),
+        description: "Resolve a page/link URL into a verified manifest of downloadable resources WITHOUT \
+creating a download task and without writing any file. Use it when the URL may be an HTML page, a \
+share link, a signed/cookie-gated URL or anything whose real file URL is unknown: it replays a local \
+deterministic recipe (when one matches in <state_dir>/resolve/recipes), verifies direct-file input \
+with a HEAD + bounded ranged GET, and in mode=auto/explore falls back to model-driven exploration \
+bound by max_llm_calls when the page is not a file and the user has configured an AI provider \
+(<state_dir>/ai.json or RDM_AI_API_KEY). Exploration sends page titles/links/truncated text and \
+response-header summaries to that provider, never Cookie/Authorization or the whole file body, and \
+the API key never appears in the result. The manifest returns resource URLs, size/Range/ETag/\
+verification plus single_stream / one_time / resumable transfer hints. Do NOT use it as a substitute \
+for rdm_download (it never consumes the URL). mode=explore without a configured provider returns \
+code=resolve_failed with details.kind=model_unavailable; no matching recipe returns \
+details.kind=recipe_no_match. When the outcome comes from a library recipe (state matched/published), \
+data.recipe_health reports that method's health (ok/degraded/broken/untested, last_failure, \
+consecutive_failures): treat degraded/broken as a signal to roll the method back (rdm recipe rollback) \
+or switch to mode=explore. Resolution never creates tasks and is bounded by \
+policy.allowed_hosts / allow_private_hosts and a per-run budget."
+            .to_string(),
+        input_schema: obj(
+            json!({
+                "url": prop_url(),
+                "goal": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "description": "Optional natural-language goal, e.g. \"Windows x64 installer\". Recorded as a hint for recipe selection and for the exploration prompt; it never forces a model call by itself."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "recipe_only", "explore"],
+                    "default": "auto",
+                    "description": "auto = use a matching local recipe, else verify the URL as a direct file and (for pages, only when an AI provider is configured) explore; recipe_only = never explore and make zero model calls; explore = always use the user's configured AI (resolve_failed/details.kind=model_unavailable when none is configured)."
+                },
+                "recipe_id": {
+                    "type": "string",
+                    "description": "Force one recipe by id (debugging/replay). An unknown id fails with resolve_failed/details.kind=recipe_no_match."
+                },
+                "max_resources": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 40,
+                    "default": 40,
+                    "description": "Maximum number of resources to return in the manifest (1..40)."
+                },
+                "max_llm_calls": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 32,
+                    "default": 8,
+                    "description": "Maximum model calls for exploration (1..32, default 8). Only used by mode=explore and by the mode=auto page fallback; recipe replay and direct-file verification make zero model calls."
+                },
+                "budget": {
+                    "type": "object",
+                    "description": "Per-run hard limits (never shared with download-task budgets). Omitted fields use the defaults shown.",
+                    "properties": {
+                        "wall_ms": {
+                            "type": "integer",
+                            "minimum": 1000,
+                            "maximum": 300000,
+                            "default": 60000,
+                            "description": "Wall-clock deadline for the whole resolution (1,000..300,000 ms)."
+                        },
+                        "http_requests": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 64,
+                            "default": 24,
+                            "description": "Maximum HTTP requests (including redirect hops and verification)."
+                        },
+                        "bytes_read": {
+                            "type": "integer",
+                            "minimum": 65536,
+                            "maximum": 33554432,
+                            "default": 4194304,
+                            "description": "Maximum body bytes read across the run (default 4 MiB)."
+                        },
+                        "redirects": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 10,
+                            "default": 5,
+                            "description": "Maximum redirect hops."
+                        }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }),
+            &["url"],
+            false,
+        ),
+        output_schema: resolve_output_schema(),
+        annotations: ToolAnnotations::new(true, false, true, true),
+    }
+}
+
+/// Output schema of `rdm_resolve`: the shared envelope whose `data` is a
+/// `ResolveOutcome` (`rdm.resolve/v1`, contract §3.1).
+fn resolve_output_schema() -> Value {
+    output_envelope(json!({
+        "type": "object",
+        "required": ["run_id", "status", "manifest", "recipe", "diagnostics"],
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "description": "Stable run id (run_...), also reported in error.details.run_id."
+            },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "succeeded", "partial", "waiting_user", "failed", "budget_exhausted", "cancelled"
+                ]
+            },
+            "manifest": nullable(resolve_manifest_schema()),
+            "recipe": nullable(resolve_recipe_ref_schema()),
+            // v1.6 optional additive field: method health of the library recipe
+            // that produced this outcome (absent for direct-link/draft runs).
+            "recipe_health": nullable(resolve_recipe_health_schema()),
+            "diagnostics": resolve_diagnostics_schema()
+        },
+        "additionalProperties": true
+    }))
+}
+
+fn resolve_manifest_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "manifest_id", "source", "resources", "created_ms"],
+        "properties": {
+            "schema_version": { "type": "string", "const": "rdm.resolve/v1" },
+            "manifest_id": { "type": "string" },
+            "source": {
+                "type": "object",
+                "properties": {
+                    "input_url": { "type": "string" },
+                    "final_url": nullable(json!({ "type": "string" })),
+                    "title": nullable(json!({ "type": "string" })),
+                    "recipe_id": nullable(json!({ "type": "string" }))
+                },
+                "additionalProperties": true
+            },
+            "resources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["resource_id", "url", "transfer", "verification"],
+                    "properties": {
+                        "resource_id": { "type": "string" },
+                        "url": { "type": "string" },
+                        "final_url": nullable(json!({ "type": "string" })),
+                        "name": nullable(json!({ "type": "string" })),
+                        "kind": nullable(json!({ "type": "string" })),
+                        "content_type": nullable(json!({ "type": "string" })),
+                        "size_bytes": nullable(json!({ "type": "integer", "minimum": 0 })),
+                        "supports_ranges": nullable(json!({ "type": "boolean" })),
+                        "etag": nullable(json!({ "type": "string" })),
+                        "last_modified": nullable(json!({ "type": "string" })),
+                        "expected_sha256": nullable(json!({ "type": "string" })),
+                        "transfer": resolve_transfer_schema(),
+                        "verification": resolve_verification_schema(),
+                        "evidence": { "type": "array", "items": { "type": "string" } },
+                        "notes": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "notes": { "type": "array", "items": { "type": "string" } },
+            "created_ms": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn resolve_transfer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "single_stream": { "type": "boolean" },
+            "connections": nullable(json!({ "type": "integer", "minimum": 1 })),
+            "dynamic_connections": nullable(json!({ "type": "boolean" })),
+            "chunk_size": nullable(json!({ "type": "integer", "minimum": 1 })),
+            "resumable": { "type": "boolean" },
+            "one_time": { "type": "boolean" },
+            "expires_ms": nullable(json!({ "type": "integer", "minimum": 0 }))
+        },
+        "additionalProperties": true
+    })
+}
+
+fn resolve_verification_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": [
+                    "verified", "head_only_verified", "login_required",
+                    "forbidden_or_expired", "not_found", "rate_limited",
+                    "html_page", "not_a_file", "empty_body",
+                    "unknown_length", "server_error", "network_error",
+                    "policy_denied"
+                ]
+            },
+            "method": {
+                "type": "string",
+                "enum": ["head_only", "ranged_get", "bounded_get"]
+            },
+            "http_status": nullable(json!({ "type": "integer" })),
+            "final_url": nullable(json!({ "type": "string" })),
+            "content_type": nullable(json!({ "type": "string" })),
+            "size_bytes": nullable(json!({ "type": "integer", "minimum": 0 })),
+            "supports_ranges": nullable(json!({ "type": "boolean" })),
+            "etag": nullable(json!({ "type": "string" })),
+            "evidence": { "type": "array", "items": { "type": "string" } },
+            "checked_ms": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn resolve_recipe_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "version": { "type": "integer", "minimum": 1 },
+            "state": { "type": "string" }
+        },
+        "additionalProperties": true
+    })
+}
+
+/// Optional `data.recipe_health` (v1.6 §8.6): method-library health of the
+/// recipe that produced the outcome (absent for direct-link/draft runs).
+fn resolve_recipe_health_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["status", "last_ok_ms", "last_failure", "consecutive_failures", "evidence"],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["ok", "degraded", "broken", "untested"],
+                "description": "ok = last replay succeeded; degraded = two consecutive structural failures; broken = three or more; untested = never run / no health recorded."
+            },
+            "last_ok_ms": nullable(json!({ "type": "integer", "minimum": 0 })),
+            "last_failure": nullable(json!({
+                "type": "object",
+                "required": ["run_id", "kind", "observed_ms"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "kind": { "type": "string", "description": "rdm.resolve error kind (e.g. recipe_stale, selector_miss, not_a_file)." },
+                    "step_id": nullable(json!({ "type": "string" })),
+                    "observed_ms": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": true
+            })),
+            "consecutive_failures": { "type": "integer", "minimum": 0 },
+            "evidence": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn resolve_diagnostics_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "error": nullable(json!({ "type": "object" })),
+            "steps": { "type": "integer", "minimum": 0 },
+            "http_requests": { "type": "integer", "minimum": 0 },
+            "bytes_read": { "type": "integer", "minimum": 0 },
+            "llm_calls": { "type": "integer", "minimum": 0 },
+            "elapsed_ms": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": true
+    })
+}
+
 fn download_tool() -> ToolDefinition {
     ToolDefinition {
         name: "rdm_download".to_string(),
@@ -636,7 +944,9 @@ Destination must resolve inside policy.allowed_dirs and the host must pass polic
 otherwise error code=policy_denied. Files above policy.require_approval_over_bytes return \
 code=needs_approval with details.plan and details.approval_token — execute them with \
 rdm_apply_plan. With allow_overwrite=false an existing target returns code=conflict and is never \
-silently replaced. Pass idempotency_key to make retries safe."
+silently replaced. Pass idempotency_key to make retries safe. For one-time/signed links or anti-hotlink \
+servers set single_stream=true: exactly one plain GET with no Range header (connections are forced to 1 \
+and a previous .part is restarted from zero)."
             .to_string(),
         input_schema: obj(
             merge_props(
@@ -645,6 +955,8 @@ silently replaced. Pass idempotency_key to make retries safe."
                     "dest_dir": prop_dest_dir(),
                     "file_name": prop_file_name(),
                     "connections": prop_connections(),
+                    "dynamic_connections": prop_dynamic_connections(),
+                    "single_stream": prop_single_stream(),
                     "chunk_size": prop_chunk_size(),
                     "expected_sha256": prop_expected_sha256(),
                     "speed_limit_bps": prop_speed_limit(),
@@ -673,7 +985,9 @@ writing a file. Returns a plan: resolved destination, size, whether approval is 
 policy reason, and — when the size exceeds the approval threshold — an approval_token. Use it when \
 you must decide before transferring (e.g. large files or an agent that needs human sign-off). For \
 small files you may skip it and call rdm_download directly; do not use it just to read metadata \
-(rdm_probe is cheaper because it creates no plan). Plans expire after 10 minutes."
+(rdm_probe is cheaper because it creates no plan). Pass single_stream=true for one-time/signed links: \
+the plan records it, and rdm_apply_plan executes the same no-Range single-GET transfer. Plans expire \
+after 10 minutes."
                 .to_string(),
         input_schema: obj(
             merge_props(
@@ -682,6 +996,8 @@ small files you may skip it and call rdm_download directly; do not use it just t
                     "dest_dir": prop_dest_dir(),
                     "file_name": prop_file_name(),
                     "connections": prop_connections(),
+                    "dynamic_connections": prop_dynamic_connections(),
+                    "single_stream": prop_single_stream(),
                     "chunk_size": prop_chunk_size(),
                     "expected_sha256": prop_expected_sha256(),
                     "speed_limit_bps": prop_speed_limit(),
@@ -1012,9 +1328,12 @@ fn selftest_tool() -> ToolDefinition {
 started on a random port (no public network): multi-connection hash consistency, graceful 200 \
 fallback when the server ignores Range, resume byte-delta after a pause, and checksum-mismatch \
 cleanup with zero leftover files. Use it as a readiness probe (e.g. after install or in CI) before \
-trusting downloads in an environment. Read-only with respect to the user's data; temporary files \
-live in the agent state dir and are removed. This validates the engine, not the remote URL — use \
-rdm_doctor/rdm_probe for that."
+trusting downloads in an environment. v1.4 also reports `data.recipes`: a read-only self-test of \
+the local recipe library (<state>/resolve/recipes) built from pure applicability checks \
+(no network, no model, no step execution); recipe failures are reported but do NOT change \
+`ok`/`passed` or the exit code (v1 only reports). Read-only with respect to the user's data; \
+temporary files live in the agent state dir and are removed. This validates the engine, not the \
+remote URL — use rdm_doctor/rdm_probe for that."
             .to_string(),
         input_schema: obj(
             json!({
@@ -1043,7 +1362,35 @@ rdm_doctor/rdm_probe for that."
                     }
                 },
                 "fixture": { "type": "object" },
-                "elapsed_ms": { "type": "integer", "minimum": 0 }
+                "elapsed_ms": { "type": "integer", "minimum": 0 },
+                "recipes": {
+                    "type": "object",
+                    "description": "Read-only recipe self-test report (v1.4, additive): pure matching checks over <state>/resolve/recipes. No network/model; recipe failures are reported here but never reflected in `ok`/`passed`.",
+                    "required": ["dir", "checked", "passed", "failed", "skipped", "failures"],
+                    "properties": {
+                        "dir": { "type": "string" },
+                        "checked": { "type": "integer", "minimum": 0 },
+                        "passed": { "type": "integer", "minimum": 0 },
+                        "failed": { "type": "integer", "minimum": 0 },
+                        "skipped": { "type": "integer", "minimum": 0 },
+                        "failures": {
+                            "type": "array",
+                            "maxItems": 50,
+                            "items": {
+                                "type": "object",
+                                "required": ["recipe_id", "version", "test", "message"],
+                                "properties": {
+                                    "recipe_id": { "type": "string" },
+                                    "version": { "type": "integer", "minimum": 0 },
+                                    "test": { "type": "string" },
+                                    "message": { "type": "string" }
+                                },
+                                "additionalProperties": true
+                            }
+                        }
+                    },
+                    "additionalProperties": true
+                }
             },
             "additionalProperties": true
         })),
@@ -1228,9 +1575,12 @@ pub fn capabilities_for(policy: &Policy) -> Value {
         "transports": ["mcp-stdio", "cli-json"],
         "features": [
             "range-probe", "segmented-download", "work-stealing", "resume",
-            "rate-limit", "sha256-verify", "policy", "approval-token",
-            "idempotency", "durable-tasks", "progress-notifications",
-            "doctor", "selftest", "bench", "state-maintenance", "redaction"
+            "dynamic-connections", "single-stream", "link-resolution", "link-resolution-explore",
+            "rate-limit",
+            "sha256-verify", "policy",
+            "approval-token", "idempotency", "durable-tasks",
+            "progress-notifications", "doctor", "selftest", "bench",
+            "state-maintenance", "redaction"
         ],
         "error_codes": error_code_names(),
         "task_states": task_state_names(),
@@ -1240,9 +1590,11 @@ pub fn capabilities_for(policy: &Policy) -> Value {
             "token_ttl_minutes": crate::APPROVAL_TOKEN_TTL_MINUTES,
             "single_use": true,
         },
-        "instructions": "Call rdm_capabilities first, then rdm_probe, then rdm_download (or \
-    rdm_plan_download -> rdm_apply_plan for large files), and rdm_wait_task/rdm_verify_file to finish. \
-    Treat policy_denied/needs_approval as stable contract signals, not transient errors."
+        "instructions": "Call rdm_capabilities first, then rdm_probe (or rdm_resolve for page/share \
+    links that are not a direct file; rdm_resolve only returns a verified manifest and never creates \
+    a task), then rdm_download (or rdm_plan_download -> rdm_apply_plan for large files), and \
+    rdm_wait_task/rdm_verify_file to finish. Treat policy_denied/needs_approval as stable contract \
+    signals, not transient errors."
     })
 }
 
@@ -1261,13 +1613,13 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_sixteen_unique_tools() {
+    fn catalog_has_seventeen_unique_tools() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(names, TOOL_NAMES.to_vec());
         let unique: HashSet<&str> = names.iter().copied().collect();
-        assert_eq!(unique.len(), 16, "tool names must be unique");
+        assert_eq!(unique.len(), 17, "tool names must be unique");
         for tool in &tools {
             assert_eq!(
                 tool_by_name(&tool.name).map(|found| found.name),
@@ -1320,6 +1672,7 @@ mod tests {
                 tool.name.as_str(),
                 "rdm_capabilities"
                     | "rdm_probe"
+                    | "rdm_resolve"
                     | "rdm_plan_download"
                     | "rdm_list_tasks"
                     | "rdm_get_task"
@@ -1346,6 +1699,7 @@ mod tests {
             let open_world = matches!(
                 tool.name.as_str(),
                 "rdm_probe"
+                    | "rdm_resolve"
                     | "rdm_download"
                     | "rdm_plan_download"
                     | "rdm_apply_plan"
@@ -1412,7 +1766,7 @@ mod tests {
             capabilities["schema_version"].as_str(),
             Some(SCHEMA_VERSION)
         );
-        assert_eq!(capabilities["tools"].as_array().unwrap().len(), 16);
+        assert_eq!(capabilities["tools"].as_array().unwrap().len(), 17);
         assert_eq!(
             capabilities["tools"]
                 .as_array()
@@ -1445,6 +1799,47 @@ mod tests {
         );
         let error_codes = capabilities["error_codes"].as_array().unwrap();
         assert_eq!(error_codes.len(), ErrorCode::all().len());
+        assert!(
+            capabilities["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| feature == "dynamic-connections"),
+            "capabilities.features must advertise dynamic-connections"
+        );
+        let features: Vec<&str> = capabilities["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let single = features
+            .iter()
+            .position(|feature| *feature == "single-stream")
+            .expect("capabilities.features must advertise single-stream");
+        let link = features
+            .iter()
+            .position(|feature| *feature == "link-resolution")
+            .expect("capabilities.features must advertise link-resolution");
+        let link_explore = features
+            .iter()
+            .position(|feature| *feature == "link-resolution-explore")
+            .expect("capabilities.features must advertise link-resolution-explore");
+        assert_eq!(
+            features.get(single.wrapping_sub(1)).copied(),
+            Some("dynamic-connections"),
+            "single-stream must come right after dynamic-connections"
+        );
+        assert_eq!(
+            features.get(link.wrapping_sub(1)).copied(),
+            Some("single-stream"),
+            "link-resolution must come right after single-stream"
+        );
+        assert_eq!(
+            features.get(link_explore.wrapping_sub(1)).copied(),
+            Some("link-resolution"),
+            "link-resolution-explore must come right after link-resolution"
+        );
         // Every advertised tool actually appears in the catalog.
         for name in capabilities["tools"].as_array().unwrap() {
             assert!(tool_by_name(name.as_str().unwrap()).is_some());
@@ -1452,10 +1847,175 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tool_schema_matches_contract() {
+        let tool = tool_by_name("rdm_resolve").unwrap();
+        assert_eq!(tool.input_schema["required"][0], "url");
+        assert_eq!(
+            tool.input_schema["properties"]["mode"]["enum"],
+            json!(["auto", "recipe_only", "explore"])
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["budget"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["max_resources"]["maximum"],
+            40
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["max_llm_calls"]["minimum"],
+            1
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["max_llm_calls"]["maximum"],
+            32
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["max_llm_calls"]["default"],
+            8
+        );
+        assert!(
+            !tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("max_llm_calls")),
+            "max_llm_calls must stay optional"
+        );
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(tool.annotations.read_only_hint);
+        assert!(!tool.annotations.destructive_hint);
+        assert!(tool.annotations.idempotent_hint);
+        assert!(tool.annotations.open_world_hint);
+        // A failed resolution still carries the full ResolveOutcome payload, so
+        // `data` must accept the manifest/diagnostics shape (not only null).
+        let data = &tool.output_schema["properties"]["data"]["anyOf"][0];
+        assert!(data["properties"]["run_id"].is_object());
+        assert!(data["properties"]["manifest"].is_object());
+        assert!(data["properties"]["diagnostics"].is_object());
+        // v1.6: optional method health (absent for direct-link/draft runs).
+        let health = &data["properties"]["recipe_health"];
+        assert_eq!(health["anyOf"][0]["type"], "object");
+        assert_eq!(health["anyOf"][1]["type"], "null");
+        let health_schema = &health["anyOf"][0];
+        assert_eq!(
+            health_schema["properties"]["status"]["enum"],
+            json!(["ok", "degraded", "broken", "untested"])
+        );
+        assert!(health_schema["properties"]["last_failure"]["anyOf"][0].is_object());
+        assert!(
+            !data["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("recipe_health")),
+            "recipe_health must stay optional"
+        );
+    }
+
+    #[test]
+    fn selftest_schema_advertises_the_recipe_report() {
+        let tool = tool_by_name("rdm_selftest").unwrap();
+        // Read-only + local fixture + the additive recipe report.
+        assert!(tool.annotations.read_only_hint);
+        assert!(!tool.annotations.open_world_hint);
+        let data = &tool.output_schema["properties"]["data"]["anyOf"][0];
+        let recipes = &data["properties"]["recipes"];
+        assert_eq!(recipes["type"], "object");
+        for key in ["dir", "checked", "passed", "failed", "skipped", "failures"] {
+            assert!(
+                recipes["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == key),
+                "recipes schema must require {key}"
+            );
+        }
+        assert_eq!(recipes["properties"]["failures"]["maxItems"], 50);
+        assert_eq!(
+            recipes["properties"]["failures"]["items"]["required"],
+            json!(["recipe_id", "version", "test", "message"])
+        );
+        // The field is additive/optional at the envelope level, so v1.3 clients
+        // that validate against the old schema keep working.
+        assert!(
+            !data["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "recipes"),
+            "recipes must stay additive, not required"
+        );
+        assert!(tool
+            .description
+            .contains("read-only self-test of the local recipe library"));
+    }
+
+    #[test]
+    fn single_stream_is_advertised_in_tool_and_plan_schemas() {
+        for name in ["rdm_download", "rdm_plan_download"] {
+            let tool = tool_by_name(name).unwrap();
+            let prop = &tool.input_schema["properties"]["single_stream"];
+            assert_eq!(prop["type"], "boolean", "{name} single_stream type");
+            assert_eq!(prop["default"], false, "{name} single_stream default");
+            assert!(
+                prop["description"].as_str().unwrap().contains("one-time"),
+                "{name} single_stream description"
+            );
+            assert_eq!(
+                tool.input_schema["additionalProperties"], false,
+                "{name} must keep additionalProperties=false"
+            );
+        }
+        // The plan carries the flag so plan -> apply preserves it.
+        let plan = tool_by_name("rdm_plan_download").unwrap();
+        let plan_data = &plan.output_schema["properties"]["data"]["anyOf"][0];
+        assert_eq!(
+            plan_data["properties"]["plan"]["properties"]["single_stream"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn dynamic_connections_is_advertised_in_tool_schemas() {
+        for name in ["rdm_download", "rdm_plan_download"] {
+            let tool = tool_by_name(name).unwrap();
+            let prop = &tool.input_schema["properties"]["dynamic_connections"];
+            assert_eq!(prop["type"], "boolean", "{name} dynamic_connections type");
+            assert_eq!(prop["default"], true, "{name} dynamic_connections default");
+            assert!(
+                prop["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Dynamically"),
+                "{name} dynamic_connections description"
+            );
+        } // The plan output carries the flag so approval flows preserve it.
+        let plan = tool_by_name("rdm_plan_download").unwrap();
+        let plan_data = &plan.output_schema["properties"]["data"]["anyOf"][0];
+        assert_eq!(
+            plan_data["properties"]["plan"]["properties"]["dynamic_connections"]["type"],
+            "boolean"
+        );
+        // Agent-visible task shapes expose the observed peak.
+        let view = task_view_schema();
+        assert_eq!(view["properties"]["peak_connections"]["type"], "integer");
+        assert_eq!(view["properties"]["dynamic_connections"]["type"], "boolean");
+        assert_eq!(
+            task_summary_schema()["properties"]["peak_connections"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            task_result_schema()["properties"]["peak_connections"]["type"],
+            "integer"
+        );
+    }
+
+    #[test]
     fn plan_with_token_is_redacted() {
         let mut request = rdm_core::DownloadRequest::new("https://user:pass@example.com/a.bin");
         request.cookie = Some("secret=1".to_string());
         request.output_dir = Some(std::path::PathBuf::from("C:\\tmp"));
+        request.single_stream = true;
         let plan = crate::DownloadPlan::new(
             request,
             Some(123),
@@ -1474,5 +2034,11 @@ mod tests {
         let summary = plan.summary();
         assert_eq!(summary["plan_id"], plan.plan_id);
         assert_eq!(summary["requires_approval"], true);
+        // single_stream plans are reported normalized: one connection, no
+        // dynamic planning, no chunk plan.
+        assert_eq!(summary["single_stream"], true);
+        assert_eq!(summary["connections"], 1);
+        assert_eq!(summary["dynamic_connections"], false);
+        assert_eq!(summary["chunk_size"], Value::Null);
     }
 }

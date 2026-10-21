@@ -51,6 +51,9 @@ pub(crate) struct Counters {
     pub downloaded: AtomicU64,
     pub completed_chunks: AtomicU64,
     pub active_workers: AtomicUsize,
+    /// High-water mark of [`Counters::active_workers`]; reported as
+    /// `DownloadSummary::peak_connections`.
+    pub peak_workers: AtomicUsize,
 }
 
 impl Counters {
@@ -71,6 +74,41 @@ impl Counters {
 
     pub fn set_downloaded(&self, bytes: u64) {
         self.downloaded.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Try to enter the "active worker" state while `active < target`.
+    ///
+    /// Returns `false` when the plan is already saturated; the caller parks and
+    /// retries after a release/target change.
+    pub fn try_enter_active(&self, target: usize) -> bool {
+        let mut active = self.active_workers.load(Ordering::SeqCst);
+        loop {
+            if active >= target {
+                return false;
+            }
+            match self.active_workers.compare_exchange(
+                active,
+                active + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.peak_workers.fetch_max(active + 1, Ordering::SeqCst);
+                    return true;
+                }
+                Err(current) => active = current,
+            }
+        }
+    }
+
+    /// Leave the "active worker" state.
+    pub fn leave_active(&self) {
+        self.active_workers.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Observed peak of simultaneously active workers.
+    pub fn peak(&self) -> usize {
+        self.peak_workers.load(Ordering::SeqCst)
     }
 }
 

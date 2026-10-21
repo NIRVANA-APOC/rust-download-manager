@@ -32,6 +32,7 @@ Examples:
   rdm bench --size 64M --connections 1,8 --output json
   rdm download https://example.com/file.iso -d C:\\Downloads -c 8 --output json
   rdm probe https://example.com/file.iso --output json
+  rdm resolve https://example.com/share/abc --mode recipe-only --output json
   rdm tasks --state completed --limit 20 --output json
   rdm task tsk_1792345678901_a1b2 --events 50 --output json
   rdm state inspect --dir C:\\Downloads --output json
@@ -78,6 +79,8 @@ pub enum Command {
     Download(DownloadArgs),
     /// Inspect remote metadata without downloading anything.
     Probe(ProbeArgs),
+    /// Resolve a page/share link into a verified resource manifest (no task).
+    Resolve(ResolveArgs),
     /// Print the machine-readable capability manifest.
     Capabilities,
     /// Print JSON Schemas for the envelope, errors, tasks, events and tools.
@@ -96,6 +99,137 @@ pub enum Command {
     State(StateArgs),
     /// Execute a batch of downloads from a JSON file or stdin.
     Run(RunArgs),
+    /// Manage the local link-resolution method library and drafts (v1.5).
+    Recipe(RecipeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecipeArgs {
+    #[command(subcommand)]
+    pub action: RecipeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecipeCommand {
+    /// List the local method library (ids/versions/health) and pending drafts.
+    List,
+    /// Show one recipe (newest, or a specific `--version`).
+    Show(RecipeShowArgs),
+    /// Run pure-matching self-tests over the library + drafts (`--strict` fails).
+    Check(RecipeCheckArgs),
+    /// Move the matcher back to an existing version (index-only rollback).
+    Rollback(RecipeRollbackArgs),
+    /// Evaluate a draft against the R1–R6 publish gates and (unless `--dry-run`)
+    /// publish it into the library.
+    Publish(RecipePublishArgs),
+    /// Export one method as JSON (sensitive-content check by default).
+    Export(RecipeExportArgs),
+    /// Import a method file into the library, or convert it to a draft /
+    /// evaluate-and-publish it.
+    Import(RecipeImportArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
+pub struct RecipeShowArgs {
+    /// Recipe id, e.g. `example.com-file`.
+    pub id: String,
+
+    /// Show this exact version instead of the newest one.
+    #[arg(long, value_name = "N")]
+    pub version: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+pub struct RecipeCheckArgs {
+    /// Exit 2 when any recipe/draft self-test fails (default is report-only).
+    #[arg(long)]
+    pub strict: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
+pub struct RecipeRollbackArgs {
+    /// Recipe id to roll back.
+    pub id: String,
+
+    /// Existing version that becomes `active_version`.
+    #[arg(long, value_name = "N")]
+    pub version: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct RecipePublishArgs {
+    /// Draft id from `rdm recipe list` / `resolve --mode explore`.
+    pub draft_id: String,
+
+    /// Positive replay sample URL (repeatable; defaults to the draft's
+    /// `source_url`). The first sample is the R3 "fresh context" sample.
+    #[arg(long = "sample", value_name = "URL")]
+    pub samples: Vec<String>,
+
+    /// Negative URL that must NOT match the recipe (repeatable; R5).
+    #[arg(long = "negative", value_name = "URL")]
+    pub negatives: Vec<String>,
+
+    /// Evaluate R1–R6 only; never write the method file / index / draft removal.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
+pub struct RecipeExportArgs {
+    /// Recipe id, e.g. `example.com-file`.
+    pub id: String,
+
+    /// Export this exact version instead of the newest one.
+    #[arg(long, value_name = "N")]
+    pub version: Option<u32>,
+
+    /// Write the recipe JSON to this path (atomic, unique tmp + rename).
+    #[arg(long, value_name = "PATH")]
+    pub out: Option<PathBuf>,
+
+    /// Allow exporting a method that carries credential-like content (headers
+    /// `authorization`/`cookie`/`proxy-authorization`, or sensitive query
+    /// parameter names such as token/sig/signature/expires/key/secret/apikey).
+    #[arg(long)]
+    pub allow_sensitive: bool,
+
+    /// Overwrite an existing `--out` target.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecipeImportArgs {
+    /// Recipe file (`rdm.recipe/v1` JSON) to import.
+    pub file: PathBuf,
+
+    /// Write the recipe as a local draft (`rdm.recipe-draft/v1`) instead of
+    /// adding it to the method library; publish it later with
+    /// `rdm recipe publish <draft_id>`.
+    #[arg(long, conflicts_with = "publish")]
+    pub as_draft: bool,
+
+    /// Replay the recipe's own tests through the R1–R6 gates and publish only
+    /// when they pass (no draft is written).
+    #[arg(long, conflicts_with = "as_draft")]
+    pub publish: bool,
+
+    /// Validate/evaluate only: never write a method file, index or draft.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Allow importing a method that carries credential-like content (same
+    /// check as `rdm recipe export --allow-sensitive`).
+    #[arg(long)]
+    pub allow_sensitive: bool,
+
+    /// Overwrite a conflicting id+version (different content) in the library.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +261,10 @@ pub struct DownloadArgs {
     #[arg(long, value_name = "HEX")]
     pub sha256: Option<String>,
 
+    /// Exactly one plain GET with no Range header (one-time/signed links).
+    #[arg(long)]
+    pub single_stream: bool,
+
     /// Idempotency key: a completed task with this key is reused instead of
     /// downloading again.
     #[arg(long, value_name = "KEY")]
@@ -147,6 +285,68 @@ pub struct ProbeArgs {
 
     #[command(flatten)]
     pub net: NetArgs,
+}
+
+/// Resolution mode of `rdm resolve` (contract §5: `auto|recipe-only|explore`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ResolveModeArg {
+    /// Use a matching local recipe, else verify the URL as a direct file (a page
+    /// may fall back to model exploration when the user configured AI).
+    Auto,
+    /// Only run a known recipe (fail when none matches); never calls a model.
+    RecipeOnly,
+    /// Model-driven exploration with the user's configured AI (`<state>/ai.json`).
+    Explore,
+}
+
+#[derive(Debug, Args)]
+pub struct ResolveArgs {
+    /// URL to resolve (http/https).
+    pub url: String,
+
+    /// Natural-language goal hint (1..512 chars), e.g. "Windows x64 installer".
+    #[arg(long, value_name = "TEXT")]
+    pub goal: Option<String>,
+
+    /// Resolution mode: auto, recipe-only or explore.
+    #[arg(long, value_enum, default_value = "auto", value_name = "MODE")]
+    pub mode: ResolveModeArg,
+
+    /// Force a specific local recipe id (debugging/replay).
+    #[arg(long, value_name = "ID")]
+    pub recipe: Option<String>,
+
+    /// Maximum resources in the returned manifest (1..40).
+    #[arg(long, value_name = "N")]
+    pub max_resources: Option<usize>,
+
+    /// Wall-clock budget for the whole resolution, in milliseconds (1000..300000).
+    #[arg(long, value_name = "MS")]
+    pub budget_ms: Option<u64>,
+
+    /// Maximum HTTP requests including redirects and verification (1..64).
+    #[arg(long, value_name = "N")]
+    pub budget_requests: Option<u32>,
+
+    /// Maximum body bytes read by the resolution (65536..33554432).
+    #[arg(long, value_name = "BYTES")]
+    pub budget_bytes: Option<u64>,
+
+    /// Maximum redirect hops (0..10).
+    #[arg(long, value_name = "N")]
+    pub budget_redirects: Option<u32>,
+
+    /// Maximum model calls when exploring (1..32; explore/auto fallback only).
+    #[arg(long, value_name = "N")]
+    pub max_llm_calls: Option<u32>,
+
+    /// Download the first verified resource after resolving (no second probe).
+    #[arg(long)]
+    pub download: bool,
+
+    /// Directory that receives the downloaded file (default: current directory).
+    #[arg(long, value_name = "DIR", requires = "download")]
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default)]

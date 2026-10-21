@@ -37,6 +37,10 @@ pub async fn run(mode: OutputMode, store_root: &Path, args: DownloadArgs) -> u8 
     if let Err(error) = super::validate_connections(request.connections) {
         return reporter.finish_err(error);
     }
+    // Normalize before persisting/tracking: `single_stream` forces
+    // connections=1 / dynamic=false / no chunk plan, and the TaskView must
+    // describe the transfer that actually executes (contract §2.4).
+    let request = request.normalized();
 
     // ---- Agent policy (only enforced when an explicit policy.json exists) ---
     let dest_dir = request
@@ -259,6 +263,7 @@ fn summary_event_json(summary: &DownloadSummary) -> Value {
         "elapsed_ms": summary.elapsed_ms,
         "avg_speed_bps": summary.avg_speed_bps,
         "connections": summary.connections,
+        "peak_connections": summary.peak_connections,
         "resumed_chunks": summary.resumed_chunks,
         "range_supported": summary.range_supported,
         "http_version": summary.http_version,
@@ -377,6 +382,16 @@ fn handle_event(
                 }),
             );
             human.retry(*chunk, *attempt, *delay_ms, reason, reporter.is_text());
+        }
+        DownloadEvent::Concurrency { target, active } => {
+            tracker.apply_concurrency(*target, *active);
+            reporter.event(
+                "concurrency",
+                json!({
+                    "target": target,
+                    "active": active,
+                }),
+            );
         }
         DownloadEvent::Completed { .. }
         | DownloadEvent::Failed { .. }
@@ -563,6 +578,7 @@ impl DownloadArgs {
             chunk_size,
             limit,
             sha256,
+            single_stream,
             idempotency_key: _,
             quiet: _,
             net,
@@ -573,6 +589,7 @@ impl DownloadArgs {
         request.connections = connections;
         request.chunk_size = chunk_size;
         request.speed_limit_bps = limit;
+        request.single_stream = single_stream;
         if let Some(expected) = sha256 {
             validate_sha256(&expected)?;
             request.expected_sha256 = Some(expected);

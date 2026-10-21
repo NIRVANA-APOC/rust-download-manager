@@ -1,18 +1,33 @@
 //! RDM 桌面 GUI 入口。
 //!
 //! 启动顺序（与 `docs/extension-protocol.md` 和 Firefox 宿主的依赖约定一致）：
-//! 1. 单实例检测：若 `ipc.json` 指向的 GUI 存活，则经 IPC 投递命令行 URL（或 Activate）后退出；
+//! 1. 单实例检测：若 `ipc.json` 指向的 GUI 存活，则经 IPC 投递命令行 URL（或 Activate）
+//!    后退出；`--silent` 启动不会抬起已运行实例的窗口；
 //! 2. 建 tokio runtime → `bind 127.0.0.1:0` → `rdm_ipc::write_info`（尽早发布，宿主轮询）；
 //! 3. 启动 IPC accept 循环与引擎 250ms ticker；
 //! 4. 扫描 `%LOCALAPPDATA%\RDM\queue\*.json` 兜底队列（宿主在 GUI 未启动时的落盘任务）；
-//! 5. 打开 GPUI 窗口（1180x760，暗色/浅色主题）；
-//! 6. 窗口关闭后删除 `ipc.json`、退出 tokio runtime。
+//! 5. 打开 GPUI 窗口（1180x760，暗色/浅色主题）；「静默启动」时窗口创建但不显示；
+//! 6. 窗口关闭后清理托盘图标、删除 `ipc.json`、退出 tokio runtime。
 //!
-//! `rdm-gui.exe <URL>` 支持启动即添加任务；GUI 已在运行时则走单实例投递。
+//! 系统集成（`desktop` 模块）：托盘图标 / 关闭到托盘（最小化仍到任务栏） / 开机自启动
+//! （HKCU Run）。是否安装托盘由 `Settings::needs_tray()` 决定，注册表在启动和保存设置时同步。
+//!
+//! `rdm-gui.exe [--silent] [--autostart] [URL]` 支持启动即添加任务；GUI 已在运行时则走
+//! 单实例投递。`--help` 打印用法。
+//!
+//! **子系统**：debug 默认是控制台子系统（便于开发看 tracing 输出，双击会弹命令行窗口）；
+//! release 或启用 `windows-subsystem` feature 时是 GUI 子系统：双击不弹控制台，日志改写到
+//! `%LOCALAPPDATA%\RDM\logs\gui.log`（安装版脚本用 `--features windows-subsystem` 构建）。
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    any(not(debug_assertions), feature = "windows-subsystem"),
+    windows_subsystem = "windows"
+)]
 
+mod ai_resolve;
 mod app;
+mod cli;
+mod desktop;
 mod engine;
 mod ipc_server;
 mod model;
@@ -32,7 +47,7 @@ use gpui::{
 use rdm_ipc::{EnqueueItem, Request};
 use tokio::sync::mpsc;
 
-use crate::app::{Bootstrap, CloseDialog, RdmApp};
+use crate::app::{Bootstrap, CloseDialog, GuiInputs, RdmApp, SettingsTab};
 use crate::engine::{EngineMsg, EngineRuntime};
 use crate::text_input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
@@ -47,8 +62,30 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 
 fn main() {
     init_logging();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        "RDM GUI 启动"
+    );
     let state_dir = rdm_ipc::state_dir();
-    let cli_url = std::env::args().nth(1).filter(|arg| !arg.starts_with('-'));
+
+    // ---- 0. 命令行参数 ----------------------------------------------------
+    let args = match cli::parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(err) => {
+            tracing::error!(error = %err, "命令行参数错误");
+            eprintln!("rdm-gui: {err}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    if args.help {
+        println!("{}", cli::USAGE);
+        return;
+    }
+    if args.autostart {
+        tracing::info!("由开机自启动项启动");
+    }
+    let cli_url = args.url.clone();
 
     // ---- 1. 单实例 --------------------------------------------------------
     if rdm_ipc::is_gui_alive() {
@@ -82,6 +119,10 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        } else if args.silent {
+            // 静默启动的第二次调用不应把已隐藏的窗口拉到前台。
+            println!("RDM 已在运行（静默模式不激活窗口）");
+            return;
         } else {
             match rdm_ipc::send(Request::Activate, Duration::from_secs(3)) {
                 Ok(_) => {
@@ -98,6 +139,10 @@ fn main() {
 
     // ---- 2. 读取本地状态 --------------------------------------------------
     let settings = model::load_settings(&state_dir);
+    // 静默启动：设置开启或命令行 --silent 强制；托盘不可用时会在窗口创建后回退显示。
+    let start_silent = settings.effective_silent_start(args.silent);
+    // AI 配置从 <state>/ai.json 读入（缺失/损坏 → 默认值，默认未启用）。
+    let ai_config = rdm_ai::AiConfig::load(&state_dir);
     let loaded = model::load_downloads(&state_dir);
     if let Some(error) = &loaded.error {
         tracing::warn!(error = %error, "加载 downloads.json 失败，从空列表开始");
@@ -153,18 +198,26 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match ipc_server::publish(&info) {
-        Ok(path) => tracing::info!(
-            path = %path.display(),
-            port = info.port,
-            "IPC endpoint 已发布"
-        ),
-        Err(err) => {
-            // 发布失败不阻断 UI（浏览器集成不可用），但要把错误记下来。
-            tracing::error!(error = %err, "写入 ipc.json 失败，Firefox 集成将不可用");
-            eprintln!("rdm-gui: 写入 ipc.json 失败: {err}");
+    let ipc_warning = match ipc_server::publish(&info) {
+        Ok(path) => {
+            tracing::info!(
+                path = %path.display(),
+                port = info.port,
+                "IPC endpoint 已发布"
+            );
+            None
         }
-    }
+        Err(err) => {
+            // 发布失败不阻断 UI（浏览器集成不可用），但要在界面上明确提示用户，
+            // 否则扩展只会显示"GUI 未运行"而用户无从排查。
+            tracing::error!(error = %err, "写入 ipc.json 失败，浏览器集成将不可用");
+            eprintln!("rdm-gui: 写入 ipc.json 失败: {err}");
+            Some(format!(
+                "浏览器集成不可用：无法写入 {}（{err}）。请改用安装目录下的 RDM（README §7），或检查该目录写权限。",
+                rdm_ipc::info_path().display()
+            ))
+        }
+    };
     runtime.spawn(ipc_server::serve(listener, token, ui_tx));
     engine.start_ticker();
 
@@ -188,10 +241,16 @@ fn main() {
         engine,
         ui_rx,
         initial,
+        ai_config,
+        ipc_warning,
     };
     let palette = Palette::for_theme(bootstrap.settings.theme);
 
     // ---- 5. GPUI ----------------------------------------------------------
+    // 托盘事件通道必须先于窗口创建：RdmApp::new 会按设置安装托盘图标，
+    // 截获的点击/退出事件经这个通道回到 GPUI 主线程（见 run 闭包里的 async loop）。
+    let tray_rx = desktop::init_event_channel();
+
     Application::new().run(move |cx: &mut App| {
         bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
@@ -202,24 +261,90 @@ fn main() {
                 ..Default::default()
             }),
             window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-            focus: true,
+            // 静默启动：窗口照常创建（下载/IPC 全部可用），但不显示、不抢焦点；
+            // 用户点托盘图标后由 RdmApp::show_from_tray 显示。
+            focus: !start_silent,
+            show: !start_silent,
             ..Default::default()
         };
 
         let window = match cx.open_window(options, move |window, cx| {
             let url_input =
                 cx.new(|cx| TextInput::new(cx, "输入或粘贴下载 URL（http/https）", palette));
-            let dir_input = cx.new(|cx| {
-                TextInput::new(
-                    cx,
-                    "例如 C:\\Users\\you\\Downloads（留空使用默认）",
-                    palette,
-                )
+            let dir_input =
+                cx.new(|cx| TextInput::new(cx, "例如 C:\\Users\\you\\Downloads", palette));
+            let limit_input = cx.new(|cx| TextInput::new(cx, "例如 2 或 1.5", palette));
+            let connections_input = cx.new(|cx| {
+                TextInput::new(cx, format!("1..={}", rdm_core::MAX_CONNECTIONS), palette)
             });
-            let limit_input = cx.new(|cx| TextInput::new(cx, "例如 2 或 1.5，留空不限速", palette));
+            let ai_base_url =
+                cx.new(|cx| TextInput::new(cx, "例如 https://api.deepseek.com/v1", palette));
+            let ai_model = cx.new(|cx| TextInput::new(cx, "例如 deepseek-flash", palette));
+            let ai_api_key = cx.new(|cx| TextInput::new(cx, "sk-…（仅本机）", palette));
+            let ai_chat_input = cx.new(|cx| TextInput::new(cx, "追问 AI…", palette));
 
-            let app =
-                cx.new(|cx| RdmApp::new(cx, url_input.clone(), dir_input, limit_input, bootstrap));
+            let inputs = GuiInputs {
+                url: url_input.clone(),
+                dir: dir_input,
+                limit: limit_input,
+                connections: connections_input,
+                ai_base_url,
+                ai_model,
+                ai_api_key,
+                ai_chat: ai_chat_input.clone(),
+            };
+            let window_handle = window.window_handle();
+            let hwnd = desktop::raw_hwnd(window);
+            let app = cx.new(|cx| RdmApp::new(cx, inputs, bootstrap, window_handle, hwnd));
+
+            // 验收/截图钩子（不写用户文档）：`RDM_TEST_OPEN_SETTINGS=1` 时启动后直接
+            // 打开设置弹窗；也可写成 download/classification/ai/appearance/system 定位到
+            // 某个分类，便于逐页截图。与 `RDM_TEST_TRAY_WITHOUT_ICON` 同一约定：只认
+            // 环境变量、不改变 CLI 参数契约，也不写用户设置（隔离 LOCALAPPDATA 下使用）。
+            if let Some(tab) = test_open_settings_tab() {
+                app.update(cx, |app, cx| {
+                    app.open_settings_for_test(window, cx, tab);
+                });
+            }
+
+            // 关闭到托盘由 `desktop` 安装在主窗口上的消息钩子拦截
+            // （见 `desktop::install_window_hook`）：托盘可用且开关打开时，WM_CLOSE
+            // 直接隐藏窗口、不进入 GPUI 的关闭流程；最小化不拦截，正常到任务栏。
+
+            // 托盘事件 → GPUI 主线程：显示主窗口 / 真正退出。
+            {
+                let mut rx = tray_rx;
+                let weak_app = app.downgrade();
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            desktop::TrayEvent::ShowMain => {
+                                let _ = weak_app.update(cx, |app, cx| app.show_from_tray(cx));
+                            }
+                            desktop::TrayEvent::Quit => {
+                                // 先移除托盘图标再退，避免残留「幽灵图标」。
+                                desktop::shutdown_tray();
+                                let _ = cx.update(|cx| cx.quit());
+                                break;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+
+            // 静默启动回退：没有托盘就没有恢复入口，直接显示窗口并提示。
+            if start_silent && !desktop::is_tray_alive() {
+                if let Some(raw) = hwnd {
+                    desktop::show_window(raw);
+                }
+                window.activate_window();
+                cx.activate(true);
+                app.update(cx, |app, cx| {
+                    app.set_toast("托盘不可用，已回退为显示主窗口", true);
+                    cx.notify();
+                });
+            }
 
             // URL 输入框 Enter = 添加。Entity 引用通过弱句柄回传，避免循环强引用。
             let weak_app = app.downgrade();
@@ -231,6 +356,16 @@ fn main() {
                 }));
             });
 
+            // AI 栏聊天输入框 Enter = 发送（上下文含解析摘要）。
+            let weak_app_chat = app.downgrade();
+            ai_chat_input.update(cx, |input, _cx| {
+                input.on_submit = Some(Rc::new(move |_window, cx| {
+                    weak_app_chat
+                        .update(cx, |app, cx| app.send_ai_chat(cx))
+                        .ok();
+                }));
+            });
+
             let focus = url_input.read(cx).focus_handle(cx);
             window.focus(&focus);
             app
@@ -238,17 +373,26 @@ fn main() {
             Ok(window) => window,
             Err(err) => {
                 eprintln!("rdm-gui: 打开窗口失败: {err}");
+                desktop::shutdown_tray();
                 ipc_server::cleanup_info_file();
                 std::process::exit(1);
             }
         };
         let _ = window;
 
-        cx.on_window_closed(|cx| cx.quit()).detach();
-        cx.activate(true);
+        cx.on_window_closed(|cx| {
+            // 正常退出路径（未开启「关闭到托盘」）：先把托盘图标摘掉。
+            desktop::shutdown_tray();
+            cx.quit();
+        })
+        .detach();
+        if !start_silent {
+            cx.activate(true);
+        }
     });
 
     // ---- 6. 清理 ----------------------------------------------------------
+    desktop::shutdown_tray();
     ipc_server::cleanup_info_file();
     drop(runtime);
     tracing::info!("RDM GUI 退出");
@@ -275,10 +419,69 @@ fn bind_keys(cx: &mut App) {
 
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("rdm_gui=info,rdm_core=info,info"));
+    let filter = || {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("rdm_gui=info,rdm_core=info,info"))
+    };
+    // 无控制台构建（release / windows-subsystem feature）没有 stderr 可看：日志写文件，
+    // 否则双击启动后出问题完全无迹可查。打不开日志文件时退回默认 stdout。
+    if cfg!(any(feature = "windows-subsystem", not(debug_assertions))) {
+        if let Some(file) = gui_log_file() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_target(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .try_init();
+            return;
+        }
+    }
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(filter())
         .with_target(false)
         .try_init();
+}
+
+/// GUI 日志文件：`%LOCALAPPDATA%\RDM\logs\gui.log`（追加写，>4 MiB 轮转到 `gui.log.1`）。
+///
+/// 只有无控制台构建使用；目录不可写时返回 `None` 回退 stdout。
+fn gui_log_file() -> Option<std::fs::File> {
+    let path = rdm_ipc::state_dir().join("logs").join("gui.log");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        if metadata.len() > 4 * 1024 * 1024 {
+            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// 自动化验收/截图专用环境变量（不写用户文档、不改变 CLI 参数契约）：
+/// `RDM_TEST_OPEN_SETTINGS=1` 启动后直接打开设置弹窗；值也可写成
+/// `download|classification|ai|appearance|system` 直接定位到某个分类，便于逐页截图。
+/// 与 `desktop` 的 `RDM_TEST_TRAY_WITHOUT_ICON` 保持一致：只认环境变量。
+const TEST_OPEN_SETTINGS_ENV: &str = "RDM_TEST_OPEN_SETTINGS";
+
+/// 解析 `RDM_TEST_OPEN_SETTINGS`：外层 `None` = 不打开弹窗；`Some(None)` = 打开并停在
+/// 默认「下载」分类；`Some(Some(tab))` = 打开并定位到指定分类。
+fn test_open_settings_tab() -> Option<Option<SettingsTab>> {
+    let raw = std::env::var(TEST_OPEN_SETTINGS_ENV).ok()?;
+    let key = raw.trim().to_ascii_lowercase();
+    if key.is_empty() || key == "0" || key == "false" {
+        return None;
+    }
+    let tab = match key.as_str() {
+        "classification" => Some(SettingsTab::Classification),
+        "ai" => Some(SettingsTab::Ai),
+        "appearance" => Some(SettingsTab::Appearance),
+        "system" => Some(SettingsTab::System),
+        // "1"/"true"/其它真值：默认「下载」分类。
+        _ => None,
+    };
+    Some(tab)
 }

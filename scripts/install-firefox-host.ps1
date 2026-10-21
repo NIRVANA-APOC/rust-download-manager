@@ -61,6 +61,21 @@ function Write-Step($Message) { Write-Host "==> $Message" -ForegroundColor Cyan 
 function Write-Ok($Message) { Write-Host "    $Message" -ForegroundColor Green }
 function Write-Warn2($Message) { Write-Host "    $Message" -ForegroundColor Yellow }
 
+# 读取 PE 子系统（2 = GUI，3 = 控制台）；用于提醒"双击会弹命令行窗口"的 debug 构建。
+function Get-PeSubsystem([string]$Path) {
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $header = New-Object byte[] 1024
+            $read = $stream.Read($header, 0, $header.Length)
+            if ($read -lt 0x40) { return $null }
+            $pe = [BitConverter]::ToInt32($header, 0x3C)
+            if ($pe -le 0 -or ($pe + 0x5E) -gt $read) { return $null }
+            return [BitConverter]::ToUInt16($header, $pe + 0x5C)
+        } finally { $stream.Dispose() }
+    } catch { return $null }
+}
+
 function Add-ToolchainPath {
     $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
     if ((Test-Path -LiteralPath $cargoBin -PathType Container) -and ($env:PATH -notlike "*$cargoBin*")) {
@@ -187,8 +202,14 @@ try {
     if (-not $NoGui) {
         $guiSource = Find-BuiltBinary -Name "rdm-gui.exe" -ExplicitPath $GuiExe
         if ($guiSource) {
-            Copy-Item -LiteralPath $guiSource -Destination (Join-Path $InstallDir "rdm-gui.exe") -Force
-            Write-Ok "已复制 GUI：$guiSource -> $(Join-Path $InstallDir 'rdm-gui.exe')"
+            $guiDest = Join-Path $InstallDir "rdm-gui.exe"
+            Copy-Item -LiteralPath $guiSource -Destination $guiDest -Force
+            Write-Ok "已复制 GUI：$guiSource -> $guiDest"
+            if ((Get-PeSubsystem $guiDest) -eq 3) {
+                Write-Warn2 "注意：rdm-gui.exe 是控制台子系统（debug 默认），双击会弹出命令行窗口。"
+                Write-Warn2 "安装无控制台版本：cargo build -p rdm-gui --features windows-subsystem，再重新运行本脚本。"
+                Write-Warn2 "无控制台构建的日志写到 %LOCALAPPDATA%\\RDM\\logs\\gui.log。"
+            }
         } else {
             Write-Warn2 "未找到 rdm-gui.exe（GUI 可能尚未构建）：宿主会在需要时尝试启动它。"
         }
@@ -201,6 +222,20 @@ try {
         path               = $InstalledExe
         type               = "stdio"
         allowed_extensions = @($ExtensionId)
+    }
+    # Firefox 与 Chrome 共用同一个宿主 manifest 文件：保留 Chrome 安装脚本写入的
+    # allowed_origins，避免重装 Firefox 宿主后 Chrome 扩展失去权限。
+    if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
+        try {
+            $existing = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $origins = @($existing.allowed_origins | Where-Object { $_ })
+            if ($origins.Count -gt 0) {
+                $manifest.allowed_origins = $origins
+                Write-Ok "保留 Chrome allowed_origins：$($origins -join ', ')"
+            }
+        } catch {
+            Write-Warn2 "已有宿主 manifest 无法解析，将重新写入：$($_.Exception.Message)"
+        }
     }
     $manifestJson = $manifest | ConvertTo-Json -Depth 5
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

@@ -1,0 +1,4 @@
+# Normalize line endings: shell scripts/hooks must stay LF so git-bash can execute them.
+* text=auto
+*.sh text eol=lf
+.githooks/** text eol=lf

@@ -35,6 +35,39 @@
       </div>
     </section>
 
+    <section id="active-section" class="active-section" hidden>
+      <div id="active-head" class="section-head active-head" hidden>
+        <h2 id="active-title">正在下载</h2>
+        <span id="active-summary" class="active-summary"></span>
+      </div>
+      <ul id="active-list" class="active-list"></ul>
+      <p id="active-more" class="active-more" hidden></p>
+      <p id="active-hint" class="active-hint" role="status" aria-live="polite" hidden></p>
+    </section>
+
+    <section class="card ai-card" aria-labelledby="ai-title">
+      <div class="ai-head">
+        <h2 id="ai-title">AI 解析</h2>
+        <label
+          class="ai-credentials"
+          title="勾选后把当前页面 Cookie 发送给本机 RDM（仅内存转发，不写日志/磁盘）；需要登录态的页面解析更准确"
+        >
+          <input id="ai-credentials" type="checkbox" aria-label="附带 Cookie 凭证" />
+          <span>Cookie</span>
+        </label>
+        <button
+          id="ai-parse"
+          class="btn primary btn-sm"
+          type="button"
+          title="解析当前页面（结果在 RDM 桌面端 AI 栏查看）"
+          aria-label="AI 解析当前页，结果在 RDM 桌面端 AI 栏查看"
+        >
+          解析此页
+        </button>
+      </div>
+      <p id="ai-result" class="ai-result" role="status" aria-live="polite"></p>
+    </section>
+
     <section class="recent">
       <div class="section-head">
         <h2>最近转交</h2>

@@ -33,13 +33,26 @@ pub const MODERN_UNSUPPORTED_VERSION: i64 = -32022;
 pub const INSTRUCTIONS: &str = "\
 RDM is a durable multi-connection download manager. Typical flow: rdm_capabilities -> \
 rdm_probe(url) -> rdm_download(url, wait=true), or for files over the approval threshold \
-rdm_plan_download -> rdm_apply_plan -> rdm_wait_task -> rdm_verify_file. Tasks are durable: \
-rdm_list_tasks / rdm_get_task survive restarts and work across CLI/MCP processes; use \
-rdm_wait_task instead of polling. Policy: destinations must resolve inside policy.allowed_dirs, \
+rdm_plan_download -> rdm_apply_plan -> rdm_wait_task -> rdm_verify_file. When the URL is a page/share \
+link instead of a direct file, call rdm_resolve first (17 tools total): it returns a verified resource \
+manifest without creating a task, then download manifest.resources[].url. rdm_resolve mode=explore (or \
+the mode=auto page fallback) uses the AI provider the user configured in <state>/ai.json (or \
+RDM_AI_API_KEY), bounded by max_llm_calls; without a configured provider it fails with \
+resolve_failed/model_unavailable and makes no model call. Exploration only ever produces resources that \
+pass evidence binding + the verifier, and the API key never appears in results or logs. Tasks are \
+durable: rdm_list_tasks / rdm_get_task survive restarts and work across CLI/MCP processes; use \
+rdm_wait_task instead of polling. Method health is returned with resolve results: when rdm_resolve \
+replays a library recipe (data.recipe.state = matched/published), data.recipe_health reports \
+ok/degraded/broken/untested + last_failure + consecutive_failures; treat degraded/broken as a signal \
+to roll the method back with `rdm recipe rollback` or switch to mode=explore. Policy: destinations must \
+resolve inside policy.allowed_dirs, \
 hosts must match policy.allowed_hosts, and loopback/private/cloud-metadata hosts are rejected \
 unless the policy explicitly enables allow_private_hosts. Files above require_approval_over_bytes \
 return needs_approval with a single-use token (two-step confirmation). pause/cancel are control \
-flow, not failures. All outputs and logs are redacted: cookies/authorization never appear.";
+flow, not failures. All outputs and logs are redacted: cookies/authorization never appear. \
+rdm_selftest additionally returns a read-only recipe self-test report in data.recipes \
+(pure matching checks, no network/model); recipe failures are reported there but do not change \
+the engine self-test result or the tool's isError state.";
 
 // ---------------------------------------------------------------------------
 // Writer
@@ -715,6 +728,7 @@ fn handle_tools_call(state: &Arc<ServerState>, request: Request, era: Era) {
         call_id: request.id.clone(),
         progress_token,
         wait_cancel,
+        failure_data: std::sync::Mutex::new(None),
     };
     let id = request.id;
     let state_for_task = Arc::clone(state);
@@ -763,6 +777,7 @@ mod tests {
     #[test]
     fn instructions_cover_flow_and_safety() {
         assert!(INSTRUCTIONS.contains("rdm_capabilities"));
+        assert!(INSTRUCTIONS.contains("rdm_resolve"));
         assert!(INSTRUCTIONS.contains("rdm_apply_plan"));
         assert!(INSTRUCTIONS.contains("policy"));
         assert!(INSTRUCTIONS.contains("redacted"));
@@ -952,9 +967,11 @@ mod tests {
 
     #[test]
     fn tool_catalog_count_matches_registry() {
-        assert_eq!(candidate_tool_count(), 16);
+        assert_eq!(candidate_tool_count(), 17);
         let catalog = tool_catalog();
-        assert_eq!(catalog.len(), 16);
+        assert_eq!(catalog.len(), 17);
         assert_eq!(catalog[0]["name"], "rdm_capabilities");
+        assert_eq!(catalog[2]["name"], "rdm_resolve");
+        assert_eq!(catalog[16]["name"], "rdm_state_maintenance");
     }
 }

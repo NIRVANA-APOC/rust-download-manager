@@ -48,6 +48,16 @@
               原生宿主 → RDM 进程内存中传递，不会写入日志。
             </span>
           </label>
+
+          <label class="row">
+            <span class="label">AI 解析附带 Cookie 凭证</span>
+            <input id="ai-credentials" type="checkbox" class="checkbox" />
+            <span class="hint">
+              点击弹窗「AI 解析当前页」时是否把当前页面 Cookie 一并交给本机 RDM。
+              默认关闭；只有勾选后才会发送，且 RDM 不会把它写入日志或磁盘。
+              与上面的「转发 Cookie」相互独立（那只影响下载接管）。
+            </span>
+          </label>
         </section>
 
         <section class="card">
@@ -73,11 +83,12 @@
 
         <section class="card">
           <h2>RDM 下载参数</h2>
-          <label class="row">
-            <span class="label">默认连接数</span>
-            <input id="connections" type="number" min="1" max="32" step="1" />
-            <span class="hint">1–32。服务器不支持 Range 时 RDM 会自动降级为单连接。</span>
-          </label>
+          <div class="row">
+            <span class="label">连接数</span>
+            <span class="hint">
+              由 RDM 桌面端「设置 → 下载 → 默认连接数」统一决定（扩展不再单独设置）。
+            </span>
+          </div>
 
           <label class="row">
             <span class="label">保存目录</span>

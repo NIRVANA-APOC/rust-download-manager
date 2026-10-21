@@ -1,11 +1,17 @@
 //! `rdm selftest` — end-to-end readiness probe using the embedded fixture
 //! server (same HTTP stack the engine uses, no network/public hosts involved).
 //!
-//! Four cases (contract §7 / task checklist):
+//! Four engine cases (contract §7 / task checklist):
 //! 1. multi-connection payload hash equals the single-connection/hash reference
 //! 2. server ignoring `Range` → transparent single-stream fallback, correct file
 //! 3. pause + resume only re-downloads the missing chunks (byte-exact)
 //! 4. `expected_sha256` mismatch leaves no files behind
+//!
+//! v1.4 (`docs/architecture.md` §11.10) adds a **read-only** recipe self-test
+//! report under `data.recipes`: `Recipe::check_tests` pure matching checks over
+//! `<state>/resolve/recipes` (no network, no model, no step execution). Recipe
+//! failures are reported only — the engine `passed`/`failed` fields and the
+//! process exit code are unchanged.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -52,6 +58,7 @@ pub async fn run(mode: OutputMode, args: SelftestArgs) -> u8 {
         .filter(|case| case.status == CaseStatus::Pass)
         .count();
     let failed = cases.len() - passed;
+    let recipe_report = recipe_selftest_report(&rdm_ipc::state_dir());
     let data = json!({
         "cases": cases,
         "passed": passed,
@@ -59,6 +66,9 @@ pub async fn run(mode: OutputMode, args: SelftestArgs) -> u8 {
         "duration_ms": super::download::elapsed_ms(started),
         "transport": "loopback-http1-fixture",
         "rdm_version": env!("CARGO_PKG_VERSION"),
+        // Additive (v1.4): read-only recipe self-test report. Never affects
+        // `passed`/`failed` or the exit code.
+        "recipes": recipe_report,
     });
 
     if reporter.is_text() {
@@ -68,6 +78,7 @@ pub async fn run(mode: OutputMode, args: SelftestArgs) -> u8 {
             let summary = case.get("summary").and_then(Value::as_str).unwrap_or("");
             crate::outln!("[{status:<4}] {id:<24} {summary}");
         }
+        print_recipe_report(&data["recipes"]);
         crate::outln!("selftest: {passed} passed, {failed} failed");
     }
 
@@ -408,6 +419,79 @@ fn cleanup(dirs: &[PathBuf], keep: bool) {
     }
 }
 
+/// Maximum failure rows kept in the report (contract: capped list).
+const MAX_RECIPE_FAILURES: usize = 50;
+
+/// Read-only recipe self-test report (`docs/architecture.md` §11.10).
+///
+/// Loads the local recipe library (`<state>/resolve/recipes`, tolerant to a
+/// missing directory and invalid files) and runs `Recipe::check_tests` — pure
+/// applicability checks only: no network, no model, no recipe step execution.
+fn recipe_selftest_report(state_dir: &Path) -> Value {
+    let dir = state_dir.join("resolve").join("recipes");
+    let registry = rdm_resolve::RecipeRegistry::load(&dir);
+    let mut checked = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut failures: Vec<Value> = Vec::new();
+    for recipe in registry.all() {
+        checked += 1;
+        for result in recipe.check_tests() {
+            if result.skipped {
+                skipped += 1;
+            } else if result.ok {
+                passed += 1;
+            } else {
+                failed += 1;
+                if failures.len() < MAX_RECIPE_FAILURES {
+                    failures.push(json!({
+                        "recipe_id": recipe.id,
+                        "version": recipe.version,
+                        "test": result.name,
+                        "message": result.message,
+                    }));
+                }
+            }
+        }
+    }
+    json!({
+        "dir": dir.display().to_string(),
+        "checked": checked,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "failures": failures,
+    })
+}
+
+/// One-line recipe report for text mode plus at most five failure rows.
+fn print_recipe_report(report: &Value) {
+    let count = |key: &str| report[key].as_u64().unwrap_or(0);
+    crate::outln!(
+        "recipes: {} checked / {} passed / {} failed / {} skipped",
+        count("checked"),
+        count("passed"),
+        count("failed"),
+        count("skipped"),
+    );
+    for failure in report["failures"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(5)
+    {
+        crate::outln!(
+            "  - {}@{} {}: {}",
+            failure["recipe_id"].as_str().unwrap_or("?"),
+            failure["version"].as_u64().unwrap_or(0),
+            failure["test"].as_str().unwrap_or("?"),
+            failure["message"].as_str().unwrap_or(""),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +505,31 @@ mod tests {
         assert_eq!(
             serde_json::to_value(CaseStatus::Fail).unwrap(),
             json!("fail")
+        );
+    }
+
+    #[test]
+    fn recipe_report_handles_missing_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "rdm-selftest-no-recipes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let report = recipe_selftest_report(&dir);
+        assert_eq!(report["checked"], 0);
+        assert_eq!(report["passed"], 0);
+        assert_eq!(report["failed"], 0);
+        assert_eq!(report["skipped"], 0);
+        assert!(report["failures"].as_array().unwrap().is_empty());
+        assert!(
+            report["dir"].as_str().unwrap().ends_with("resolve/recipes")
+                || report["dir"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("resolve\\recipes")
         );
     }
 }

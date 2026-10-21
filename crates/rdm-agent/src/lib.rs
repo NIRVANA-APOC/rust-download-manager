@@ -107,6 +107,8 @@ pub enum ErrorCode {
     Conflict,
     NetworkError,
     HttpStatus,
+    /// Link resolution failed or produced no downloadable resource (v1.2).
+    ResolveFailed,
     RangeUnsupported,
     NoContentLength,
     ChecksumMismatch,
@@ -132,6 +134,7 @@ impl ErrorCode {
             Self::Conflict => "conflict",
             Self::NetworkError => "network_error",
             Self::HttpStatus => "http_status",
+            Self::ResolveFailed => "resolve_failed",
             Self::RangeUnsupported => "range_unsupported",
             Self::NoContentLength => "no_content_length",
             Self::ChecksumMismatch => "checksum_mismatch",
@@ -165,6 +168,7 @@ impl ErrorCode {
             Self::Conflict,
             Self::NetworkError,
             Self::HttpStatus,
+            Self::ResolveFailed,
             Self::RangeUnsupported,
             Self::NoContentLength,
             Self::ChecksumMismatch,
@@ -402,6 +406,10 @@ pub struct TaskResult {
     pub sha256: Option<String>,
     pub elapsed_ms: u64,
     pub avg_speed_bps: f64,
+    /// Realised peak number of concurrent workers (0 when unknown, e.g. an
+    /// old task record persisted before dynamic connection planning).
+    #[serde(default)]
+    pub peak_connections: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +430,10 @@ pub struct TaskRecord {
     pub total_bytes: Option<u64>,
     pub downloaded_bytes: u64,
     pub connections: usize,
+    /// Realised peak of concurrently active workers (dynamic planning); `0`
+    /// for old persisted records / before the first event.
+    #[serde(default)]
+    pub peak_connections: u32,
     pub chunk_size: Option<u64>,
     pub range_supported: Option<bool>,
     pub http_version: Option<String>,
@@ -578,6 +590,7 @@ impl TaskRecord {
             state: TaskState::Queued,
             source: source.into(),
             connections: request.connections,
+            peak_connections: 0,
             chunk_size: request.chunk_size,
             file_name: file_name.into(),
             dest_dir,
@@ -623,6 +636,9 @@ pub struct TaskSummary {
     pub total_bytes: Option<u64>,
     pub downloaded_bytes: u64,
     pub connections: usize,
+    /// Realised peak of concurrently active workers (dynamic planning).
+    #[serde(default)]
+    pub peak_connections: u32,
     pub speed_bps: f64,
     pub created_at: String,
     pub updated_at: String,
@@ -640,6 +656,7 @@ impl From<&TaskRecord> for TaskSummary {
             total_bytes: record.total_bytes,
             downloaded_bytes: record.downloaded_bytes,
             connections: record.connections,
+            peak_connections: record.peak_connections,
             speed_bps: record.speed_bps,
             created_at: record.created_at.clone(),
             updated_at: record.updated_at.clone(),
@@ -658,6 +675,10 @@ pub struct TaskView {
     pub id: String,
     pub state: TaskState,
     pub source: String,
+    /// Whether this task used dynamic connection planning (request default
+    /// `true`; old persisted views default to `false`).
+    #[serde(default)]
+    pub dynamic_connections: bool,
     pub url: String,
     pub file_name: String,
     pub dest_dir: PathBuf,
@@ -665,6 +686,10 @@ pub struct TaskView {
     pub total_bytes: Option<u64>,
     pub downloaded_bytes: u64,
     pub connections: usize,
+    /// Realised peak of concurrently active workers (dynamic planning); `0`
+    /// for old persisted records / before the first event.
+    #[serde(default)]
+    pub peak_connections: u32,
     pub chunk_size: Option<u64>,
     pub range_supported: Option<bool>,
     pub http_version: Option<String>,
@@ -693,6 +718,8 @@ impl From<&TaskRecord> for TaskView {
             total_bytes: record.total_bytes,
             downloaded_bytes: record.downloaded_bytes,
             connections: record.connections,
+            peak_connections: record.peak_connections,
+            dynamic_connections: record.request.dynamic_connections,
             chunk_size: record.chunk_size,
             range_supported: record.range_supported,
             http_version: record.http_version.clone(),
@@ -1448,15 +1475,22 @@ impl DownloadPlan {
     }
 
     /// Agent-visible plan shape: request dropped, only operational fields.
+    ///
+    /// Connection fields are reported **normalized** (the way the engine will
+    /// execute the plan): `single_stream` plans show `connections = 1`,
+    /// `dynamic_connections = false` and `chunk_size = null`.
     pub fn summary(&self) -> Value {
+        let normalized = self.request.normalized();
         serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "plan_id": self.plan_id,
             "url": redact_url(&self.request.url),
             "dest_dir": self.request.output_dir,
             "file_name": self.request.file_name,
-            "connections": self.request.connections,
-            "chunk_size": self.request.chunk_size,
+            "connections": normalized.connections,
+            "dynamic_connections": normalized.dynamic_connections,
+            "single_stream": normalized.single_stream,
+            "chunk_size": normalized.chunk_size,
             "expected_sha256": self.request.expected_sha256,
             "speed_limit_bps": self.request.speed_limit_bps,
             "total_bytes": self.total_bytes,
@@ -1503,6 +1537,8 @@ mod tests {
     #[test]
     fn error_codes_are_stable() {
         assert_eq!(ErrorCode::InvalidUrl.as_str(), "invalid_url");
+        assert_eq!(ErrorCode::ResolveFailed.as_str(), "resolve_failed");
+        assert!(!ErrorCode::ResolveFailed.retryable());
         assert!(ErrorCode::NetworkError.retryable());
         assert!(!ErrorCode::ChecksumMismatch.retryable());
     }
@@ -1744,6 +1780,8 @@ mod tests {
             "total_bytes",
             "downloaded_bytes",
             "connections",
+            "peak_connections",
+            "dynamic_connections",
             "chunk_size",
             "range_supported",
             "http_version",
@@ -1759,6 +1797,80 @@ mod tests {
         ] {
             assert!(view_has_field(&serialized, key), "TaskView missing {key}");
         }
+    }
+
+    #[test]
+    fn task_view_exposes_peak_and_dynamic_connections() {
+        let mut request = sample_request("https://example.com/a.bin");
+        request.dynamic_connections = false;
+        let mut record = TaskRecord::new("cli", request, PathBuf::from("C:\\tmp"), "a.bin");
+        record.peak_connections = 6;
+        record.result = Some(TaskResult {
+            path: "C:\\tmp\\a.bin".to_string(),
+            size: 1024,
+            sha256: None,
+            elapsed_ms: 12,
+            avg_speed_bps: 85.3,
+            peak_connections: 6,
+        });
+
+        let view = record.view();
+        assert_eq!(view.peak_connections, 6);
+        assert!(!view.dynamic_connections);
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["peak_connections"], 6);
+        assert_eq!(value["dynamic_connections"], false);
+        assert_eq!(value["result"]["peak_connections"], 6);
+
+        let summary = TaskSummary::from(&record);
+        assert_eq!(summary.peak_connections, 6);
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap()["peak_connections"],
+            6
+        );
+    }
+
+    #[test]
+    fn task_view_defaults_dynamic_connections_to_true_for_new_requests() {
+        let record = TaskRecord::new(
+            "mcp",
+            sample_request("https://example.com/a.bin"),
+            PathBuf::from("C:\\tmp"),
+            "a.bin",
+        );
+        assert!(record.view().dynamic_connections);
+        assert_eq!(record.view().peak_connections, 0);
+    }
+
+    #[test]
+    fn legacy_persisted_record_without_peak_connections_still_loads() {
+        // Old task stores predate `peak_connections`; additive fields must not
+        // make previously persisted tasks unreadable.
+        let record = TaskRecord::new(
+            "cli",
+            sample_request("https://example.com/a.bin"),
+            PathBuf::from("C:\\tmp"),
+            "a.bin",
+        );
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("peak_connections");
+        let decoded: TaskRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.peak_connections, 0);
+        assert_eq!(decoded.view().peak_connections, 0);
+
+        // TaskResult and TaskView are additive too.
+        let mut result = serde_json::to_value(TaskResult {
+            path: "a.bin".to_string(),
+            size: 1,
+            sha256: None,
+            elapsed_ms: 1,
+            avg_speed_bps: 1.0,
+            peak_connections: 4,
+        })
+        .unwrap();
+        result.as_object_mut().unwrap().remove("peak_connections");
+        let decoded: TaskResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.peak_connections, 0);
     }
 
     fn view_has_field(serialized: &str, key: &str) -> bool {

@@ -899,6 +899,13 @@ fn apply_engine_event(
                 }),
             );
         }
+        DownloadEvent::Concurrency { target, active } => {
+            // `connections` keeps its planned-limit semantics from Started;
+            // the Concurrency stream contributes the observed peak.
+            record.peak_connections = record.peak_connections.max(active as u32);
+            record.updated_at = now_iso8601();
+            let _ = target;
+        }
         DownloadEvent::Completed { summary } => {
             // The authoritative completion handling happens in `finish`; this
             // event is used for the final persisted snapshot.
@@ -950,12 +957,14 @@ fn apply_summary(record: &mut TaskRecord, summary: &DownloadSummary) {
     record.path = Some(summary.path.clone());
     record.range_supported = Some(summary.range_supported);
     record.http_version = summary.http_version.clone();
+    record.peak_connections = record.peak_connections.max(summary.peak_connections);
     record.result = Some(rdm_agent::TaskResult {
         path: summary.path.display().to_string(),
         size: summary.total_bytes,
         sha256: summary.sha256.clone(),
         elapsed_ms: summary.elapsed_ms,
         avg_speed_bps: summary.avg_speed_bps,
+        peak_connections: summary.peak_connections,
     });
     record.finished_at = Some(now_iso8601());
     record.updated_at = now_iso8601();
@@ -1000,6 +1009,7 @@ fn finish(
                     "elapsed_ms": summary.elapsed_ms,
                     "avg_speed_bps": summary.avg_speed_bps,
                     "connections": summary.connections,
+                    "peak_connections": summary.peak_connections,
                     "resumed_chunks": summary.resumed_chunks,
                 }),
             );
@@ -1239,6 +1249,18 @@ mod tests {
         assert_eq!(result.sha256.as_deref(), Some(expected.as_str()));
         assert_eq!(result.size, server.size());
         assert!(Path::new(&result.path).exists());
+        // Dynamic connection planning is reflected on every agent-visible
+        // surface: record, TaskResult and the serialized TaskView.
+        assert!(
+            result.peak_connections >= 2,
+            "expected a multi-connection peak, got {}",
+            result.peak_connections
+        );
+        assert!(settled.peak_connections >= result.peak_connections);
+        let view = serde_json::to_value(settled.view()).unwrap();
+        assert_eq!(view["dynamic_connections"], true);
+        assert!(view["peak_connections"].as_u64().unwrap() >= 2);
+        assert!(view["result"]["peak_connections"].as_u64().unwrap() >= 2);
         // The engine really used multiple range requests.
         let stats = server.stats();
         assert!(
@@ -1251,6 +1273,36 @@ mod tests {
         assert!(events.iter().any(|event| event.r#type == "completed"));
         server.shutdown().await;
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn apply_summary_exposes_peak_connections() {
+        let mut record = TaskRecord::new(
+            "test",
+            request("http://127.0.0.1:1/file.bin"),
+            PathBuf::from("C:\\tmp"),
+            "file.bin",
+        );
+        let summary = DownloadSummary {
+            path: PathBuf::from("C:\\tmp\\file.bin"),
+            total_bytes: 2048,
+            elapsed_ms: 5,
+            avg_speed_bps: 409.6,
+            connections: 4,
+            peak_connections: 3,
+            sha256: None,
+            resumed_chunks: 0,
+            range_supported: true,
+            http_version: Some("HTTP/1.1".to_string()),
+        };
+        apply_summary(&mut record, &summary);
+        assert_eq!(record.state, TaskState::Completed);
+        assert_eq!(record.peak_connections, 3);
+        assert_eq!(record.result.as_ref().unwrap().peak_connections, 3);
+        let view = serde_json::to_value(record.view()).unwrap();
+        assert_eq!(view["peak_connections"], 3);
+        assert_eq!(view["result"]["peak_connections"], 3);
+        assert_eq!(view["dynamic_connections"], true);
     }
 
     #[tokio::test]

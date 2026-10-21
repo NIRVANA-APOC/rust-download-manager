@@ -152,13 +152,35 @@ impl Filter {
 pub enum Theme {
     Dark,
     Light,
+    /// Catppuccin Latte（浅色）。
+    CatppuccinLatte,
+    /// Catppuccin Frappe（深色）。
+    CatppuccinFrappe,
+    /// Catppuccin Macchiato（深色）。
+    CatppuccinMacchiato,
+    /// Catppuccin Mocha（深色）。
+    CatppuccinMocha,
 }
 
 impl Theme {
+    /// 设置页展示顺序；`theme.rs` 的 `Palette` 必须覆盖这 6 个变体。
+    pub const ALL: [Theme; 6] = [
+        Theme::Dark,
+        Theme::Light,
+        Theme::CatppuccinLatte,
+        Theme::CatppuccinFrappe,
+        Theme::CatppuccinMacchiato,
+        Theme::CatppuccinMocha,
+    ];
+
     pub fn label_zh(self) -> &'static str {
         match self {
             Self::Dark => "深色",
             Self::Light => "浅色",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::CatppuccinFrappe => "Catppuccin Frappe",
+            Self::CatppuccinMacchiato => "Catppuccin Macchiato",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
         }
     }
 }
@@ -175,6 +197,23 @@ pub struct Settings {
     pub verify_sha256: bool,
     pub theme: Theme,
     pub auto_start: bool,
+    /// 动态线程规划：写入 `DownloadRequest.dynamic_connections`（默认开）。
+    pub dynamic_connections: bool,
+    /// 按后缀/内容类型分目录保存（默认开）。
+    pub save_by_extension: bool,
+    /// 是否允许 AI 参与分类（仍受 `ai.json` 的 `enabled` + key 约束，默认开）。
+    pub ai_classify: bool,
+
+    // ---------------------------------------------------------------
+    // 系统集成（桌面端）
+    // ---------------------------------------------------------------
+    /// 开机自启动：写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（默认关）。
+    pub launch_at_startup: bool,
+    /// 最小化到托盘：开启后**关闭窗口**时隐藏到托盘而不是退出；最小化按钮仍正常
+    /// 最小化到任务栏（默认关，需托盘）。
+    pub minimize_to_tray: bool,
+    /// 静默启动：启动时不显示主窗口，直接驻留托盘（默认关，需托盘）。
+    pub silent_start: bool,
 }
 
 impl Default for Settings {
@@ -186,11 +225,30 @@ impl Default for Settings {
             verify_sha256: false,
             theme: Theme::Dark,
             auto_start: true,
+            dynamic_connections: true,
+            save_by_extension: true,
+            ai_classify: true,
+            launch_at_startup: false,
+            minimize_to_tray: false,
+            silent_start: false,
         }
     }
 }
 
 impl Settings {
+    /// 是否需要常驻托盘图标：关闭到托盘与静默启动都依赖托盘。
+    ///
+    /// 单独开启「开机自启动」不强制托盘（正常显示主窗口），只有这两个开关会
+    /// 让窗口可能处于隐藏状态，因此必须有托盘入口可以恢复。
+    pub fn needs_tray(&self) -> bool {
+        self.minimize_to_tray || self.silent_start
+    }
+
+    /// 启动时实际是否静默运行（设置开或命令行 `--silent` 强制）。
+    pub fn effective_silent_start(&self, cli_silent: bool) -> bool {
+        self.silent_start || cli_silent
+    }
+
     /// 收敛非法值（手工改过 JSON 也不至于 panic）。
     pub fn normalized(&self) -> Self {
         let mut out = self.clone();
@@ -213,19 +271,29 @@ impl Settings {
         req.connections = self.default_connections.clamp(1, rdm_core::MAX_CONNECTIONS);
         req.output_dir = self.default_dir.clone();
         req.speed_limit_bps = self.speed_limit_bps.filter(|v| *v > 0);
+        req.dynamic_connections = self.dynamic_connections;
         req
     }
 }
 
-/// 校验 URL、补齐设置里的默认目录/限速，并收敛连接数。
+/// 校验 URL、补齐设置里的默认目录/限速，并用 GUI 设置收敛下载参数。
 ///
-/// GUI 添加、IPC `enqueue`、CLI URL、spool 恢复都走这一条路径，保证行为一致。
+/// GUI 添加、IPC `enqueue`（浏览器扩展 → 原生宿主）、CLI URL、spool 恢复都走这一条路径。
+/// **下载参数以 GUI 设置为唯一权威**：连接数强制为 `Settings::default_connections`、
+/// 动态线程规划跟随 `Settings::dynamic_connections`——扩展/宿主随请求传来的 `connections`
+/// 只作为向后兼容字段被接收，不再决定实际并发上限（2026-10-20 修复「GUI 设 16、
+/// 扩展 popup 却显示上限 8」）。重试/续传不走这里，保留任务原始参数。
 pub fn prepare_request(
     settings: &Settings,
     mut request: DownloadRequest,
 ) -> Result<DownloadRequest, String> {
     request.url = validate_url(&request.url)?;
     request = request.normalized();
+    // 设置是唯一权威：覆盖扩展/宿主/旧 spool 文件里携带的连接数。
+    request.connections = settings
+        .default_connections
+        .clamp(1, rdm_core::MAX_CONNECTIONS);
+    request.dynamic_connections = settings.dynamic_connections;
     if request.output_dir.is_none() {
         request.output_dir = settings.default_dir.clone();
     }
@@ -257,6 +325,22 @@ pub fn parse_speed_limit_mb(text: &str) -> Result<Option<u64>, String> {
     Ok(Some(bps as u64))
 }
 
+/// 解析设置页的「最大线程数」输入框：只接受 `1..=MAX_CONNECTIONS` 的整数。
+pub fn parse_connections(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("请输入连接数".to_string());
+    }
+    let value: usize = text.parse().map_err(|_| "连接数必须是整数".to_string())?;
+    if !(1..=rdm_core::MAX_CONNECTIONS).contains(&value) {
+        return Err(format!(
+            "连接数必须在 1..={} 之间",
+            rdm_core::MAX_CONNECTIONS
+        ));
+    }
+    Ok(value)
+}
+
 fn trim_float(value: f64) -> String {
     let mut s = format!("{value:.2}");
     while s.contains('.') && s.ends_with('0') {
@@ -266,6 +350,380 @@ fn trim_float(value: f64) -> String {
         s.pop();
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// AI 面板纯状态（供 app.rs 渲染；不依赖 gpui）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl AiRole {
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::System => "系统",
+            Self::User => "我",
+            Self::Assistant => "AI",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AiChatMessage {
+    pub role: AiRole,
+    pub text: String,
+    /// 消息时间戳（`model.rs` 契约字段；渲染层暂未展示时间）。
+    #[allow(dead_code)]
+    pub created_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiResourceCard {
+    pub resource: rdm_ai::ParsedResource,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AiParseStatus {
+    #[default]
+    Idle,
+    Parsing,
+    Ready,
+    Failed,
+}
+
+impl AiParseStatus {
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Idle => "未解析",
+            Self::Parsing => "解析中…",
+            Self::Ready => "已解析",
+            Self::Failed => "解析失败",
+        }
+    }
+}
+
+/// 聊天历史保留上限：超出后丢弃最旧的消息。
+///
+/// 面板改成可滚动历史后消息会一直攒着，必须设上限，否则长时间对话会拖慢每帧渲染；
+/// 流式输出中的 assistant 占位永远在末尾，不会被这条规则丢掉。
+pub const AI_CHAT_HISTORY_LIMIT: usize = 200;
+
+/// 一次 AI 解析来源的**内存**凭据（P4b-a，`docs/architecture.md` §11.12）。
+///
+/// GUI 从浏览器上下文拿到的一次性 Cookie/Referer/UA 只用于：
+/// 1. resolver-first 的验证/方法回放（engine → `HostCredentials`）；
+/// 2. 本次解析结果的「下载选中」交接（host 与解析来源完全一致时填入
+///    `DownloadRequest{cookie,referer,user_agent}`）。
+///
+/// 生命周期：下一次解析开始时被替换、解析失败时清除；**不实现
+/// `Serialize`/`Deserialize`**（永远不会进 settings/任务 store/解析缓存/日志），
+/// 手写 `Debug` 只显示 host 与「是否设置」，不显示任何值。
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ParseCredential {
+    /// 归一化后的来源 host：小写、去尾点、不含端口。
+    pub host: String,
+    pub cookie: Option<String>,
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+impl ParseCredential {
+    /// 没有 host 或三个字段全空 → 等于没有凭据。
+    pub fn is_empty(&self) -> bool {
+        self.host.is_empty()
+            || (self.cookie.is_none() && self.referer.is_none() && self.user_agent.is_none())
+    }
+}
+
+impl std::fmt::Debug for ParseCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只暴露 host 与「是否设置」；任何字段值都不进日志/调试输出。
+        f.debug_struct("ParseCredential")
+            .field("host", &self.host)
+            .field("cookie", &self.cookie.is_some())
+            .field("referer", &self.referer.is_some())
+            .field("user_agent", &self.user_agent.is_some())
+            .finish()
+    }
+}
+
+/// AI 解析/聊天面板的纯状态机。`app.rs` 只负责把字段画出来。
+#[derive(Debug, Clone, Default)]
+pub struct AiPanelState {
+    pub visible: bool,
+    pub status: AiParseStatus,
+    pub source_url: String,
+    pub messages: Vec<AiChatMessage>,
+    pub resources: Vec<AiResourceCard>,
+    pub notes: Vec<String>,
+    pub ai_used: bool,
+    pub cache_hit: bool,
+    pub model: Option<String>,
+    pub error: Option<String>,
+    /// P4b-a：本次解析来源的内存凭据（仅下载交接用；Debug 已脱敏）。
+    pub credential: Option<ParseCredential>,
+    /// 解析请求代号；迟到的结果按此丢弃。
+    pub request_id: u64,
+    pub chat_pending: bool,
+    /// 是否有 assistant 消息正在流式输出（`app.rs` 据此渲染「正在输出」占位/光标）。
+    pub streaming: bool,
+}
+
+impl AiPanelState {
+    /// 开始一次解析：清空上一次的解析结果（保留聊天消息），并展示面板。
+    ///
+    /// 上一次的内存凭据也在此丢弃：新解析必须由 `app.rs` 紧接着调用
+    /// [`Self::set_request_credential`] 才会带上自己的（可能有）凭据。
+    pub fn begin_parse(&mut self, url: &str, request_id: u64) {
+        self.visible = true;
+        self.status = AiParseStatus::Parsing;
+        self.source_url = url.to_string();
+        self.resources.clear();
+        self.notes.clear();
+        self.ai_used = false;
+        self.cache_hit = false;
+        self.model = None;
+        self.error = None;
+        self.credential = None;
+        self.request_id = request_id;
+    }
+
+    /// 应用成功返回的解析报告。默认全部资源勾选。
+    pub fn apply_report(&mut self, report: rdm_ai::ParseReport) {
+        self.visible = true;
+        self.status = AiParseStatus::Ready;
+        self.source_url = report.source_url;
+        self.notes = report.notes;
+        self.ai_used = report.ai_used;
+        self.cache_hit = report.cache_hit;
+        self.model = report.model;
+        self.resources = report
+            .resources
+            .into_iter()
+            .map(|resource| AiResourceCard {
+                resource,
+                selected: true,
+            })
+            .collect();
+        self.error = None;
+    }
+
+    /// 应用解析失败（本地校验失败 / 无法访问页面等；AI 失败会由启发式结果兜底）。
+    ///
+    /// 失败不保留解析凭据：下载交接只对「本次成功解析」的来源 host 生效。
+    pub fn apply_parse_error(&mut self, error: String) {
+        self.visible = true;
+        self.status = AiParseStatus::Failed;
+        self.resources.clear();
+        self.notes.clear();
+        self.error = Some(error);
+        self.clear_credential();
+    }
+
+    /// P4b-a：记录本次解析请求携带的**内存**凭据（`app.rs` 在 `begin_parse` 后调用）。
+    ///
+    /// host 从 `request.url` 归一化（小写/去尾点/不含端口）；cookie/referer/UA 去空串。
+    /// 无效 URL 或三个字段全空 → 清空凭据（新解析总是替换上一次的凭据）。
+    pub fn set_request_credential(&mut self, request: &rdm_ai::ParseRequest) {
+        self.credential = credential_from_request(request);
+    }
+
+    /// 清除内存凭据（解析失败 / 主动切换上下文时调用）。
+    pub fn clear_credential(&mut self) {
+        self.credential = None;
+    }
+
+    /// P4b-a 下载交接：资源 host 与解析来源 host **完全一致**（大小写/尾点归一化）
+    /// 时返回本次解析的凭据副本，否则 `None`（Cookie 不应跨 host 发送）。
+    pub fn download_credentials_for(&self, resource_url: &str) -> Option<ParseCredential> {
+        let credential = self.credential.as_ref()?;
+        if credential.is_empty() {
+            return None;
+        }
+        let host = normalized_url_host(resource_url)?;
+        (host == credential.host).then(|| credential.clone())
+    }
+
+    /// P4b-a：把匹配 host 的解析凭据填入 `DownloadRequest`（`app.rs`「下载选中」调用）。
+    ///
+    /// 只在 host 完全一致时生效；只填充本面板持有的非空字段，不会把请求里已有的
+    /// 值清空（GUI 自己构造的下载请求这些字段本来就是 `None`）。
+    pub fn apply_credentials(&self, resource_url: &str, request: &mut rdm_core::DownloadRequest) {
+        let Some(credential) = self.download_credentials_for(resource_url) else {
+            return;
+        };
+        if credential.cookie.is_some() {
+            request.cookie = credential.cookie;
+        }
+        if credential.referer.is_some() {
+            request.referer = credential.referer;
+        }
+        if credential.user_agent.is_some() {
+            request.user_agent = credential.user_agent;
+        }
+    }
+
+    pub fn toggle_resource(&mut self, index: usize) {
+        if let Some(card) = self.resources.get_mut(index) {
+            card.selected = !card.selected;
+        }
+    }
+
+    pub fn select_all(&mut self, selected: bool) {
+        for card in &mut self.resources {
+            card.selected = selected;
+        }
+    }
+
+    pub fn selected_indices(&self) -> Vec<usize> {
+        self.resources
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| card.selected)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.resources.iter().filter(|card| card.selected).count()
+    }
+
+    pub fn push_message(&mut self, role: AiRole, text: impl Into<String>) {
+        self.push_message_capped(role, text.into());
+    }
+
+    /// 追加一条消息并保证历史不超过 [`AI_CHAT_HISTORY_LIMIT`]（丢最旧）。
+    fn push_message_capped(&mut self, role: AiRole, text: String) {
+        self.messages.push(AiChatMessage {
+            role,
+            text,
+            created_ms: now_ms(),
+        });
+        if self.messages.len() > AI_CHAT_HISTORY_LIMIT {
+            let excess = self.messages.len() - AI_CHAT_HISTORY_LIMIT;
+            self.messages.drain(..excess);
+        }
+    }
+
+    /// 开始一次流式问答：追加用户消息 + 一条空的 assistant 占位消息，进入流式状态。
+    ///
+    /// 调用方负责把面板设为可见并清空输入框；`chat_pending` 与 `streaming` 一起置位，
+    /// 保证「发送按钮禁用」与「正在输出」两个 UI 状态不会互相矛盾。
+    pub fn begin_chat_stream(&mut self, user_text: &str) {
+        self.push_message(AiRole::User, user_text);
+        self.push_message(AiRole::Assistant, String::new());
+        self.streaming = true;
+        self.chat_pending = true;
+    }
+
+    /// 追加一段流式增量：空增量直接丢弃；末尾不是 assistant 时新建一条。
+    ///
+    /// 只追加不重置文本，最终以 [`Self::finish_chat_stream`] 的完整回复为准（防丢字/重复）。
+    pub fn push_chat_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match self.messages.last_mut() {
+            Some(message) if message.role == AiRole::Assistant => message.text.push_str(delta),
+            _ => self.push_message(AiRole::Assistant, delta),
+        }
+    }
+
+    /// 结束流式输出：用引擎给的完整回复覆盖末尾 assistant（空回复填占位文案）。
+    ///
+    /// 末尾不是 assistant（例如历史被重置）时新建一条，避免把回复丢掉。
+    pub fn finish_chat_stream(&mut self, full_reply: &str) {
+        self.streaming = false;
+        self.chat_pending = false;
+        let text = if full_reply.trim().is_empty() {
+            "（无内容）".to_string()
+        } else {
+            full_reply.to_string()
+        };
+        match self.messages.last_mut() {
+            Some(message) if message.role == AiRole::Assistant => message.text = text,
+            _ => self.push_message(AiRole::Assistant, text),
+        }
+    }
+
+    /// 流式失败：清掉流式状态；末尾为空 assistant 占位时删除它（避免留下空白气泡），
+    /// 再追加一条 system 错误消息。已经收到的部分文本会保留（引擎只会在没有文本时
+    /// 回 `AiChatFailed`，这里仍按「保留已有内容」处理，防御未来改协议）。
+    pub fn fail_chat_stream(&mut self, error: &str) {
+        self.streaming = false;
+        self.chat_pending = false;
+        self.drop_empty_assistant_tail();
+        self.push_message(AiRole::System, format!("AI 回复失败：{error}"));
+    }
+
+    /// 中止流式输出但不展示错误（解析新页面等切换上下文的场景）。
+    ///
+    /// 迟到的引擎事件会被 `request_id` 过滤掉；这里同步收尾状态，避免 `chat_pending`
+    /// / `streaming` 与 UI 长期不一致。
+    pub fn abort_chat_stream(&mut self) {
+        self.streaming = false;
+        self.chat_pending = false;
+        self.drop_empty_assistant_tail();
+    }
+
+    /// 删除末尾「没有内容」的 assistant 占位消息（流式开始后、任何 delta 之前的状态）。
+    fn drop_empty_assistant_tail(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|message| message.role == AiRole::Assistant && message.text.is_empty())
+        {
+            self.messages.pop();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4b-a：解析凭据的 host 归一化（`docs/architecture.md` §11.12）
+// ---------------------------------------------------------------------------
+
+/// URL → 归一化 host（小写、去尾点、不含端口）；非 http(s)/无 host → `None`。
+fn normalized_url_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    parsed.host_str().map(normalize_credential_host)
+}
+
+/// host 归一化：trim + 小写 + 去一个尾点（与 `rdm-resolve::HostCredentials` 一致）。
+fn normalize_credential_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn non_empty_credential(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// 从解析请求提取内存凭据；无 host / 三个字段全空 → `None`。
+fn credential_from_request(request: &rdm_ai::ParseRequest) -> Option<ParseCredential> {
+    let host = normalized_url_host(&request.url)?;
+    let cookie = non_empty_credential(request.cookie.as_deref());
+    let referer = non_empty_credential(request.referer.as_deref());
+    let user_agent = non_empty_credential(request.user_agent.as_deref());
+    if cookie.is_none() && referer.is_none() && user_agent.is_none() {
+        return None;
+    }
+    Some(ParseCredential {
+        host,
+        cookie,
+        referer,
+        user_agent,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +861,13 @@ pub struct DownloadItem {
     pub speed_bps: f64,
     pub eta_secs: Option<f64>,
     pub active_workers: usize,
+    /// 本次下载实际达到的峰值并发 worker 数（来自 `Concurrency` 事件 / 最终 summary）。
+    pub peak_connections: usize,
+    /// 动态线程规划当前目标（`Concurrency.target`；0 = 引擎还没报告）。
+    pub target_connections: usize,
     pub path: Option<PathBuf>,
+    /// 分类保存后的实际目录；持久化并在「继续下载/重试」时复用。
+    pub save_dir: Option<PathBuf>,
     pub error: Option<String>,
     /// 运行中的瞬时状态（探测/重试/降级），完成后清空。
     pub note: Option<String>,
@@ -435,7 +899,10 @@ impl DownloadItem {
             speed_bps: 0.0,
             eta_secs: None,
             active_workers: 0,
+            peak_connections: 0,
+            target_connections: 0,
             path: None,
+            save_dir: None,
             error: None,
             note: None,
             source: source.into(),
@@ -477,10 +944,20 @@ impl DownloadItem {
         format_eta(self.eta_secs)
     }
 
-    /// 连接数展示：已完成/暂停时显示请求配置；下载中显示引擎报告的活动 worker。
+    /// 连接数展示。
+    ///
+    /// - 不支持 Range 的服务器固定「单连接」；
+    /// - 动态规划运行中：`"{active} / {target} · 上限 {max}"`；
+    /// - 其余情况保持旧文案（`"{n} 连接"`，下载中优先展示活动 worker 数）。
     pub fn connections_text(&self) -> String {
         if self.range_supported == Some(false) {
             return "单连接".to_string();
+        }
+        if self.state.is_active() && self.target_connections > 0 {
+            return format!(
+                "{} / {} · 上限 {}",
+                self.active_workers, self.target_connections, self.request.connections
+            );
         }
         let n = if self.state.is_active() && self.active_workers > 0 {
             self.active_workers
@@ -599,6 +1076,12 @@ impl DownloadItem {
                     ));
                 }
             }
+            DownloadEvent::Concurrency { target, active } => {
+                // 动态线程规划的目标/活跃数变化。
+                self.target_connections = target;
+                self.active_workers = active;
+                self.peak_connections = self.peak_connections.max(active);
+            }
             DownloadEvent::Completed { .. } => {
                 // 最终结果由 `apply_result` 收敛，这里只清状态提示。
                 if !stopping {
@@ -647,6 +1130,8 @@ impl DownloadItem {
                 self.error = None;
                 self.note = None;
                 self.range_supported = Some(summary.range_supported);
+                self.peak_connections =
+                    self.peak_connections.max(summary.peak_connections as usize);
                 self.sha256 = summary.sha256;
                 self.clear_speed();
                 self.finish_stop();
@@ -703,6 +1188,9 @@ impl DownloadItem {
             created_ms: self.created_ms,
             sha256: self.sha256.clone(),
             range_supported: self.range_supported,
+            peak_connections: self.peak_connections,
+            target_connections: self.target_connections,
+            save_dir: self.save_dir.clone(),
         }
     }
 
@@ -738,7 +1226,10 @@ impl DownloadItem {
             speed_bps: 0.0,
             eta_secs: None,
             active_workers: 0,
+            peak_connections: saved.peak_connections,
+            target_connections: saved.target_connections,
             path: saved.path,
+            save_dir: saved.save_dir,
             error: saved.error,
             note: None,
             source: saved.source,
@@ -829,6 +1320,15 @@ pub struct PersistedItem {
     pub sha256: Option<String>,
     #[serde(default)]
     pub range_supported: Option<bool>,
+    /// 峰值并发（旧文件缺省 = 0）。
+    #[serde(default)]
+    pub peak_connections: usize,
+    /// 动态规划目标（旧文件缺省 = 0）。
+    #[serde(default)]
+    pub target_connections: usize,
+    /// 分类保存目录（旧文件缺省 = None）。
+    #[serde(default)]
+    pub save_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1050,6 +1550,7 @@ mod tests {
             resumed_chunks: 0,
             range_supported: true,
             http_version: None,
+            peak_connections: 8,
         }
     }
 
@@ -1256,14 +1757,22 @@ mod tests {
             verify_sha256: false,
             theme: Theme::Dark,
             auto_start: true,
+            dynamic_connections: false,
+            save_by_extension: true,
+            ai_classify: true,
+            launch_at_startup: false,
+            minimize_to_tray: false,
+            silent_start: false,
         };
 
-        // URL 校验 + 连接数收敛 + 默认目录/限速补齐。
+        // URL 校验 + 连接数/动态规划跟随 GUI 设置 + 默认目录/限速补齐。
         let mut request = DownloadRequest::new("  https://example.com/a.bin  ");
-        request.connections = 999;
+        request.connections = 999; // 扩展/宿主的旧值会被 GUI 设置覆盖
+        request.dynamic_connections = true;
         let prepared = prepare_request(&settings, request).unwrap();
         assert_eq!(prepared.url, "https://example.com/a.bin");
-        assert_eq!(prepared.connections, rdm_core::MAX_CONNECTIONS);
+        assert_eq!(prepared.connections, 4, "连接数应为 GUI 设置值");
+        assert!(!prepared.dynamic_connections, "动态规划应跟随 GUI 设置");
         assert_eq!(prepared.output_dir, Some(PathBuf::from("D:/downloads")));
         assert_eq!(prepared.speed_limit_bps, Some(1_048_576));
 
@@ -1277,6 +1786,32 @@ mod tests {
 
         // 非法 URL 拒绝。
         assert!(prepare_request(&settings, DownloadRequest::new("ftp://x/a")).is_err());
+    }
+
+    /// 回归：浏览器扩展/宿主传来的 connections 不得覆盖 GUI 的「默认连接数」
+    /// （用户报障：GUI 设 16、扩展 popup 显示上限 8）。
+    #[test]
+    fn prepare_request_uses_gui_connections_over_handoff_value() {
+        let mut settings = Settings::default();
+        settings.default_connections = 16;
+        settings.dynamic_connections = false;
+
+        let mut request = DownloadRequest::new("https://example.com/a.bin");
+        request.connections = 8; // 旧扩展默认值 / 宿主缺省值
+        request.dynamic_connections = true;
+        let prepared = prepare_request(&settings, request).unwrap();
+        assert_eq!(prepared.connections, 16);
+        assert!(!prepared.dynamic_connections);
+
+        // 设置值越界时仍收敛到 1..=MAX_CONNECTIONS。
+        settings.default_connections = 0;
+        let prepared =
+            prepare_request(&settings, DownloadRequest::new("https://example.com/b.bin")).unwrap();
+        assert_eq!(prepared.connections, 1);
+        settings.default_connections = 999;
+        let prepared =
+            prepare_request(&settings, DownloadRequest::new("https://example.com/c.bin")).unwrap();
+        assert_eq!(prepared.connections, rdm_core::MAX_CONNECTIONS);
     }
 
     #[test]
@@ -1355,6 +1890,53 @@ mod tests {
         assert_eq!(item.connections_text(), "单连接");
     }
 
+    #[test]
+    fn concurrency_events_track_target_and_peak() {
+        let mut item = item_in_state(1, ItemState::Downloading);
+        item.apply_event(DownloadEvent::Concurrency {
+            target: 4,
+            active: 2,
+        });
+        assert_eq!(item.target_connections, 4);
+        assert_eq!(item.active_workers, 2);
+        assert_eq!(item.peak_connections, 2);
+        assert_eq!(item.connections_text(), "2 / 4 · 上限 8");
+
+        item.apply_event(DownloadEvent::Concurrency {
+            target: 6,
+            active: 6,
+        });
+        assert_eq!(item.peak_connections, 6);
+
+        // 回退目标不降低历史峰值。
+        item.apply_event(DownloadEvent::Concurrency {
+            target: 3,
+            active: 3,
+        });
+        assert_eq!(item.peak_connections, 6);
+        assert_eq!(item.connections_text(), "3 / 3 · 上限 8");
+
+        // 暂停后回到旧文案（展示请求配置）。
+        item.apply_result(Err(DownloadError::Paused { downloaded: 10 }));
+        assert_eq!(item.connections_text(), "8 连接");
+    }
+
+    #[test]
+    fn summary_peak_connections_is_merged() {
+        let mut item = item_in_state(1, ItemState::Downloading);
+        item.apply_event(DownloadEvent::Concurrency {
+            target: 3,
+            active: 3,
+        });
+        let mut summary = sample_summary();
+        summary.peak_connections = 6;
+        item.apply_result(Ok(summary));
+        assert_eq!(item.peak_connections, 6);
+        assert_eq!(item.state, ItemState::Completed);
+        // 完成后不再展示动态文案。
+        assert_eq!(item.connections_text(), "8 连接");
+    }
+
     // --- 设置 ---
 
     #[test]
@@ -1388,9 +1970,101 @@ mod tests {
     }
 
     #[test]
+    fn new_setting_flags_default_true_and_feed_request() {
+        let settings = Settings::default();
+        assert!(settings.dynamic_connections);
+        assert!(settings.save_by_extension);
+        assert!(settings.ai_classify);
+        assert!(
+            settings
+                .build_request("https://example.com/a.bin")
+                .dynamic_connections
+        );
+
+        let mut settings = settings;
+        settings.dynamic_connections = false;
+        assert!(
+            !settings
+                .build_request("https://example.com/a.bin")
+                .dynamic_connections
+        );
+        // normalized 只收敛数值，不重置开关。
+        assert!(!settings.normalized().dynamic_connections);
+    }
+
+    #[test]
+    fn old_settings_json_uses_new_flag_defaults() {
+        let old = r#"{"default_connections":4,"speed_limit_bps":null,"verify_sha256":true,
+            "theme":"light","auto_start":false}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert!(settings.dynamic_connections);
+        assert!(settings.save_by_extension);
+        assert!(settings.ai_classify);
+        assert_eq!(settings.theme, Theme::Light);
+        assert!(!settings.auto_start);
+    }
+
+    #[test]
+    fn parses_connection_input() {
+        assert_eq!(parse_connections("8").unwrap(), 8);
+        assert_eq!(parse_connections(" 1 ").unwrap(), 1);
+        assert_eq!(
+            parse_connections(&rdm_core::MAX_CONNECTIONS.to_string()).unwrap(),
+            rdm_core::MAX_CONNECTIONS
+        );
+        assert!(parse_connections("0").is_err());
+        assert!(parse_connections("999").is_err());
+        assert!(parse_connections("").is_err());
+        assert!(parse_connections("abc").is_err());
+        assert!(parse_connections("-1").is_err());
+    }
+
+    #[test]
     fn theme_labels() {
         assert_eq!(Theme::Dark.label_zh(), "深色");
         assert_eq!(Theme::Light.label_zh(), "浅色");
+        assert_eq!(Theme::CatppuccinLatte.label_zh(), "Catppuccin Latte");
+        assert_eq!(Theme::CatppuccinFrappe.label_zh(), "Catppuccin Frappe");
+        assert_eq!(
+            Theme::CatppuccinMacchiato.label_zh(),
+            "Catppuccin Macchiato"
+        );
+        assert_eq!(Theme::CatppuccinMocha.label_zh(), "Catppuccin Mocha");
+        assert_eq!(Theme::ALL.len(), 6);
+        assert_eq!(
+            Theme::ALL.map(Theme::label_zh),
+            [
+                "深色",
+                "浅色",
+                "Catppuccin Latte",
+                "Catppuccin Frappe",
+                "Catppuccin Macchiato",
+                "Catppuccin Mocha",
+            ]
+        );
+    }
+
+    #[test]
+    fn theme_serde_names_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&Theme::CatppuccinLatte).unwrap(),
+            "\"catppuccin_latte\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Theme::CatppuccinFrappe).unwrap(),
+            "\"catppuccin_frappe\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Theme::CatppuccinMacchiato).unwrap(),
+            "\"catppuccin_macchiato\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Theme::CatppuccinMocha).unwrap(),
+            "\"catppuccin_mocha\""
+        );
+        // 旧值不变。
+        assert_eq!(serde_json::to_string(&Theme::Dark).unwrap(), "\"dark\"");
+        assert_eq!(serde_json::to_string(&Theme::Light).unwrap(), "\"light\"");
     }
 
     // --- 持久化 ---
@@ -1467,6 +2141,12 @@ mod tests {
             verify_sha256: true,
             theme: Theme::Light,
             auto_start: false,
+            dynamic_connections: false,
+            save_by_extension: false,
+            ai_classify: false,
+            launch_at_startup: true,
+            minimize_to_tray: true,
+            silent_start: false,
         };
         save_settings(&dir, &settings).unwrap();
         let loaded = load_settings(&dir);
@@ -1476,7 +2156,58 @@ mod tests {
         assert!(loaded.verify_sha256);
         assert_eq!(loaded.theme, Theme::Light);
         assert!(!loaded.auto_start);
+        assert!(!loaded.dynamic_connections);
+        assert!(!loaded.save_by_extension);
+        assert!(!loaded.ai_classify);
+        assert!(loaded.launch_at_startup);
+        assert!(loaded.minimize_to_tray);
+        assert!(!loaded.silent_start);
+        assert!(loaded.needs_tray());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_settings_json_defaults_new_system_integration_fields() {
+        // 旧版 settings.json 没有三个新字段：反序列化必须回落到默认值（全关）。
+        let dir = temp_dir("settings-old");
+        let path = settings_path(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"theme":"light","auto_start":false,"default_connections":6}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded.default_connections, 6);
+        assert!(!loaded.auto_start);
+        assert!(!loaded.launch_at_startup);
+        assert!(!loaded.minimize_to_tray);
+        assert!(!loaded.silent_start);
+        assert!(!loaded.needs_tray());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn needs_tray_and_effective_silent_start() {
+        let mut settings = Settings::default();
+        assert!(!settings.needs_tray());
+        assert!(!settings.effective_silent_start(false));
+
+        settings.minimize_to_tray = true;
+        assert!(settings.needs_tray());
+        assert!(!settings.effective_silent_start(false));
+
+        settings.minimize_to_tray = false;
+        settings.silent_start = true;
+        assert!(settings.needs_tray());
+        assert!(settings.effective_silent_start(false));
+        assert!(settings.effective_silent_start(true));
+
+        // 仅开机自启动不需要托盘。
+        settings.silent_start = false;
+        settings.launch_at_startup = true;
+        assert!(!settings.needs_tray());
+        assert!(settings.effective_silent_start(true));
     }
 
     #[test]
@@ -1495,5 +2226,507 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("\"next_seq\":1"));
         assert!(json.contains("\"version\":1"));
+    }
+
+    #[test]
+    fn persisted_new_fields_roundtrip_and_backward_compatible() {
+        let mut item = item_in_state(1, ItemState::Paused);
+        item.peak_connections = 5;
+        item.target_connections = 4;
+        item.save_dir = Some(PathBuf::from("C:/downloads/视频"));
+        let saved = item.to_persisted();
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(json.contains("\"peak_connections\":5"));
+        let restored = DownloadItem::from_persisted(serde_json::from_str(&json).unwrap());
+        assert_eq!(restored.peak_connections, 5);
+        assert_eq!(restored.target_connections, 4);
+        assert_eq!(restored.save_dir, Some(PathBuf::from("C:/downloads/视频")));
+
+        // 旧 downloads.json 没有新字段 → 默认 0/None，不报错。
+        let old = r#"{"id":"dl_000009","file_name":"a.bin",
+            "url":"https://example.com/a.bin",
+            "request":{"url":"https://example.com/a.bin"},"state":"paused"}"#;
+        let saved: PersistedItem = serde_json::from_str(old).unwrap();
+        assert_eq!(saved.peak_connections, 0);
+        assert_eq!(saved.target_connections, 0);
+        assert!(saved.save_dir.is_none());
+        let item = DownloadItem::from_persisted(saved);
+        assert_eq!(item.state, ItemState::Paused);
+    }
+
+    // --- AI 面板 ---
+
+    fn ai_resource(name: &str) -> rdm_ai::ParsedResource {
+        rdm_ai::ParsedResource {
+            url: format!("https://example.com/{name}"),
+            name: name.to_string(),
+            kind: "video".to_string(),
+            size_bytes: Some(1024),
+            content_type: Some("video/mp4".to_string()),
+            note: None,
+        }
+    }
+
+    fn ai_report() -> rdm_ai::ParseReport {
+        rdm_ai::ParseReport {
+            source_url: "https://example.com/page".to_string(),
+            source_kind: "html_page".to_string(),
+            title: Some("示例页面".to_string()),
+            resources: vec![ai_resource("a.mp4"), ai_resource("b.mp4")],
+            notes: vec!["整理出 2 个视频资源".to_string()],
+            ai_used: true,
+            model: Some("gpt-4o-mini".to_string()),
+            created_ms: 1,
+            cache_hit: false,
+            failure_kind: None,
+        }
+    }
+
+    #[test]
+    fn ai_panel_parse_lifecycle() {
+        let mut panel = AiPanelState::default();
+        assert_eq!(panel.status, AiParseStatus::Idle);
+        assert!(!panel.visible);
+
+        panel.begin_parse("https://example.com/page", 7);
+        assert!(panel.visible);
+        assert_eq!(panel.status, AiParseStatus::Parsing);
+        assert_eq!(panel.request_id, 7);
+        assert_eq!(panel.source_url, "https://example.com/page");
+        assert!(panel.resources.is_empty());
+        assert!(panel.error.is_none());
+
+        panel.apply_report(ai_report());
+        assert_eq!(panel.status, AiParseStatus::Ready);
+        assert_eq!(panel.resources.len(), 2);
+        assert_eq!(panel.selected_count(), 2);
+        assert_eq!(panel.notes, vec!["整理出 2 个视频资源".to_string()]);
+        assert!(panel.ai_used);
+        assert!(!panel.cache_hit);
+        assert_eq!(panel.model.as_deref(), Some("gpt-4o-mini"));
+        assert!(panel.error.is_none());
+    }
+
+    #[test]
+    fn ai_panel_selection_helpers() {
+        let mut panel = AiPanelState::default();
+        panel.apply_report(ai_report());
+        panel.toggle_resource(0);
+        assert_eq!(panel.selected_indices(), vec![1]);
+        assert_eq!(panel.selected_count(), 1);
+        // 越界忽略。
+        panel.toggle_resource(99);
+        panel.select_all(false);
+        assert_eq!(panel.selected_count(), 0);
+        assert!(panel.selected_indices().is_empty());
+        panel.select_all(true);
+        assert_eq!(panel.selected_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn ai_panel_error_and_messages() {
+        let mut panel = AiPanelState::default();
+        panel.begin_parse("https://example.com/x", 1);
+        panel.apply_parse_error("无法访问页面".to_string());
+        assert_eq!(panel.status, AiParseStatus::Failed);
+        assert_eq!(panel.error.as_deref(), Some("无法访问页面"));
+        assert!(panel.resources.is_empty());
+
+        assert_eq!(AiRole::User.label_zh(), "我");
+        panel.push_message(AiRole::User, "这个页面有视频吗？");
+        panel.push_message(AiRole::Assistant, String::from("有 2 个 mp4。"));
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[0].role, AiRole::User);
+        assert!(panel.messages[0].created_ms > 0);
+        assert_eq!(panel.messages[1].text, "有 2 个 mp4。");
+        assert_eq!(panel.messages[1].role, AiRole::Assistant);
+    }
+
+    // ------------------------------------------------------------------
+    // P4b-a: download credential hand-off (`docs/architecture.md` §11.12)
+    // ------------------------------------------------------------------
+
+    fn credential_request(
+        url: &str,
+        cookie: Option<&str>,
+        referer: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> rdm_ai::ParseRequest {
+        rdm_ai::ParseRequest {
+            url: url.to_string(),
+            title: None,
+            referer: referer.map(str::to_owned),
+            user_agent: user_agent.map(str::to_owned),
+            cookie: cookie.map(str::to_owned),
+            hint: None,
+        }
+    }
+
+    #[test]
+    fn set_request_credential_normalizes_the_source_host() {
+        let mut panel = AiPanelState::default();
+        panel.set_request_credential(&credential_request(
+            "https://App.Example.COM.:8443/page?q=1#frag",
+            Some("  session=secret  "),
+            Some("https://app.example.com/ref"),
+            Some("rdm-agent/1.0"),
+        ));
+
+        let credential = panel.credential.as_ref().expect("credential");
+        // 小写、去尾点、端口不进 host key。
+        assert_eq!(credential.host, "app.example.com");
+        assert_eq!(credential.cookie.as_deref(), Some("session=secret"));
+        assert_eq!(
+            credential.referer.as_deref(),
+            Some("https://app.example.com/ref")
+        );
+        assert_eq!(credential.user_agent.as_deref(), Some("rdm-agent/1.0"));
+        assert!(!credential.is_empty());
+    }
+
+    #[test]
+    fn set_request_credential_ignores_invalid_or_empty_requests() {
+        let mut panel = AiPanelState::default();
+        // 无效 URL → 清空（新解析替换旧凭据）。
+        panel.set_request_credential(&credential_request("not a url", Some("a=b"), None, None));
+        assert!(panel.credential.is_none());
+        // cookie/referer/UA 全为空/空白 → None。
+        panel.set_request_credential(&credential_request(
+            "https://example.com/x",
+            Some("   "),
+            Some(""),
+            Some("  "),
+        ));
+        assert!(panel.credential.is_none());
+        // 非 http(s) scheme 不接受。
+        panel.set_request_credential(&credential_request(
+            "file:///tmp/x",
+            Some("a=b"),
+            None,
+            None,
+        ));
+        assert!(panel.credential.is_none());
+        // 只有 Referer/UA（无 cookie）也是凭据。
+        panel.set_request_credential(&credential_request(
+            "https://example.com/x",
+            None,
+            Some("https://example.com/ref"),
+            None,
+        ));
+        let credential = panel.credential.as_ref().expect("referer-only credential");
+        assert!(credential.cookie.is_none());
+        assert_eq!(
+            credential.referer.as_deref(),
+            Some("https://example.com/ref")
+        );
+    }
+
+    #[test]
+    fn download_credentials_match_only_the_exact_host() {
+        let mut panel = AiPanelState::default();
+        panel.set_request_credential(&credential_request(
+            "https://App.Example.com./page",
+            Some("session=1"),
+            None,
+            None,
+        ));
+
+        // 大小写/尾点归一化 + 端口不同仍算同一 host。
+        assert!(panel
+            .download_credentials_for("https://APP.example.COM:8443/files/a.bin")
+            .is_some());
+        // 同 host 的 http 资源也匹配（host 相同即可）。
+        assert!(panel
+            .download_credentials_for("http://app.example.com/a.bin")
+            .is_some());
+        // 子域 / 不同 host / 非法 URL / 非 http(s) → None。
+        assert!(panel
+            .download_credentials_for("https://cdn.example.com/files/a.bin")
+            .is_none());
+        assert!(panel
+            .download_credentials_for("https://other.test/a.bin")
+            .is_none());
+        assert!(panel.download_credentials_for("not a url").is_none());
+        assert!(panel
+            .download_credentials_for("file:///tmp/a.bin")
+            .is_none());
+    }
+
+    #[test]
+    fn download_credentials_absent_without_a_credential() {
+        let panel = AiPanelState::default();
+        assert!(panel.credential.is_none());
+        assert!(panel
+            .download_credentials_for("https://example.com/a.bin")
+            .is_none());
+
+        // 直接塞一个空 ParseCredential 也视为没有凭据。
+        let panel = AiPanelState {
+            credential: Some(ParseCredential::default()),
+            ..AiPanelState::default()
+        };
+        assert!(panel
+            .download_credentials_for("https://example.com/a.bin")
+            .is_none());
+    }
+
+    #[test]
+    fn apply_credentials_fills_only_matching_hosts() {
+        let mut panel = AiPanelState::default();
+        panel.set_request_credential(&credential_request(
+            "https://example.com/page",
+            Some("session=cookie-value"),
+            Some("https://example.com/ref"),
+            Some("rdm-test/1.0"),
+        ));
+
+        let mut request = rdm_core::DownloadRequest::new("https://Example.com/files/a.bin");
+        panel.apply_credentials("https://example.com/files/a.bin", &mut request);
+        assert_eq!(request.cookie.as_deref(), Some("session=cookie-value"));
+        assert_eq!(request.referer.as_deref(), Some("https://example.com/ref"));
+        assert_eq!(request.user_agent.as_deref(), Some("rdm-test/1.0"));
+
+        // 不同 host → 一个字段都不填。
+        let mut other = rdm_core::DownloadRequest::new("https://cdn.example.com/a.bin");
+        panel.apply_credentials("https://cdn.example.com/a.bin", &mut other);
+        assert!(other.cookie.is_none());
+        assert!(other.referer.is_none());
+        assert!(other.user_agent.is_none());
+    }
+
+    #[test]
+    fn apply_credentials_leaves_requests_untouched_without_credentials() {
+        let panel = AiPanelState::default();
+        let mut request = rdm_core::DownloadRequest::new("https://example.com/a.bin");
+        request.user_agent = Some("existing-agent".to_string());
+        panel.apply_credentials("https://example.com/a.bin", &mut request);
+        assert!(request.cookie.is_none());
+        assert_eq!(request.user_agent.as_deref(), Some("existing-agent"));
+    }
+
+    #[test]
+    fn download_handoff_survives_prepare_request_normalization() {
+        // app.rs 的「下载选中」顺序：build_request → apply_credentials → prepare_request。
+        let settings = Settings::default();
+        let mut panel = AiPanelState::default();
+        panel.set_request_credential(&credential_request(
+            "https://example.com/page",
+            Some("session=flow"),
+            Some("https://example.com/ref"),
+            Some("rdm-flow/1.0"),
+        ));
+
+        let mut request = settings.build_request("https://example.com/files/a.bin");
+        panel.apply_credentials("https://example.com/files/a.bin", &mut request);
+        let request = prepare_request(&settings, request).expect("valid request");
+
+        assert_eq!(request.cookie.as_deref(), Some("session=flow"));
+        assert_eq!(request.referer.as_deref(), Some("https://example.com/ref"));
+        assert_eq!(request.user_agent.as_deref(), Some("rdm-flow/1.0"));
+    }
+
+    #[test]
+    fn parse_credential_debug_never_leaks_plaintext_secrets() {
+        let credential = ParseCredential {
+            host: "example.com".to_string(),
+            cookie: Some("session=super-secret".to_string()),
+            referer: Some("https://example.com/secret-ref".to_string()),
+            user_agent: Some("secret-agent".to_string()),
+        };
+        let rendered = format!("{credential:?}");
+        assert!(rendered.contains("ParseCredential"));
+        assert!(rendered.contains("example.com"));
+        // 只有「是否设置」可见，不出现任何明文值。
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(!rendered.contains("secret-ref"), "{rendered}");
+        assert!(!rendered.contains("secret-agent"), "{rendered}");
+        assert!(rendered.contains("cookie: true"), "{rendered}");
+        assert!(rendered.contains("referer: true"), "{rendered}");
+        assert!(rendered.contains("user_agent: true"), "{rendered}");
+
+        // 面板 Debug（Option<ParseCredential>）同样不泄漏。
+        let panel = AiPanelState {
+            credential: Some(credential),
+            ..AiPanelState::default()
+        };
+        let panel_debug = format!("{panel:?}");
+        assert!(!panel_debug.contains("super-secret"), "{panel_debug}");
+        assert!(!panel_debug.contains("secret-agent"), "{panel_debug}");
+
+        // 空凭据的 Debug 只显示布尔值。
+        let empty = format!("{:?}", ParseCredential::default());
+        assert!(empty.contains("cookie: false"), "{empty}");
+    }
+
+    #[test]
+    fn new_parse_replaces_and_failure_clears_the_credential() {
+        let mut panel = AiPanelState::default();
+        panel.begin_parse("https://a.example/page", 1);
+        panel.set_request_credential(&credential_request(
+            "https://a.example/page",
+            Some("session=a"),
+            None,
+            None,
+        ));
+        assert_eq!(panel.credential.as_ref().unwrap().host, "a.example");
+
+        // 新解析（不同 host）替换旧凭据。
+        panel.begin_parse("https://b.example/page", 2);
+        panel.set_request_credential(&credential_request(
+            "https://b.example/page",
+            None,
+            Some("https://b.example/ref"),
+            Some("ua"),
+        ));
+        let credential = panel.credential.as_ref().expect("replaced credential");
+        assert_eq!(credential.host, "b.example");
+        assert!(credential.cookie.is_none());
+
+        // 解析失败 → 凭据清除，不再参与下载交接。
+        panel.apply_parse_error("boom".to_string());
+        assert!(panel.credential.is_none());
+        assert!(panel
+            .download_credentials_for("https://b.example/files/a.bin")
+            .is_none());
+
+        // 显式 clear 同样生效。
+        panel.set_request_credential(&credential_request(
+            "https://c.example/page",
+            Some("session=c"),
+            None,
+            None,
+        ));
+        assert!(panel.credential.is_some());
+        panel.clear_credential();
+        assert!(panel.credential.is_none());
+    }
+
+    #[test]
+    fn ai_chat_stream_assembles_deltas_in_order() {
+        let mut panel = AiPanelState::default();
+        assert!(!panel.streaming);
+        panel.begin_chat_stream("下载哪个？");
+        // 用户消息 + 空的 assistant 占位；两个「进行中」标志一起置位。
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[0].role, AiRole::User);
+        assert_eq!(panel.messages[0].text, "下载哪个？");
+        assert_eq!(panel.messages[1].role, AiRole::Assistant);
+        assert!(panel.messages[1].text.is_empty());
+        assert!(panel.streaming);
+        assert!(panel.chat_pending);
+
+        panel.push_chat_delta("推荐");
+        panel.push_chat_delta("下载");
+        panel.push_chat_delta(" mp4。");
+        assert_eq!(panel.messages[1].text, "推荐下载 mp4。");
+
+        // 空 delta 忽略：不新增消息、不改文本。
+        let before = panel.messages.len();
+        panel.push_chat_delta("");
+        assert_eq!(panel.messages.len(), before);
+        assert_eq!(panel.messages[1].text, "推荐下载 mp4。");
+
+        panel.finish_chat_stream("推荐下载 mp4。");
+        assert!(!panel.streaming);
+        assert!(!panel.chat_pending);
+        // finish 覆盖而不是追加，消息数不变（防止丢字/重复）。
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[1].text, "推荐下载 mp4。");
+    }
+
+    #[test]
+    fn ai_chat_stream_finish_overwrites_partial_reply() {
+        let mut panel = AiPanelState::default();
+        panel.begin_chat_stream("q");
+        panel.push_chat_delta("半截");
+        panel.finish_chat_stream("完整回复");
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[1].role, AiRole::Assistant);
+        assert_eq!(panel.messages[1].text, "完整回复");
+        assert!(!panel.streaming);
+
+        // 空回复（模型没给内容）用占位文案，避免渲染出空白气泡。
+        panel.begin_chat_stream("q2");
+        panel.finish_chat_stream("");
+        assert_eq!(panel.messages.last().unwrap().text, "（无内容）");
+        assert!(!panel.streaming);
+    }
+
+    #[test]
+    fn ai_chat_stream_fail_appends_system_error() {
+        let mut panel = AiPanelState::default();
+        panel.begin_chat_stream("q");
+        panel.fail_chat_stream("HTTP 401");
+        assert!(!panel.streaming);
+        assert!(!panel.chat_pending);
+        // 空占位被移除：只留下用户消息 + system 错误。
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[0].role, AiRole::User);
+        assert_eq!(panel.messages[1].role, AiRole::System);
+        assert!(panel.messages[1].text.contains("HTTP 401"));
+
+        // 已经有部分文本时保留 assistant 内容，错误信息单独追加。
+        panel.begin_chat_stream("q2");
+        panel.push_chat_delta("部分");
+        panel.fail_chat_stream("超时");
+        assert_eq!(panel.messages.len(), 5);
+        assert_eq!(panel.messages[3].role, AiRole::Assistant);
+        assert_eq!(panel.messages[3].text, "部分");
+        assert_eq!(panel.messages[4].role, AiRole::System);
+        assert!(panel.messages[4].text.contains("超时"));
+    }
+
+    #[test]
+    fn ai_chat_abort_clears_streaming_without_error_message() {
+        let mut panel = AiPanelState::default();
+        panel.begin_chat_stream("q");
+        panel.abort_chat_stream();
+        assert!(!panel.streaming);
+        assert!(!panel.chat_pending);
+        // 不留下空的 assistant 占位，也不追加错误消息。
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].role, AiRole::User);
+    }
+
+    #[test]
+    fn ai_chat_history_keeps_at_most_limit_messages() {
+        let mut panel = AiPanelState::default();
+        // 150 轮问答 = 300 条，超过上限后丢最旧的 100 条。
+        for index in 0..150 {
+            panel.push_message(AiRole::User, format!("q{index}"));
+            panel.push_message(AiRole::Assistant, format!("a{index}"));
+        }
+        assert_eq!(panel.messages.len(), AI_CHAT_HISTORY_LIMIT);
+        assert_eq!(panel.messages[0].text, "q50");
+        assert_eq!(panel.messages.last().unwrap().text, "a149");
+
+        // 流式占位在末尾，永远不会被上限规则丢掉。
+        panel.begin_chat_stream("最新问题");
+        assert_eq!(panel.messages.len(), AI_CHAT_HISTORY_LIMIT);
+        assert_eq!(panel.messages.last().unwrap().role, AiRole::Assistant);
+        assert_eq!(panel.messages[panel.messages.len() - 2].text, "最新问题");
+    }
+
+    #[test]
+    fn ai_chat_delta_without_trailing_assistant_creates_one() {
+        let mut panel = AiPanelState::default();
+        panel.push_message(AiRole::User, "q");
+        panel.push_chat_delta("hi");
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[1].role, AiRole::Assistant);
+        assert_eq!(panel.messages[1].text, "hi");
+        // `streaming` 只由 begin/finish/fail 管理，单个 delta 不臆造流式状态。
+        assert!(!panel.streaming);
+    }
+
+    #[test]
+    fn ai_chat_finish_without_placeholder_creates_assistant() {
+        let mut panel = AiPanelState::default();
+        panel.push_message(AiRole::User, "q");
+        panel.finish_chat_stream("完整回复");
+        assert_eq!(panel.messages.len(), 2);
+        assert_eq!(panel.messages[1].role, AiRole::Assistant);
+        assert_eq!(panel.messages[1].text, "完整回复");
+        assert!(!panel.streaming);
     }
 }

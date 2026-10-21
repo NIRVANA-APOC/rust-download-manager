@@ -37,7 +37,7 @@ pub fn resources_list() -> Value {
             {
                 "uri": "rdm://schema",
                 "name": "Tool schemas",
-                "description": "Machine-readable inputSchema/outputSchema for all 16 RDM tools.",
+                "description": "Machine-readable inputSchema/outputSchema for all 17 RDM tools.",
                 "mimeType": JSON_MIME,
             },
             {

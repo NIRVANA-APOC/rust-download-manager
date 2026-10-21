@@ -1,0 +1,27 @@
+[package]
+name = "rdm-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RDM link resolution runtime: contracts, verifier, recipe runner and registry"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+url.workspace = true
+tracing.workspace = true
+regex.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rdm-core = { workspace = true }
+rdm-ai = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# P4a credentials service tests drive a real loopback server with a required
+# cookie; same path-dependency style other crates use (not a workspace dep).
+rdm-fixture-server = { path = "../rdm-fixture-server" }

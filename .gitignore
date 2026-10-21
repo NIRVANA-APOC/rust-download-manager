@@ -4,6 +4,9 @@
 **/*.rs.bk
 *.pdb
 
+# Browser extension build output
+/dist/
+
 # Downloaded / test artifacts
 /downloads/
 *.part

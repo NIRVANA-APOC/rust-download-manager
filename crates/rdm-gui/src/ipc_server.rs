@@ -73,19 +73,43 @@ pub async fn bind(token: String) -> io::Result<(TcpListener, IpcInfo)> {
     Ok((listener, info))
 }
 
-/// 原子发布 `ipc.json`，返回其路径。
+/// 原子发布 `ipc.json`（短暂失败重试，避免与旧实例清理/杀软扫描抢窗口）。
 pub fn publish(info: &IpcInfo) -> Result<PathBuf, rdm_ipc::IpcError> {
-    rdm_ipc::write_info(info)?;
-    Ok(rdm_ipc::info_path())
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match rdm_ipc::write_info(info) {
+            Ok(()) => return Ok(rdm_ipc::info_path()),
+            Err(err) => {
+                tracing::warn!(attempt, error = %err, "写入 ipc.json 失败，准备重试");
+                last_error = Some(err);
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            }
+        }
+    }
+    Err(last_error.expect("至少尝试过一次发布 ipc.json"))
 }
 
 /// 退出时删除 `ipc.json`（尽力而为；token 已随进程失效，残留也连不上）。
+///
+/// **只删除本进程发布的文件**：用户快速关闭旧实例再开新实例时，旧实例的清理不能把
+/// 新实例刚写入的 `ipc.json` 删掉，否则浏览器扩展会一直显示"GUI 未运行"。
 pub fn cleanup_info_file() {
     let path = rdm_ipc::info_path();
-    match std::fs::remove_file(&path) {
-        Ok(()) => tracing::info!(path = %path.display(), "已删除 ipc.json"),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => tracing::warn!(path = %path.display(), error = %err, "删除 ipc.json 失败"),
+    match rdm_ipc::read_info() {
+        Ok(info) if info.pid != std::process::id() => {
+            tracing::debug!(
+                path = %path.display(),
+                pid = info.pid,
+                "ipc.json 属于其他 RDM 实例，跳过删除"
+            );
+        }
+        _ => match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(path = %path.display(), "已删除 ipc.json"),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(path = %path.display(), error = %err, "删除 ipc.json 失败"),
+        },
     }
 }
 
@@ -284,6 +308,10 @@ pub fn status_payload(items: &[DownloadItem]) -> serde_json::Value {
                 "total": item.total,
                 "speed_bps": item.speed_bps,
                 "connections": item.request.connections,
+                // 加性字段（v0.2，扩展显示"当前启用线程数"用）：旧宿主/旧扩展忽略即可。
+                "active_connections": item.active_workers,
+                "target_connections": item.target_connections,
+                "peak_connections": item.peak_connections,
             })
         })
         .collect();
@@ -463,6 +491,11 @@ mod tests {
         item.downloaded = 10;
         item.total = Some(100);
         item.speed_bps = 5.0;
+        // 线程数三字段（扩展"当前启用线程数"）：active_workers 当前活跃 worker、
+        // target_connections 动态规划目标（0=引擎未报告）、peak_connections 本次峰值。
+        item.active_workers = 6;
+        item.target_connections = 12;
+        item.peak_connections = 16;
         let payload = status_payload(&[item]);
         assert_eq!(payload["global_speed_bps"], 5.0);
         assert_eq!(payload["active"], 1);
@@ -473,6 +506,23 @@ mod tests {
             payload["downloads"][0]["connections"],
             rdm_core::DEFAULT_CONNECTIONS
         );
+        assert_eq!(payload["downloads"][0]["active_connections"], 6);
+        assert_eq!(payload["downloads"][0]["target_connections"], 12);
+        assert_eq!(payload["downloads"][0]["peak_connections"], 16);
+    }
+
+    #[test]
+    fn status_payload_thread_fields_default_to_zero() {
+        // 新建/未开始/旧状态项的线程计数默认 0，序列化时不能缺字段。
+        let item = DownloadItem::new(
+            next_download_id(2),
+            DownloadRequest::new("https://example.com/b.bin"),
+            "test",
+        );
+        let payload = status_payload(&[item]);
+        assert_eq!(payload["downloads"][0]["active_connections"], 0);
+        assert_eq!(payload["downloads"][0]["target_connections"], 0);
+        assert_eq!(payload["downloads"][0]["peak_connections"], 0);
     }
 
     #[test]

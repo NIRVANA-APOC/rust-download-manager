@@ -26,6 +26,7 @@ async fn main() -> ExitCode {
     let code: u8 = match cli.command {
         Command::Download(args) => commands::download::run(mode, &store_root, args).await,
         Command::Probe(args) => commands::probe::run(mode, &store_root, args).await,
+        Command::Resolve(args) => commands::resolve::run(mode, &store_root, args).await,
         Command::Capabilities => commands::capabilities::run(mode, &store_root),
         Command::Schema => commands::schema::run(mode),
         Command::Doctor(args) => commands::doctor::run(mode, &store_root, args).await,
@@ -35,6 +36,7 @@ async fn main() -> ExitCode {
         Command::Task(args) => commands::tasks::show(mode, &store_root, args),
         Command::State(args) => commands::state::run(mode, args),
         Command::Run(args) => commands::run::run(mode, &store_root, args).await,
+        Command::Recipe(args) => commands::recipe::run(mode, &store_root, args).await,
     };
     ExitCode::from(code)
 }

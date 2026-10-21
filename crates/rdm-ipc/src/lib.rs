@@ -56,6 +56,40 @@ pub enum Request {
     },
     /// Bring the main window to front.
     Activate,
+    /// Ask the GUI to run the AI link parser for a page/URL.
+    ///
+    /// Credentials (`cookie`) are only forwarded to the parser in memory; the
+    /// GUI must never persist or log them.
+    ///
+    /// P4b-b2 (`docs/architecture.md` §11.12 / `docs/extension-protocol.md`
+    /// v0.3): `page_url`/`page_title`/`page_links` carry an optional **link
+    /// snapshot** of the page the extension sees. Old hosts/extensions omit
+    /// them (`serde(default)` = no snapshot); the GUI validates and forwards
+    /// them to the resolver only (never persisted, never logged as values).
+    AiParse {
+        url: String,
+        #[serde(default)]
+        source_page: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        include_credentials: bool,
+        #[serde(default)]
+        cookie: Option<String>,
+        #[serde(default)]
+        referer: Option<String>,
+        #[serde(default)]
+        user_agent: Option<String>,
+        /// Absolute http(s) URL of the page the links were collected from.
+        #[serde(default)]
+        page_url: Option<String>,
+        #[serde(default)]
+        page_title: Option<String>,
+        /// Absolute http(s) links scraped from that page (deduplicated,
+        /// bounded by the native host before they reach this layer).
+        #[serde(default)]
+        page_links: Vec<String>,
+    },
 }
 
 /// A download handed over by the extension.
@@ -248,5 +282,146 @@ mod tests {
     #[test]
     fn state_dir_is_absolute() {
         assert!(state_dir().is_absolute());
+    }
+
+    #[test]
+    fn ai_parse_roundtrip_preserves_optional_fields() {
+        let env = Envelope {
+            id: 11,
+            token: None,
+            request: Request::AiParse {
+                url: "https://example.com/watch?v=1".into(),
+                source_page: Some("https://example.com/".into()),
+                title: Some("示例页面".into()),
+                include_credentials: true,
+                cookie: Some("sid=abc".into()),
+                referer: Some("https://example.com/".into()),
+                user_agent: Some("UA/1".into()),
+                page_url: Some("https://example.com/watch?v=1".into()),
+                page_title: Some("示例页面".into()),
+                page_links: vec![
+                    "https://cdn.example.com/a.mp4".into(),
+                    "https://cdn.example.com/b.zip".into(),
+                ],
+            },
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"method\":\"ai_parse\""));
+        assert!(json.contains("\"include_credentials\":true"));
+        assert!(json.contains("\"page_links\""));
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        match back.request {
+            Request::AiParse {
+                url,
+                source_page,
+                title,
+                include_credentials,
+                cookie,
+                referer,
+                user_agent,
+                page_url,
+                page_title,
+                page_links,
+            } => {
+                assert_eq!(url, "https://example.com/watch?v=1");
+                assert_eq!(source_page.as_deref(), Some("https://example.com/"));
+                assert_eq!(title.as_deref(), Some("示例页面"));
+                assert!(include_credentials);
+                assert_eq!(cookie.as_deref(), Some("sid=abc"));
+                assert_eq!(referer.as_deref(), Some("https://example.com/"));
+                assert_eq!(user_agent.as_deref(), Some("UA/1"));
+                assert_eq!(page_url.as_deref(), Some("https://example.com/watch?v=1"));
+                assert_eq!(page_title.as_deref(), Some("示例页面"));
+                assert_eq!(
+                    page_links,
+                    vec![
+                        "https://cdn.example.com/a.mp4".to_string(),
+                        "https://cdn.example.com/b.zip".to_string()
+                    ]
+                );
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ai_parse_minimal_payload_defaults_optional_fields() {
+        let env: Envelope = serde_json::from_str(
+            r#"{"id":3,"method":"ai_parse","url":"https://example.com/files"}"#,
+        )
+        .unwrap();
+        match env.request {
+            Request::AiParse {
+                url,
+                source_page,
+                title,
+                include_credentials,
+                cookie,
+                referer,
+                user_agent,
+                page_url,
+                page_title,
+                page_links,
+            } => {
+                assert_eq!(url, "https://example.com/files");
+                assert!(source_page.is_none());
+                assert!(title.is_none());
+                assert!(!include_credentials);
+                assert!(cookie.is_none());
+                assert!(referer.is_none());
+                assert!(user_agent.is_none());
+                // P4b-b2: old hosts/extensions send no snapshot at all.
+                assert!(page_url.is_none());
+                assert!(page_title.is_none());
+                assert!(page_links.is_empty());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ai_parse_page_snapshot_fields_are_backward_compatible() {
+        // A pre-v0.3 frame omits the snapshot fields entirely; a v0.3 frame can
+        // still carry only the page URL/title (no links) or no page URL.
+        let legacy: Envelope = serde_json::from_str(
+            r#"{"id":1,"method":"ai_parse","url":"https://example.com/x","title":"t"}"#,
+        )
+        .unwrap();
+        match legacy.request {
+            Request::AiParse {
+                page_url,
+                page_title,
+                page_links,
+                ..
+            } => {
+                assert!(page_url.is_none());
+                assert!(page_title.is_none());
+                assert!(page_links.is_empty());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let snapshot: Envelope = serde_json::from_str(
+            r#"{"id":2,"method":"ai_parse","url":"https://example.com/x",
+                "page_url":"https://example.com/x","page_title":"页面",
+                "page_links":["https://cdn.example.com/a.bin"]}"#,
+        )
+        .unwrap();
+        match snapshot.request {
+            Request::AiParse {
+                page_url,
+                page_title,
+                page_links,
+                ..
+            } => {
+                assert_eq!(page_url.as_deref(), Some("https://example.com/x"));
+                assert_eq!(page_title.as_deref(), Some("页面"));
+                assert_eq!(
+                    page_links,
+                    vec!["https://cdn.example.com/a.bin".to_string()]
+                );
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 }

@@ -56,8 +56,64 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     palette: Palette,
+    /// 掩码显示（API Key 等敏感字段）：内容仍按明文编辑/复制，绘制时每个字符显示为 `*`。
+    masked: bool,
+    /// 长文本水平滚动偏移（保证光标可见；由 prepaint 每帧按光标计算）。
+    scroll_x: f32,
     /// Enter 回调（URL 框用于「添加」）。
     pub on_submit: Option<Rc<dyn Fn(&mut Window, &mut gpui::App)>>,
+}
+
+/// 掩码文本：每个字符一个 `*`。
+///
+/// 每个 `*` 恰好 1 字节（ASCII），因此「显示字节偏移 == 显示字符序号」，
+/// 可以把内容里的 UTF-8 字节偏移映射到掩码文本的索引而不破坏光标/选区计算。
+fn mask_text(content: &str) -> String {
+    "*".repeat(content.chars().count())
+}
+
+/// 内容字节偏移 → 显示文本索引（未掩码时原样返回）。
+fn display_offset(content: &str, content_offset: usize, masked: bool) -> usize {
+    if !masked {
+        return content_offset;
+    }
+    content
+        .get(..content_offset.min(content.len()))
+        .map(|prefix| prefix.chars().count())
+        .unwrap_or(0)
+}
+
+/// 显示文本索引 → 内容字节偏移（未掩码时原样返回）。
+fn content_offset(content: &str, display_index: usize, masked: bool) -> usize {
+    if !masked {
+        return display_index.min(content.len());
+    }
+    content
+        .char_indices()
+        .nth(display_index)
+        .map(|(index, _)| index)
+        .unwrap_or(content.len())
+}
+
+/// 计算让光标可见的水平滚动偏移（长路径/长 URL 在窄输入框里横向滚动）。
+///
+/// 纯函数便于单测：光标已在视口内 → 0；否则把光标推到右边缘留 2px 余量，
+/// 且不超过文本末尾。
+fn scroll_to_cursor(cursor_x: f32, text_width: f32, viewport_width: f32) -> f32 {
+    if !cursor_x.is_finite()
+        || !text_width.is_finite()
+        || !viewport_width.is_finite()
+        || viewport_width <= 0.0
+    {
+        return 0.0;
+    }
+    let margin = 2.0_f32.min(viewport_width * 0.5);
+    let max_scroll = (text_width - viewport_width + margin).max(0.0);
+    if cursor_x <= viewport_width - margin {
+        0.0
+    } else {
+        (cursor_x - viewport_width + margin).clamp(0.0, max_scroll)
+    }
 }
 
 impl TextInput {
@@ -77,6 +133,8 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             palette,
+            masked: false,
+            scroll_x: 0.0,
             on_submit: None,
         }
     }
@@ -87,6 +145,20 @@ impl TextInput {
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+    }
+
+    /// 切换掩码显示（只影响绘制，不改变内容）。
+    pub fn set_masked(&mut self, masked: bool) {
+        self.masked = masked;
+    }
+
+    /// 内容字节偏移 → 当前显示文本的索引（掩码时按字符数折算）。
+    fn display_offset(&self, content_offset: usize) -> usize {
+        display_offset(&self.content, content_offset, self.masked)
+    }
+
+    fn content_offset_from_display(&self, display_index: usize) -> usize {
+        content_offset(&self.content, display_index, self.masked)
     }
 
     /// 用代码设置内容（清空、预填目录等），光标移到末尾。
@@ -186,8 +258,20 @@ impl TextInput {
     }
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        // `on_submit` 回调常常要读取"提交这个输入框的同一个 Entity"（例如 URL 框的
+        // on_submit → RdmApp::add_from_input 会 `url_input.read(cx)`，AI 聊天框会读
+        // ai_chat_input）。如果同步调用，GPUI 会因该 Entity 仍处于 update 租约内而
+        // double-lease panic（cannot read … while it is already being updated），
+        // 而 GPUI 主线程是 non-unwinding panic → 进程直接闪退。
+        //
+        // 注意：**不能用 `cx.defer_in`**——它自身会 `view.update(...)` 重新更新本输入框，
+        // 回调里再 read 同一个 Entity 依旧 double-lease。这里用 App 级 defer 捕获
+        // WindowHandle，等本次 Entity 更新租约彻底释放后再进入窗口执行回调。
         if let Some(callback) = self.on_submit.clone() {
-            callback(window, cx);
+            let window_handle = window.window_handle();
+            cx.defer(move |cx: &mut gpui::App| {
+                let _ = window_handle.update(cx, |_, window, cx| callback(window, cx));
+            });
         }
         cx.notify();
     }
@@ -252,7 +336,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + px(self.scroll_x))
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -421,13 +505,14 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        let scroll = px(self.scroll_x);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(self.display_offset(range.start)) - scroll,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(self.display_offset(range.end)) - scroll,
                 bounds.bottom(),
             ),
         ))
@@ -441,8 +526,15 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
+        let x = point.x - line_point.x + px(self.scroll_x);
+        if self.masked {
+            // 掩码文本每个字符都是 1 字节的 `*`：显示字节索引即显示字符序号。
+            let display_index = last_layout.index_for_x(x)?;
+            let content_offset = self.content_offset_from_display(display_index);
+            return Some(self.offset_to_utf16(content_offset));
+        }
         assert_eq!(last_layout.text, self.content);
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -462,6 +554,8 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    /// 让光标可见的水平滚动偏移。
+    scroll_x: f32,
 }
 
 impl IntoElement for TextElement {
@@ -508,6 +602,7 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
+        let masked = input.masked;
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
@@ -517,10 +612,14 @@ impl Element for TextElement {
                 input.placeholder.clone(),
                 Hsla::from(self.palette.text_faint),
             )
+        } else if masked {
+            (mask_text(&content).into(), style.color)
         } else {
-            (content, style.color)
+            (content.clone(), style.color)
         };
-
+        let display_cursor = display_offset(&content, cursor, masked);
+        let display_selection = display_offset(&content, selected_range.start, masked)
+            ..display_offset(&content, selected_range.end, masked);
         let run = TextRun {
             len: display_text.len(),
             font: style.font(),
@@ -529,8 +628,9 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
-            vec![
+        // 掩码文本每个字符都是 `*`，IME 的 marked range 无法安全映射，直接显示普通文本。
+        let runs = match input.marked_range.as_ref() {
+            Some(marked_range) if !masked => vec![
                 TextRun {
                     len: marked_range.start,
                     ..run.clone()
@@ -551,9 +651,8 @@ impl Element for TextElement {
             ]
             .into_iter()
             .filter(|run| run.len > 0)
-            .collect()
-        } else {
-            vec![run]
+            .collect(),
+            _ => vec![run],
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
@@ -561,30 +660,30 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
-        let cursor_pos = line.x_for_index(cursor);
-        let (selection, cursor) = if selected_range.is_empty() {
+        let cursor_x: f32 = line.x_for_index(display_cursor).into();
+        let text_width: f32 = line.width.into();
+        let viewport_width: f32 = (bounds.right() - bounds.left()).into();
+        let scroll_x = scroll_to_cursor(cursor_x, text_width, viewport_width);
+        let shift = |x: f32| bounds.left() + px(x - scroll_x);
+        let (selection, cursor) = if display_selection.is_empty() {
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
+                        point(shift(cursor_x), bounds.top()),
                         size(px(1.5), bounds.bottom() - bounds.top()),
                     ),
                     self.palette.accent,
                 )),
             )
         } else {
+            let selection_start: f32 = line.x_for_index(display_selection.start).into();
+            let selection_end: f32 = line.x_for_index(display_selection.end).into();
             (
                 Some(fill(
                     Bounds::from_corners(
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.start),
-                            bounds.top(),
-                        ),
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.end),
-                            bounds.bottom(),
-                        ),
+                        point(shift(selection_start), bounds.top()),
+                        point(shift(selection_end), bounds.bottom()),
                     ),
                     self.palette.accent_soft,
                 )),
@@ -596,6 +695,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll_x,
         }
     }
 
@@ -618,9 +718,15 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
+        let scroll_x = prepaint.scroll_x;
         let line = prepaint.line.take().expect("line was shaped in prepaint");
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .expect("paint text line");
+        line.paint(
+            point(bounds.left() - px(scroll_x), bounds.top()),
+            window.line_height(),
+            window,
+            cx,
+        )
+        .expect("paint text line");
 
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
@@ -631,6 +737,7 @@ impl Element for TextElement {
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = scroll_x;
         });
     }
 }
@@ -658,6 +765,8 @@ impl Render for TextInput {
             .border_1()
             .border_color(border)
             .rounded_md()
+            // 长文本（路径/URL）只做水平滚动，不撑破外层 flex 列。
+            .overflow_hidden()
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
@@ -687,5 +796,64 @@ impl Render for TextInput {
                         palette,
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_text_replaces_each_char() {
+        assert_eq!(mask_text(""), "");
+        assert_eq!(mask_text("abc"), "***");
+        // 每个 `*` 是 1 字节，因此掩码后的字节长度 == 字符数（光标映射的前提）。
+        let masked = mask_text("密码a");
+        assert_eq!(masked, "***");
+        assert_eq!(masked.len(), 3);
+    }
+
+    #[test]
+    fn display_offsets_round_trip_with_ascii() {
+        let content = "abcd";
+        for offset in 0..=content.len() {
+            assert_eq!(display_offset(content, offset, true), offset);
+            assert_eq!(content_offset(content, offset, true), offset);
+        }
+        // 未掩码时原样返回。
+        assert_eq!(display_offset(content, 2, false), 2);
+        assert_eq!(content_offset(content, 2, false), 2);
+    }
+
+    #[test]
+    fn masked_offsets_respect_utf8_boundaries() {
+        let content = "密码a"; // 3 + 3 + 1 字节
+        assert_eq!(display_offset(content, 0, true), 0);
+        assert_eq!(display_offset(content, 3, true), 1);
+        assert_eq!(display_offset(content, 6, true), 2);
+        assert_eq!(display_offset(content, 7, true), 3);
+        assert_eq!(content_offset(content, 0, true), 0);
+        assert_eq!(content_offset(content, 1, true), 3);
+        assert_eq!(content_offset(content, 2, true), 6);
+        assert_eq!(content_offset(content, 3, true), 7);
+        // 越界输入不 panic，收敛到末尾。
+        assert_eq!(content_offset(content, 99, true), 7);
+        assert_eq!(display_offset(content, 99, true), 3);
+    }
+
+    #[test]
+    fn scroll_keeps_cursor_visible_in_narrow_input() {
+        // 文本比输入框短：不滚动。
+        assert_eq!(scroll_to_cursor(50.0, 100.0, 200.0), 0.0);
+        // 光标在视口内：不滚动。
+        assert_eq!(scroll_to_cursor(150.0, 400.0, 200.0), 0.0);
+        // 光标超出右边缘：滚到「光标 - 视口 + 余量」。
+        assert_eq!(scroll_to_cursor(300.0, 400.0, 200.0), 102.0);
+        // 光标在文本末尾：最多滚到「文本宽 - 视口 + 余量」。
+        assert_eq!(scroll_to_cursor(400.0, 400.0, 200.0), 202.0);
+        // 退化输入（宽度为 0/NaN）不 panic。
+        assert_eq!(scroll_to_cursor(120.0, 300.0, 0.0), 0.0);
+        assert_eq!(scroll_to_cursor(f32::NAN, 300.0, 100.0), 0.0);
+        assert_eq!(scroll_to_cursor(10.0, f32::INFINITY, 100.0), 0.0);
     }
 }

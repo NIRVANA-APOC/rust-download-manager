@@ -20,10 +20,10 @@ const els = {
   autoStartGui: document.getElementById("auto-start-gui"),
   contextMenu: document.getElementById("context-menu"),
   forwardCookies: document.getElementById("forward-cookies"),
+  aiCredentials: document.getElementById("ai-credentials"),
   minSizeMb: document.getElementById("min-size-mb"),
   allowExtensions: document.getElementById("allow-extensions"),
   blockExtensions: document.getElementById("block-extensions"),
-  connections: document.getElementById("connections"),
   outputDir: document.getElementById("output-dir"),
   speedLimit: document.getElementById("speed-limit"),
   save: document.getElementById("save"),
@@ -59,10 +59,10 @@ function fillForm(settings) {
   els.autoStartGui.checked = normalized.autoStartGui;
   els.contextMenu.checked = normalized.contextMenu;
   els.forwardCookies.checked = normalized.forwardCookies;
+  els.aiCredentials.checked = normalized.aiIncludeCredentials;
   els.minSizeMb.value = formatMegabytesFromBytes(normalized.minSizeBytes);
   els.allowExtensions.value = formatExtensionList(normalized.allowExtensions);
   els.blockExtensions.value = formatExtensionList(normalized.blockExtensions);
-  els.connections.value = String(normalized.connections);
   els.outputDir.value = normalized.outputDir;
   els.speedLimit.value = normalized.speedLimitKiBps > 0 ? String(normalized.speedLimitKiBps) : "";
 }
@@ -74,10 +74,10 @@ function readForm() {
     autoStartGui: els.autoStartGui.checked,
     contextMenu: els.contextMenu.checked,
     forwardCookies: els.forwardCookies.checked,
+    aiIncludeCredentials: els.aiCredentials.checked,
     minSizeBytes: parseMegabytesToBytes(els.minSizeMb.value),
     allowExtensions: parseExtensionList(els.allowExtensions.value),
     blockExtensions: parseExtensionList(els.blockExtensions.value),
-    connections: parseInt(els.connections.value, 10) || DEFAULT_SETTINGS.connections,
     outputDir,
     speedLimitKiBps: parseInt(els.speedLimit.value, 10) || 0,
   });

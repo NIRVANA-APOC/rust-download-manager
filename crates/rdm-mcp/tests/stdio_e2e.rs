@@ -60,14 +60,31 @@ struct Client {
 
 impl Client {
     fn start(state_dir: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rdm-mcp"))
+        Self::start_with_env(state_dir, &[])
+    }
+
+    fn start_with_localappdata(state_dir: &Path, localappdata: &Path) -> Self {
+        Self::start_with_env(
+            state_dir,
+            &[("LOCALAPPDATA", localappdata.to_string_lossy().into_owned())],
+        )
+    }
+
+    fn start_with_env(state_dir: &Path, envs: &[(&str, String)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rdm-mcp"));
+        command
             .arg("--state-dir")
             .arg(state_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn rdm-mcp");
+            .env_remove("RDM_AGENT_STATE_DIR")
+            // Never let a developer's real AI key leak into the isolated tests.
+            .env_remove("RDM_AI_API_KEY");
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn rdm-mcp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let (tx, rx) = mpsc::channel();
@@ -243,9 +260,10 @@ async fn stdio_end_to_end_download_lifecycle() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 16);
+    assert_eq!(names.len(), 17);
     assert_eq!(names[0], "rdm_capabilities");
-    assert_eq!(names[15], "rdm_state_maintenance");
+    assert_eq!(names[2], "rdm_resolve");
+    assert_eq!(names[16], "rdm_state_maintenance");
 
     // --- probe --------------------------------------------------------
     let probe = client.tool("rdm_probe", json!({ "url": url }));
@@ -264,7 +282,8 @@ async fn stdio_end_to_end_download_lifecycle() {
             "expected_sha256": expected_sha,
             "cookie": "session=integration-secret",
             "headers": { "Authorization": "Bearer integration-secret" },
-            "idempotency_key": "it-lifecycle-1"
+            "idempotency_key": "it-lifecycle-1",
+            "dynamic_connections": false
         }),
         "it-progress-1",
     );
@@ -274,6 +293,15 @@ async fn stdio_end_to_end_download_lifecycle() {
         task["state"], "completed",
         "download did not complete: {download}"
     );
+    // The explicit dynamic_connections=false is honoured end-to-end and the
+    // realised concurrency peak is exposed on the TaskView/result.
+    assert_eq!(task["dynamic_connections"], false);
+    let peak = task["peak_connections"].as_u64().unwrap();
+    assert!(
+        (2..=4).contains(&peak),
+        "unexpected peak_connections {peak}: {task}"
+    );
+    assert_eq!(task["result"]["peak_connections"], peak);
     let task_id = structured(&download)["task_id"]
         .as_str()
         .unwrap()
@@ -315,6 +343,15 @@ async fn stdio_end_to_end_download_lifecycle() {
         json!({ "task_id": task_id, "include_events": true, "event_limit": 50 }),
     );
     assert_tool_ok(&detail);
+    assert_eq!(
+        structured(&detail)["data"]["task"]["dynamic_connections"],
+        false
+    );
+    assert_eq!(
+        structured(&detail)["data"]["task"]["peak_connections"],
+        peak,
+        "get_task must expose the same realised peak as the download result"
+    );
     let events = structured(&detail)["data"]["events"].as_array().unwrap();
     assert!(!events.is_empty());
     assert!(!serde_json::to_string(events)
@@ -370,6 +407,12 @@ async fn stdio_end_to_end_download_lifecycle() {
         cases.iter().all(|case| case["status"] == "pass"),
         "selftest cases failed: {selftest}"
     );
+    // v1.4 additive: read-only recipe self-test report is always present.
+    let recipes = &structured(&selftest)["data"]["recipes"];
+    assert!(recipes.is_object(), "{selftest}");
+    assert!(recipes["dir"].as_str().is_some(), "{selftest}");
+    assert!(recipes["checked"].as_u64().is_some(), "{selftest}");
+    assert!(recipes["failures"].is_array(), "{selftest}");
     let bench = client.tool(
         "rdm_bench",
         json!({ "size_bytes": 256 * 1024, "connections": [1, 2], "repeats": 1 }),
@@ -490,11 +533,12 @@ async fn approval_flow_conflict_and_safe_defaults() {
     // -- explicit plan -> apply flow ----------------------------------
     let planned = client.tool(
         "rdm_plan_download",
-        json!({ "url": url, "file_name": "planned.bin" }),
+        json!({ "url": url, "file_name": "planned.bin", "dynamic_connections": false }),
     );
     assert_tool_ok(&planned);
     let plan_data = &structured(&planned)["data"];
     assert_eq!(plan_data["approval_required"], true);
+    assert_eq!(plan_data["plan"]["dynamic_connections"], false);
     let planned_plan_id = plan_data["plan"]["plan_id"].as_str().unwrap().to_string();
     let planned_token = plan_data["approval_token"].as_str().unwrap().to_string();
     let planned_apply = client.tool(
@@ -510,6 +554,11 @@ async fn approval_flow_conflict_and_safe_defaults() {
     assert_eq!(
         structured(&planned_apply)["data"]["task"]["state"],
         "completed"
+    );
+    assert_eq!(
+        structured(&planned_apply)["data"]["task"]["dynamic_connections"],
+        false,
+        "apply must preserve the planned dynamic_connections flag"
     );
 
     // -- download returns needs_approval -> apply ---------------------
@@ -691,6 +740,139 @@ async fn wait_cancellation_and_pause_resume_over_stdio() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// ---------------------------------------------------------------------------
+// rdm_resolve (v1.2 link resolution)
+// ---------------------------------------------------------------------------
+
+/// Minimal direct-link recipe: fetch the input URL once and emit it as the
+/// resource; the resolver verifier (HEAD + bounded ranged GET) does the rest.
+const DIRECT_RECIPE: &str = r#"{
+  "schema": "rdm.recipe/v1",
+  "id": "fixture-direct",
+  "version": 1,
+  "name": "Fixture direct link",
+  "match": { "hosts": ["127.0.0.1"], "url_pattern": "^(?P<input_url>http://.+)$" },
+  "limits": { "requests": 8, "bytes_read": 262144, "wall_ms": 15000, "redirects": 3 },
+  "steps": [
+    {
+      "id": "fetch",
+      "op": "http_request",
+      "args": { "method": "GET", "url": "{{input_url}}", "max_bytes": 1024 },
+      "expect": { "status_in": [200, 206] }
+    }
+  ],
+  "emit": { "url": "{{input_url}}" }
+}"#;
+
+/// Isolated `%LOCALAPPDATA%` root: the resolver looks up recipes under
+/// `<LOCALAPPDATA>/RDM/resolve/recipes`, so tests must never touch the real
+/// user profile.
+fn localappdata_root(root: &Path) -> PathBuf {
+    let local = root.join("localappdata");
+    std::fs::create_dir_all(&local).unwrap();
+    local
+}
+
+fn write_direct_recipe(localappdata: &Path) {
+    let recipes = localappdata.join("RDM").join("resolve").join("recipes");
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(recipes.join("fixture-direct@1.json"), DIRECT_RECIPE).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_tool_success_and_failure_paths() {
+    let fixture = TestServer::start(Config::new(96 * 1024)).await.unwrap();
+    let url = fixture.file_url();
+    let mut html_config = Config::new(8 * 1024);
+    html_config.content_type = "text/html".to_string();
+    let html_fixture = TestServer::start(html_config).await.unwrap();
+    let html_url = html_fixture.file_url();
+
+    // --- success: recipe replay + built-in verification ----------------
+    let root = temp_root("resolve-ok");
+    write_policy(&root, json!({}));
+    let local = localappdata_root(&root);
+    write_direct_recipe(&local);
+    let mut client = Client::start_with_localappdata(&root, &local);
+    let initialize = client.initialize("2025-06-18");
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "rdm");
+    let resolved = client.tool("rdm_resolve", json!({ "url": url, "mode": "recipe_only" }));
+    assert_tool_ok(&resolved);
+    let data = &structured(&resolved)["data"];
+    assert_eq!(data["status"], "succeeded");
+    assert!(data["run_id"].as_str().unwrap().starts_with("run_"));
+    assert_eq!(data["recipe"]["id"], "fixture-direct");
+    assert_eq!(data["diagnostics"]["llm_calls"], 0);
+    let resource = &data["manifest"]["resources"][0];
+    assert_eq!(resource["url"], url);
+    assert_eq!(resource["verification"]["status"], "verified");
+    assert_eq!(resource["size_bytes"], 96 * 1024);
+    assert_eq!(resource["transfer"]["resumable"], true);
+
+    // --- invalid_url: bad input, never a policy mask -------------------
+    let bad = client.tool("rdm_resolve", json!({ "url": "not-a-url" }));
+    assert_eq!(bad["result"]["isError"], true, "{bad}");
+    assert_eq!(structured(&bad)["error"]["code"], "invalid_url");
+    assert_eq!(structured(&bad)["data"], Value::Null);
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+
+    // --- no recipe: auto falls back to built-in direct verification ----
+    let root = temp_root("resolve-fail");
+    write_policy(&root, json!({}));
+    let local = localappdata_root(&root); // no recipes installed
+    let mut client = Client::start_with_localappdata(&root, &local);
+    client.initialize("2025-06-18");
+    let direct = client.tool("rdm_resolve", json!({ "url": url }));
+    assert_tool_ok(&direct);
+    let direct_data = &structured(&direct)["data"];
+    assert_eq!(direct_data["status"], "succeeded");
+    assert_eq!(direct_data["recipe"], Value::Null, "{direct_data}");
+    assert_eq!(
+        direct_data["manifest"]["resources"][0]["verification"]["status"],
+        "verified"
+    );
+
+    // --- failed resolution still returns the full ResolveOutcome ------
+    let failed = client.tool("rdm_resolve", json!({ "url": html_url }));
+    assert_eq!(failed["result"]["isError"], true, "{failed}");
+    let failed_structured = structured(&failed);
+    assert_eq!(failed_structured["error"]["code"], "resolve_failed");
+    assert_eq!(failed_structured["error"]["details"]["kind"], "not_a_file");
+    assert!(failed_structured["error"]["details"]["run_id"].is_string());
+    assert_eq!(failed_structured["data"]["status"], "failed");
+    assert!(failed_structured["data"]["run_id"].is_string());
+    assert!(failed_structured["data"]["diagnostics"]["error"].is_object());
+
+    // recipe_only never falls back: an empty library is recipe_no_match.
+    let no_recipe = client.tool("rdm_resolve", json!({ "url": url, "mode": "recipe_only" }));
+    assert_eq!(no_recipe["result"]["isError"], true, "{no_recipe}");
+    assert_eq!(structured(&no_recipe)["error"]["code"], "resolve_failed");
+    assert_eq!(
+        structured(&no_recipe)["error"]["details"]["kind"],
+        "recipe_no_match"
+    );
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+
+    // --- policy_denied: loopback host outside the policy --------------
+    let root = temp_root("resolve-policy");
+    write_policy(
+        &root,
+        json!({ "allowed_hosts": ["*.example.com"], "allow_private_hosts": false }),
+    );
+    let mut client = Client::start(&root);
+    client.initialize("2025-06-18");
+    let denied = client.tool("rdm_resolve", json!({ "url": url }));
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    assert_eq!(structured(&denied)["error"]["code"], "policy_denied");
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+
+    fixture.shutdown().await;
+    html_fixture.shutdown().await;
+}
+
 /// SHA-256 of the fixture payload (byte-level equality check).
 fn sha256_of(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -718,8 +900,703 @@ async fn modern_only_client_requires_per_request_meta() {
     // A modern request with the required _meta keeps working.
     let with_meta = client.request("tools/list", json!({ "_meta": modern_meta }));
     assert_eq!(with_meta["result"]["resultType"], "complete");
-    assert_eq!(with_meta["result"]["tools"].as_array().unwrap().len(), 16);
+    assert_eq!(with_meta["result"]["tools"].as_array().unwrap().len(), 17);
 
     assert_eq!(client.close(), 0);
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_stream_download_and_plan_apply() {
+    // Engine `single_stream`: one plain GET with no Range header; the plan ->
+    // apply path must preserve the flag (plan summary normalized to 1 conn).
+    let fixture = TestServer::start(Config::new(128 * 1024)).await.unwrap();
+    let url = fixture.file_url();
+    let root = temp_root("single-stream");
+    write_policy(&root, json!({}));
+    let mut client = Client::start(&root);
+    client.initialize("2025-06-18");
+
+    // --- rdm_download single_stream=true ------------------------------
+    fixture.reset_stats();
+    let download = client.tool(
+        "rdm_download",
+        json!({
+            "url": url,
+            "file_name": "single.bin",
+            "wait": true,
+            "wait_timeout_ms": 60000,
+            "single_stream": true,
+            // Single-stream wins over explicit connection knobs.
+            "connections": 8,
+            "dynamic_connections": true
+        }),
+    );
+    assert_tool_ok(&download);
+    let task = &structured(&download)["data"]["task"];
+    assert_eq!(task["state"], "completed", "{download}");
+    assert_eq!(task["connections"], 1);
+    assert_eq!(task["dynamic_connections"], false);
+    let stats = fixture.stats();
+    // prepare_download probes once for policy/metadata (HEAD, and
+    // single_stream skips the ranged probe), then the engine's own probe
+    // (HEAD) and the single plain GET.
+    assert_eq!(
+        stats.methods,
+        vec!["HEAD".to_string(), "HEAD".to_string(), "GET".to_string()],
+        "single_stream must be HEAD probes + one plain GET: {stats:?}"
+    );
+    assert!(
+        stats.range_headers.is_empty(),
+        "single_stream must never send a Range header: {:?}",
+        stats.range_headers
+    );
+
+    // --- invalid type names the field -------------------------------
+    let bad = client.tool(
+        "rdm_download",
+        json!({ "url": url, "single_stream": "yes" }),
+    );
+    assert_eq!(bad["result"]["isError"], true, "{bad}");
+    assert_eq!(structured(&bad)["error"]["code"], "invalid_request");
+    assert!(structured(&bad)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("single_stream"));
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+
+    // --- plan -> apply preserves single_stream ----------------------
+    let root = temp_root("single-stream-plan");
+    write_policy(&root, json!({ "require_approval_over_bytes": 1 }));
+    let mut client = Client::start(&root);
+    client.initialize("2025-06-18");
+    fixture.reset_stats();
+    let planned = client.tool(
+        "rdm_plan_download",
+        json!({ "url": url, "file_name": "planned.bin", "single_stream": true }),
+    );
+    assert_tool_ok(&planned);
+    let plan = &structured(&planned)["data"]["plan"];
+    assert_eq!(plan["single_stream"], true, "{planned}");
+    assert_eq!(plan["connections"], 1);
+    assert_eq!(plan["dynamic_connections"], false);
+    let plan_id = plan["plan_id"].as_str().unwrap().to_string();
+    let token = structured(&planned)["data"]["approval_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let applied = client.tool(
+        "rdm_apply_plan",
+        json!({
+            "plan_id": plan_id,
+            "approval_token": token,
+            "wait": true,
+            "wait_timeout_ms": 60000
+        }),
+    );
+    assert_tool_ok(&applied);
+    assert_eq!(structured(&applied)["data"]["task"]["state"], "completed");
+    let stats = fixture.stats();
+    // plan probe (HEAD) + apply re-probe (HEAD) + engine probe (HEAD) + the
+    // single plain GET; no ranged request anywhere.
+    assert_eq!(
+        stats.methods,
+        vec![
+            "HEAD".to_string(),
+            "HEAD".to_string(),
+            "HEAD".to_string(),
+            "GET".to_string()
+        ],
+        "plan -> apply must keep the no-Range single-GET shape: {stats:?}"
+    );
+    assert!(stats.range_headers.is_empty(), "{:?}", stats.range_headers);
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+    fixture.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// rdm_resolve v1.3: mode=explore with a user-configured AI provider
+// ---------------------------------------------------------------------------
+
+/// Write the user's AI provider config (`<LOCALAPPDATA>\RDM\ai.json`).
+fn write_ai_config(localappdata: &Path, base_url: &str, api_key: &str) {
+    let state = localappdata.join("RDM");
+    std::fs::create_dir_all(&state).unwrap();
+    let config = json!({
+        "enabled": true,
+        "base_url": base_url,
+        "model": "mock-model",
+        "api_key": api_key,
+        "timeout_secs": 10
+    });
+    std::fs::write(
+        state.join("ai.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Minimal share page that links to the fixture's direct file URL.
+async fn spawn_share_page(file_url: &str) -> (String, tokio::sync::watch::Sender<bool>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind share page");
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}/share/abc");
+    let html = format!(
+        "<!doctype html><html><head><title>Share page</title></head><body>\
+         <h1>RDM fixture share page</h1><a href=\"{file_url}\">download the file</a></body></html>"
+    );
+    let (shutdown, mut rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                _ = rx.changed() => break,
+                accepted = listener.accept() => accepted,
+            };
+            let Ok((mut stream, _)) = accepted else {
+                break;
+            };
+            let html = html.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let is_head = head.starts_with(b"HEAD ");
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    html.len()
+                )
+                .into_bytes();
+                if !is_head {
+                    response.extend_from_slice(html.as_bytes());
+                }
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    (url, shutdown)
+}
+
+/// Scripted OpenAI-compatible mock (`POST /chat/completions`): turn 1 reads the
+/// share page, later turns emit the fixture URL with the real observation id.
+struct MockLlm {
+    base_url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl MockLlm {
+    async fn start(share_url: &str, file_url: &str) -> Self {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock llm");
+        let addr = listener.local_addr().unwrap();
+        let share_url = share_url.to_string();
+        let file_url = file_url.to_string();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&requests);
+        let (shutdown, mut rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = rx.changed() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut stream, _)) = accepted else {
+                    break;
+                };
+                let recorded = std::sync::Arc::clone(&recorded);
+                let share_url = share_url.clone();
+                let file_url = file_url.clone();
+                tokio::spawn(async move {
+                    let body = read_http_body(&mut stream).await;
+                    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    recorded.lock().unwrap().push(request.clone());
+                    let content = scripted_reply(&request, &share_url, &file_url);
+                    let payload = json!({
+                        "choices": [{"message": {"role": "assistant", "content": content}}]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}/v1"),
+            requests,
+            shutdown,
+        }
+    }
+
+    fn recorded_requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+async fn read_http_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            return buffer;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buffer[..position]).to_ascii_lowercase();
+            let expected = head
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while buffer.len() < position + 4 + expected {
+                let read = stream.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            return buffer[position + 4..].to_vec();
+        }
+    }
+}
+
+fn scripted_reply(request: &Value, share_url: &str, file_url: &str) -> String {
+    let messages = request["messages"].as_array().cloned().unwrap_or_default();
+    let assistant_turns = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .count();
+    if assistant_turns == 0 {
+        return json!({"action": "page_read", "url": share_url}).to_string();
+    }
+    let conversation = serde_json::to_string(request).unwrap_or_default();
+    match find_observation_id(&conversation) {
+        Some(observation) => json!({
+            "action": "emit_manifest",
+            "resources": [{
+                "url": file_url,
+                "evidence": format!("{observation}#links/0"),
+                "name": "file"
+            }],
+            "notes": ["scripted mock"]
+        })
+        .to_string(),
+        None => json!({
+            "action": "finish",
+            "reason": "mock saw no observation id",
+            "kind": "no_resources"
+        })
+        .to_string(),
+    }
+}
+
+fn find_observation_id(conversation: &str) -> Option<String> {
+    let mut search = conversation;
+    while let Some(start) = search.find("obs_") {
+        let rest = &search[start..];
+        let end = rest
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(rest.len());
+        let candidate = &rest[..end];
+        // Real ids are `obs_<pid>_<seq>`; skip the prompt's placeholder forms.
+        let parts: Vec<&str> = candidate.split('_').collect();
+        if parts.len() >= 3
+            && parts[1..]
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return Some(candidate.to_string());
+        }
+        search = &rest[end..];
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_tool_explore_uses_configured_ai() {
+    let fixture = TestServer::start(Config::new(64 * 1024)).await.unwrap();
+    let (share_url, share_shutdown) = spawn_share_page(&fixture.file_url()).await;
+    let mock = MockLlm::start(&share_url, &fixture.file_url()).await;
+    let root = temp_root("resolve-explore-ai");
+    write_policy(&root, json!({}));
+    let local = localappdata_root(&root);
+    write_ai_config(&local, &mock.base_url, "mcp-test-key-987654");
+    let mut client = Client::start_with_localappdata(&root, &local);
+    client.initialize("2025-06-18");
+
+    let resolved = client.tool(
+        "rdm_resolve",
+        json!({ "url": share_url, "mode": "explore", "max_llm_calls": 3 }),
+    );
+    assert_tool_ok(&resolved);
+    let data = &structured(&resolved)["data"];
+    assert_eq!(data["status"], "succeeded", "{resolved}");
+    // v1.5: an expressible exploration distills a local draft instead of null.
+    assert_eq!(data["recipe"]["state"], "draft", "{resolved}");
+    assert!(
+        data["recipe"]["id"].as_str().unwrap().starts_with("draft_"),
+        "{resolved}"
+    );
+    assert_eq!(data["manifest"]["resources"][0]["url"], fixture.file_url());
+    assert_eq!(
+        data["manifest"]["resources"][0]["verification"]["status"],
+        "verified"
+    );
+    let llm_calls = data["diagnostics"]["llm_calls"].as_u64().unwrap();
+    assert!((2..=3).contains(&llm_calls), "{resolved}");
+
+    // Privacy: neither the tool result nor the prompt bodies carry the key.
+    let raw = serde_json::to_string(&resolved).unwrap();
+    assert!(
+        !raw.contains("mcp-test-key-987654"),
+        "tool result leaked key"
+    );
+    let recorded = mock.recorded_requests();
+    assert!(!recorded.is_empty());
+    for (index, request) in recorded.iter().enumerate() {
+        let text = serde_json::to_string(request).unwrap();
+        assert!(
+            !text.contains("mcp-test-key-987654"),
+            "prompt body leaked the key: {text}"
+        );
+        if index > 0 {
+            assert!(
+                text.contains("untrusted_content"),
+                "tool results must be untrusted_content: {text}"
+            );
+        }
+    }
+
+    // Schema/capabilities contract (still 17 tools).
+    let capabilities = client.tool("rdm_capabilities", json!({}));
+    assert_tool_ok(&capabilities);
+    let features = structured(&capabilities)["data"]["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let link = features
+        .iter()
+        .position(|feature| *feature == "link-resolution")
+        .expect("link-resolution feature");
+    assert_eq!(
+        features.get(link + 1).copied(),
+        Some("link-resolution-explore"),
+        "link-resolution-explore must follow link-resolution: {features:?}"
+    );
+    let tools = client.request("tools/list", json!({}));
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 17);
+    let resolve_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "rdm_resolve")
+        .expect("rdm_resolve tool");
+    let property = &resolve_tool["inputSchema"]["properties"]["max_llm_calls"];
+    assert_eq!(property["type"], "integer");
+    assert_eq!(property["minimum"], 1);
+    assert_eq!(property["maximum"], 32);
+    assert_eq!(property["default"], 8);
+
+    // Out-of-range max_llm_calls is a typed invalid_request.
+    let out_of_range = client.tool(
+        "rdm_resolve",
+        json!({ "url": share_url, "mode": "explore", "max_llm_calls": 33 }),
+    );
+    assert_eq!(out_of_range["result"]["isError"], true, "{out_of_range}");
+    assert_eq!(
+        structured(&out_of_range)["error"]["code"],
+        "invalid_request"
+    );
+    assert!(structured(&out_of_range)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("max_llm_calls"));
+
+    assert_eq!(client.close(), 0);
+    mock.shutdown();
+    let _ = share_shutdown.send(true);
+    std::fs::remove_dir_all(&root).ok();
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_tool_explore_without_ai_is_model_unavailable() {
+    let mut config = Config::new(8 * 1024);
+    config.content_type = "text/html".to_string();
+    let fixture = TestServer::start(config).await.unwrap();
+    let root = temp_root("resolve-explore-noai");
+    write_policy(&root, json!({}));
+    let local = localappdata_root(&root);
+    let mut client = Client::start_with_localappdata(&root, &local);
+    client.initialize("2025-06-18");
+    let resolved = client.tool(
+        "rdm_resolve",
+        json!({ "url": fixture.file_url(), "mode": "explore" }),
+    );
+    assert_eq!(resolved["result"]["isError"], true, "{resolved}");
+    let payload = structured(&resolved);
+    assert_eq!(payload["error"]["code"], "resolve_failed");
+    assert_eq!(
+        payload["error"]["details"]["kind"], "model_unavailable",
+        "{resolved}"
+    );
+    // The failed call still carries the full ResolveOutcome for diagnostics.
+    assert_eq!(payload["data"]["status"], "failed");
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+    fixture.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// rdm_selftest v1.4: read-only recipe self-test report
+// ---------------------------------------------------------------------------
+
+/// Recipe whose pure matching self-tests pass (one match, one no-match, one skip).
+const SELFTEST_PASS_RECIPE: &str = r#"{
+  "schema": "rdm.recipe/v1",
+  "id": "selftest-pass",
+  "version": 1,
+  "name": "Selftest passing recipe",
+  "match": { "hosts": ["example.com"], "url_pattern": "^https://example\\.com/file/(?P<id>[0-9]+)$" },
+  "steps": [
+    { "id": "fetch", "op": "http_request",
+      "args": { "method": "GET", "url": "{{input_url}}", "max_bytes": 1024 } }
+  ],
+  "emit": { "url": "{{input_url}}" },
+  "tests": [
+    { "name": "matches-file-url", "input_url": "https://example.com/file/42" },
+    { "name": "rejects-other-host", "input_url": "https://mirror.example.net/file/42",
+      "expect_no_match": true },
+    { "name": "skipped-needs-login", "input_url": "https://example.com/file/43",
+      "skip": "requires login" }
+  ]
+}"#;
+
+/// Recipe with one deliberately failing `expect_no_match` self-test.
+const SELFTEST_FAILING_RECIPE: &str = r#"{
+  "schema": "rdm.recipe/v1",
+  "id": "selftest-failing",
+  "version": 2,
+  "name": "Selftest failing recipe",
+  "match": { "hosts": ["fail.example"], "url_pattern": "^https://fail\\.example/" },
+  "steps": [
+    { "id": "fetch", "op": "http_request",
+      "args": { "method": "GET", "url": "{{input_url}}", "max_bytes": 1024 } }
+  ],
+  "emit": { "url": "{{input_url}}" },
+  "tests": [
+    { "name": "must-not-match", "input_url": "https://fail.example/file/1",
+      "expect_no_match": true }
+  ]
+}"#;
+
+fn write_selftest_recipes(localappdata: &Path) {
+    let recipes = localappdata.join("RDM").join("resolve").join("recipes");
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(recipes.join("selftest-pass@1.json"), SELFTEST_PASS_RECIPE).unwrap();
+    std::fs::write(
+        recipes.join("selftest-failing@2.json"),
+        SELFTEST_FAILING_RECIPE,
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selftest_tool_reports_recipe_self_tests() {
+    let root = temp_root("selftest-recipes");
+    write_policy(&root, json!({}));
+    let local = localappdata_root(&root);
+    write_selftest_recipes(&local);
+    let mut client = Client::start_with_localappdata(&root, &local);
+    client.initialize("2025-06-18");
+
+    let selftest = client.tool("rdm_selftest", json!({ "size_bytes": 512 * 1024 }));
+    assert_tool_ok(&selftest);
+    let data = &structured(&selftest)["data"];
+    // Engine result is untouched by recipe failures.
+    assert_eq!(data["passed"], 4, "{selftest}");
+    assert_eq!(data["failed"], 0, "{selftest}");
+    let recipes = &data["recipes"];
+    let expected_dir = local.join("RDM").join("resolve").join("recipes");
+    assert_eq!(recipes["dir"], expected_dir.display().to_string());
+    assert_eq!(recipes["checked"], 2, "{selftest}");
+    assert_eq!(recipes["passed"], 2, "{selftest}");
+    assert_eq!(recipes["failed"], 1, "{selftest}");
+    assert_eq!(recipes["skipped"], 1, "{selftest}");
+    let failures = recipes["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{selftest}");
+    assert_eq!(failures[0]["recipe_id"], "selftest-failing");
+    assert_eq!(failures[0]["version"], 2);
+    assert_eq!(failures[0]["test"], "must-not-match");
+    assert!(failures[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("must not match but did"));
+
+    // Tool count/schema contract: still 17 tools, recipes schema is additive.
+    let tools = client.request("tools/list", json!({}));
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 17);
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "rdm_selftest")
+        .expect("rdm_selftest tool");
+    let data_schema = &tool["outputSchema"]["properties"]["data"]["anyOf"][0];
+    let recipes_schema = &data_schema["properties"]["recipes"];
+    assert_eq!(recipes_schema["type"], "object", "{tool}");
+    assert_eq!(recipes_schema["properties"]["failures"]["maxItems"], 50);
+    assert!(
+        !data_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "recipes"),
+        "recipes is an additive/optional field: {tool}"
+    );
+
+    // Missing recipe library → checked=0 (still a successful selftest).
+    let empty_root = temp_root("selftest-no-recipes");
+    write_policy(&empty_root, json!({}));
+    let empty_local = localappdata_root(&empty_root);
+    let mut empty_client = Client::start_with_localappdata(&empty_root, &empty_local);
+    empty_client.initialize("2025-06-18");
+    let empty = empty_client.tool("rdm_selftest", json!({ "size_bytes": 512 * 1024 }));
+    assert_tool_ok(&empty);
+    let empty_recipes = &structured(&empty)["data"]["recipes"];
+    assert_eq!(empty_recipes["checked"], 0, "{empty}");
+    assert_eq!(empty_recipes["passed"], 0);
+    assert_eq!(empty_recipes["failed"], 0);
+    assert!(empty_recipes["failures"].as_array().unwrap().is_empty());
+    assert_eq!(empty_client.close(), 0);
+    std::fs::remove_dir_all(&empty_root).ok();
+
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// rdm_resolve v1.6 §8.6: library method health (`recipe_health`)
+// ---------------------------------------------------------------------------
+
+/// Library recipe that replays a fixture URL and emits it. Against an HTML
+/// fixture the replay succeeds but verification yields `partial`/`not_a_file`
+/// (a non-structural failure), so a seeded health status stays observable.
+const HEALTH_RECIPE: &str = r#"{
+  "schema": "rdm.recipe/v1",
+  "id": "fixture-html",
+  "version": 1,
+  "name": "Fixture HTML page",
+  "match": { "hosts": ["127.0.0.1"], "url_pattern": "^(?P<input_url>http://.+)$" },
+  "limits": { "requests": 4, "bytes_read": 131072, "wall_ms": 10000, "redirects": 2 },
+  "steps": [
+    {
+      "id": "fetch",
+      "op": "http_request",
+      "args": { "method": "GET", "url": "{{input_url}}", "max_bytes": 512 },
+      "expect": { "status_in": [200] }
+    }
+  ],
+  "emit": { "url": "{{input_url}}" }
+}"#;
+
+fn write_health_recipe(localappdata: &Path) {
+    let recipes = localappdata.join("RDM").join("resolve").join("recipes");
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(recipes.join("fixture-html@1.json"), HEALTH_RECIPE).unwrap();
+}
+
+fn write_health_index(localappdata: &Path, status: &str, consecutive_failures: u32) {
+    let resolve = localappdata.join("RDM").join("resolve");
+    std::fs::create_dir_all(&resolve).unwrap();
+    let index = json!({
+        "schema": "rdm.recipe-index/v1",
+        "updated_ms": 1_792_345_678_901u64,
+        "entries": {
+            "fixture-html": {
+                "active_version": 1,
+                "updated_ms": 1_792_345_678_901u64,
+                "health": {
+                    "status": status,
+                    "last_ok_ms": null,
+                    "last_failure": null,
+                    "consecutive_failures": consecutive_failures,
+                    "evidence": []
+                }
+            }
+        }
+    });
+    std::fs::write(
+        resolve.join("index.json"),
+        serde_json::to_string_pretty(&index).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_reports_library_method_health() {
+    let mut config = Config::new(8 * 1024);
+    config.content_type = "text/html".to_string();
+    let fixture = TestServer::start(config).await.unwrap();
+    let url = fixture.file_url();
+    let root = temp_root("resolve-health");
+    write_policy(&root, json!({}));
+    let local = localappdata_root(&root);
+    write_health_recipe(&local);
+    write_health_index(&local, "degraded", 2);
+
+    let mut client = Client::start_with_localappdata(&root, &local);
+    client.initialize("2025-06-18");
+    let resolved = client.tool(
+        "rdm_resolve",
+        json!({ "url": url, "mode": "recipe_only", "recipe_id": "fixture-html" }),
+    );
+    assert_tool_ok(&resolved);
+    let data = &structured(&resolved)["data"];
+    assert_eq!(data["status"], "partial", "{resolved}");
+    assert_eq!(data["recipe"]["id"], "fixture-html");
+    assert_eq!(data["recipe"]["state"], "matched");
+    let health = &data["recipe_health"];
+    assert_eq!(health["status"], "degraded", "{resolved}");
+    assert_eq!(health["consecutive_failures"], 2);
+    assert_eq!(health["last_failure"]["kind"], "not_a_file");
+    assert!(health["evidence"].is_array());
+    // No new tool: the field is additive on the existing rdm_resolve data.
+    let tools = client.request("tools/list", json!({}));
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 17);
+
+    assert_eq!(client.close(), 0);
+    std::fs::remove_dir_all(&root).ok();
+    fixture.shutdown().await;
 }

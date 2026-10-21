@@ -85,6 +85,11 @@ pub struct Config {
     pub file_path: String,
     /// Path issuing the redirect.
     pub redirect_path: String,
+    /// When set, every `GET`/`HEAD` request must carry a `Cookie` header whose
+    /// value contains this exact substring (e.g. `"session=abc"`); otherwise the
+    /// server replies `401` with a `text/plain` body `"cookie required"`.
+    /// `None` (the default) keeps the previous behaviour.
+    pub required_cookie: Option<String>,
 }
 
 impl Default for Config {
@@ -106,6 +111,7 @@ impl Default for Config {
             omit_accept_ranges: false,
             file_path: "/file".to_string(),
             redirect_path: "/redirect".to_string(),
+            required_cookie: None,
         }
     }
 }
@@ -177,6 +183,13 @@ impl Config {
         });
         self
     }
+
+    /// Require a cookie: `GET`/`HEAD` requests whose `Cookie` header does not
+    /// contain `value` get `401 text/plain` + body `"cookie required"` (P4a).
+    pub fn with_required_cookie(mut self, value: impl Into<String>) -> Self {
+        self.required_cookie = Some(value.into());
+        self
+    }
 }
 
 /// Snapshot of what the server observed. All counters are cumulative since
@@ -197,6 +210,9 @@ pub struct Stats {
     pub aborted_connections: u64,
     /// Raw `Range` header values in arrival order.
     pub range_headers: Vec<String>,
+    /// Request methods in arrival order (`HEAD`, `GET`, …). Lets tests assert
+    /// an exact request sequence (e.g. "one rangeless GET, no probe").
+    pub methods: Vec<String>,
     /// HTTP version token from each request line (always `HTTP/1.1` for this
     /// fixture; lets tests prove the engine used h1 for chunked transfers).
     pub http_versions: Vec<String>,
@@ -608,6 +624,7 @@ async fn serve(
 ) -> std::io::Result<bool> {
     state.with_stats(|s| {
         s.requests += 1;
+        s.methods.push(request.method.clone());
         s.http_versions.push(request.version.clone());
         match request.method.as_str() {
             "HEAD" => s.head_requests += 1,
@@ -639,6 +656,17 @@ async fn serve(
 
     if request.method != "GET" && request.method != "HEAD" {
         return write_status(writer, 405, "Method Not Allowed", &[], 0).await;
+    }
+
+    // Required-cookie mode (P4a): a GET/HEAD without the configured cookie
+    // substring is rejected before any payload/redirect handling.
+    if let Some(required) = &config.required_cookie {
+        let present = request
+            .header("cookie")
+            .is_some_and(|value| value.contains(required.as_str()));
+        if !present {
+            return write_cookie_required(writer, request.method == "HEAD").await;
+        }
     }
 
     if is_redirect {
@@ -827,6 +855,30 @@ async fn write_404(writer: &mut OwnedWriteHalf) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// `401` used by the P4a required-cookie mode.
+async fn write_cookie_required(
+    writer: &mut OwnedWriteHalf,
+    head_only: bool,
+) -> std::io::Result<bool> {
+    const BODY: &[u8] = b"cookie required";
+    write_head(
+        writer,
+        401,
+        "Unauthorized",
+        &[
+            ("Content-Type", "text/plain".to_string()),
+            ("Content-Length", BODY.len().to_string()),
+            ("Connection", "keep-alive".to_string()),
+        ],
+    )
+    .await?;
+    if !head_only {
+        writer.write_all(BODY).await?;
+        writer.flush().await?;
+    }
+    Ok(true)
+}
+
 async fn write_status(
     writer: &mut OwnedWriteHalf,
     status: u16,
@@ -946,5 +998,73 @@ mod tests {
         // The second block restarts the pattern (content is block-periodic).
         assert_eq!(&a[CONTENT_BLOCK_SIZE..CONTENT_BLOCK_SIZE + 4], &block[..4]);
         assert_eq!(a.len() as u64, size);
+    }
+
+    // ------------------------------------------------------------------
+    // P4a required-cookie mode
+    // ------------------------------------------------------------------
+
+    /// One raw HTTP/1.1 exchange with `Connection: close`.
+    async fn raw_request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect fixture");
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+        if let Some(cookie) = cookie {
+            request.push_str("Cookie: ");
+            request.push_str(cookie);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        stream.flush().await.expect("flush request");
+        let mut response = Vec::new();
+        let _ = timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn required_cookie_rejects_requests_without_it() {
+        let server = TestServer::start(Config::new(16).with_required_cookie("session=abc"))
+            .await
+            .expect("start fixture");
+        let response = raw_request(server.addr(), "GET", "/file", None).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(response.contains("Content-Type: text/plain"), "{response}");
+        assert!(response.contains("cookie required"), "{response}");
+        assert_eq!(server.stats().get_requests, 1);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn required_cookie_allows_matching_cookie_for_get_and_head() {
+        let server = TestServer::start(Config::new(16).with_required_cookie("session=abc"))
+            .await
+            .expect("start fixture");
+
+        let get = raw_request(server.addr(), "GET", "/file", Some("other=1; session=abc")).await;
+        assert!(get.starts_with("HTTP/1.1 200"), "{get}");
+        let head = raw_request(server.addr(), "HEAD", "/file", Some("session=abc")).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("Content-Length: 16"), "{head}");
+        // HEAD must not carry a body after the header terminator.
+        let header_end = head.find("\r\n\r\n").expect("header terminator");
+        assert_eq!(header_end + 4, head.len(), "HEAD must not send a body");
+
+        let stats = server.stats();
+        assert_eq!(stats.get_requests, 1);
+        assert_eq!(stats.head_requests, 1);
+        assert_eq!(stats.responses_200, 2);
+        server.shutdown().await;
     }
 }

@@ -7,8 +7,8 @@
  *        原生宿主可用 → 取消并抹掉浏览器下载 → native messaging 转交 RDM；
  *        宿主不可用/转交失败 → 重新发起浏览器下载（并防止再次拦截形成死循环）；
  *   3. 维护原生宿主 / GUI 在线状态与工具栏徽章；
- *   4. 右键菜单「使用 RDM 下载」；
- *   5. 为 popup / options 提供消息接口。
+ *   4. 右键菜单「使用 RDM 下载」/「用 RDM AI 解析此页」；
+ *   5. 为 popup / options 提供消息接口（含 AI 解析 ai_parse）。
  *
  * 设计约束（Firefox MV3）：
  *   - background 使用 background.scripts（Firefox 不支持 service worker）；
@@ -31,6 +31,11 @@ const {
   buildCookieHeader,
   redactUrl,
   formatBytes,
+  resolveAiIncludeCredentials,
+  buildAiParseRequest,
+  formatAiParseResult,
+  aiParseRecentEntry,
+  normalizeDownloads,
 } = RDMPure;
 
 const HOST_NAME = "com.rdm.download";
@@ -39,10 +44,15 @@ const RECENT_KEY = "rdm.recent";
 const STATUS_KEY = "rdm.status";
 const PING_ALARM = "rdm.status.ping";
 const MENU_ID = "rdm-download-with";
+const AI_MENU_ID = "rdm-ai-parse-page";
 const MAX_RECENT = 20;
 const PING_TIMEOUT_MS = 3000;
+/** popup 每秒轮询一次下载进度；宿主/GUI 正常时应远快于该预算。 */
+const STATUS_TIMEOUT_MS = 3000;
 /** GUI 未被启动时，宿主最多轮询 8 秒，这里留足余量。 */
 const ENQUEUE_TIMEOUT_MS = 16000;
+/** AI 解析同样可能触发 GUI 启动，给与 enqueue 相同的预算。 */
+const AI_PARSE_TIMEOUT_MS = 16000;
 const CACHE_TTL_MS = 90 * 1000;
 const MAX_CACHE_ENTRIES = 80;
 const FALLBACK_GUARD_TTL_MS = 30 * 1000;
@@ -159,16 +169,38 @@ function setStatus(host, gui, detail, hostVersion) {
   }, 250);
 }
 
+/** 「最近转交」允许的状态；未知值按 error 处理（保持旧行为）。 */
+const RECENT_STATES = ["handed", "queued", "fallback", "ai", "error"];
+
+/**
+ * 归一化一条「最近转交」记录。
+ *
+ * 旧版本 storage 里的记录没有 `downloadId` 字段，这里统一补 ""，popup 据此
+ * 静默跳过进度显示（不报错、不显示错误进度条）。
+ */
+function normalizeRecentEntry(raw) {
+  const entry = raw && typeof raw === "object" ? raw : {};
+  return {
+    at: typeof entry.at === "number" && Number.isFinite(entry.at) ? entry.at : 0,
+    fileName: typeof entry.fileName === "string" ? entry.fileName : "",
+    url: typeof entry.url === "string" ? entry.url : "",
+    status: RECENT_STATES.includes(entry.status) ? entry.status : "error",
+    detail: typeof entry.detail === "string" ? entry.detail : "",
+    downloadId: typeof entry.downloadId === "string" ? entry.downloadId : "",
+  };
+}
+
 async function loadRecent() {
   if (recent) return recent;
   const stored = await storageGet(RECENT_KEY);
-  recent = Array.isArray(stored[RECENT_KEY]) ? stored[RECENT_KEY] : [];
+  const list = Array.isArray(stored[RECENT_KEY]) ? stored[RECENT_KEY] : [];
+  recent = list.map(normalizeRecentEntry);
   return recent;
 }
 
 async function pushRecent(entry) {
   const list = (await loadRecent()).slice();
-  list.unshift(Object.assign({ at: Date.now() }, entry));
+  list.unshift(normalizeRecentEntry(Object.assign({ at: Date.now() }, entry)));
   recent = list.slice(0, MAX_RECENT);
   await storageSet({ [RECENT_KEY]: recent });
 }
@@ -319,6 +351,143 @@ async function pingHost() {
     const classified = classifyHostError(message);
     setStatus(classified.host, false, classified.detail);
     return { ok: false, guiRunning: false, error: message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 下载进度（status）
+//
+// 冻结契约（docs/extension-protocol.md §1.3）：
+//   popup → background：{type:"status"}
+//   background → popup（成功）：
+//     {ok:true, guiRunning, active, globalSpeedBps,
+//      downloads:[{id,fileName,state,downloaded,total,speedBps,connections,
+//                  activeConnections,targetConnections,peakConnections}]}
+//   失败/宿主不可用：
+//     {ok:false, guiRunning:false, downloads:[], active:0, globalSpeedBps:0,
+//      error, code}
+//   code：host_outdated（旧宿主不认 status）| timeout | host_unavailable | error。
+//   GUI 未运行不是错误：宿主仍返回 ok + gui_running:false + 空 downloads（无 code）。
+// 所有字段类型防御：坏数据丢弃/回退，绝不把异常抛给 popup。
+// ---------------------------------------------------------------------------
+
+/** status 失败时允许的 code（popup 根据它显示可操作提示）。 */
+const STATUS_FAILURE_CODES = Object.freeze([
+  "host_outdated",
+  "timeout",
+  "host_unavailable",
+  "error",
+]);
+
+/** status 失败时的固定形状（popup 只读取 ok/downloads/code，其余字段保持类型稳定）。 */
+function statusUnavailable(error, code) {
+  return {
+    ok: false,
+    guiRunning: false,
+    downloads: [],
+    active: 0,
+    globalSpeedBps: 0,
+    error: typeof error === "string" && error ? error : "status_unavailable",
+    code: STATUS_FAILURE_CODES.includes(code) ? code : "error",
+  };
+}
+
+/** 原生请求异常 → 失败 code：响应超时 / 宿主不可用（缺失、断开、connectNative 失败）。 */
+function classifyStatusFailure(message) {
+  return /超时|timeout/i.test(String(message || "")) ? "timeout" : "host_unavailable";
+}
+
+/**
+ * 宿主 error 帧 → 失败 code。
+ * 旧版原生宿主不认识 `status`，会回 invalid_request / "unknown message type"；
+ * 这是用户最常见的"看不到进度"原因，必须单独标记为 host_outdated。
+ */
+function classifyStatusErrorFrame(response) {
+  const code = typeof response.code === "string" ? response.code : "";
+  const message = typeof response.message === "string" ? response.message : "";
+  if (code === "invalid_request" || /unknown message type/i.test(message)) return "host_outdated";
+  return "error";
+}
+
+/** 正的有限数值；字符串/NaN/负数一律回退 fallback。 */
+function finitePositiveNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** 宿主 snake_case 下载项 → camelCase（字段校验交给 RDMPure.normalizeDownloads）。 */
+function mapHostDownload(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    id: raw.id,
+    fileName: raw.file_name,
+    state: raw.state,
+    downloaded: raw.downloaded,
+    total: raw.total === undefined ? null : raw.total,
+    speedBps: raw.speed_bps,
+    connections: raw.connections,
+    // 旧宿主 / 旧 GUI 不返回这三个字段 → normalizeDownloads 统一 0 兜底。
+    activeConnections: raw.active_connections,
+    targetConnections: raw.target_connections,
+    peakConnections: raw.peak_connections,
+  };
+}
+
+/** 宿主 status 响应 → popup 契约形状（gui_running:false 仍是成功响应）。 */
+function normalizeStatusResponse(response) {
+  const reply = response && typeof response === "object" ? response : {};
+  const rawDownloads = Array.isArray(reply.downloads) ? reply.downloads : [];
+  const mapped = [];
+  for (const raw of rawDownloads) {
+    const item = mapHostDownload(raw);
+    if (item) mapped.push(item);
+  }
+  return {
+    ok: true,
+    guiRunning: reply.gui_running === true,
+    active: Math.trunc(finitePositiveNumber(reply.active, 0)),
+    globalSpeedBps: finitePositiveNumber(reply.global_speed_bps, 0),
+    downloads: normalizeDownloads(mapped),
+  };
+}
+
+/** 向宿主查询下载进度；响应/超时/断开/坏数据都归一化为结构化结果，不抛错。 */
+async function fetchDownloadStatus() {
+  let response;
+  try {
+    response = await nativeClient.request({ type: "status" }, STATUS_TIMEOUT_MS);
+  } catch (err) {
+    const message = String((err && err.message) || err || "status_error");
+    const classified = classifyHostError(message);
+    return statusUnavailable(
+      classified.detail || message,
+      classifyStatusFailure(message)
+    );
+  }
+  try {
+    if (!response || typeof response !== "object") {
+      return statusUnavailable("status_unexpected_response", "error");
+    }
+    if (response.type === "error") {
+      const code = typeof response.code === "string" ? response.code : "";
+      const message = typeof response.message === "string" ? response.message : "";
+      return statusUnavailable(
+        [code, message].filter(Boolean).join("：") || "status_error",
+        classifyStatusErrorFrame(response)
+      );
+    }
+    if (response.type !== "status") {
+      return statusUnavailable("status_unexpected_response", "error");
+    }
+    if (response.ok === false) {
+      return statusUnavailable(
+        typeof response.error === "string" ? response.error : "status_failed",
+        "error"
+      );
+    }
+    return normalizeStatusResponse(response);
+  } catch (err) {
+    debug("归一化 status 响应失败: " + err);
+    return statusUnavailable("status_invalid_response", "error");
   }
 }
 
@@ -544,9 +713,10 @@ async function buildRequest(options) {
   const url = options.url;
   const cached = options.cached || null;
   const cachedHeaders = (cached && cached.headers) || {};
+  // 不发送 connections：RDM 桌面端「设置 → 下载 → 默认连接数」是唯一权威，
+  // GUI 会把浏览器转交任务的连接数覆盖成自己的设置。
   const request = {
     url,
-    connections: settings.connections,
     source: "firefox",
   };
 
@@ -598,6 +768,235 @@ async function sendHandoff(request, settings) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// AI 解析（ai_parse）
+// ---------------------------------------------------------------------------
+
+/** 当前窗口的活动标签页（拿不到时返回 null，调用方给出可读错误）。 */
+async function getActiveTab() {
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    return Array.isArray(tabs) && tabs.length > 0 ? tabs[0] : null;
+  } catch (err) {
+    debug("读取当前标签页失败: " + err);
+    return null;
+  }
+}
+
+/** referer 只取 webRequest 观察到的 http(s) 值；Cookie 永远不进入日志。 */
+function aiReferer(url) {
+  const cached = lookupRequest(url);
+  return firstHttpUrl([cached && cached.headers && cached.headers["referer"]]);
+}
+
+/** 两个 URL 是否指向同一页面（忽略 fragment；query/端口参与比较）。 */
+function samePageUrl(left, right) {
+  try {
+    const a = new URL(String(left));
+    const b = new URL(String(right));
+    a.hash = "";
+    b.hash = "";
+    return a.href === b.href;
+  } catch (_err) {
+    return false;
+  }
+}
+
+/**
+ * 采集当前标签页的页面链接快照（v0.3，仅随「附带 Cookie 凭证」同意一起采集）。
+ *
+ * 通过 `browser.scripting.executeScript` 在主 frame 内读取 `location.href`、
+ * `document.title` 与 `a[href]` 绝对 URL；不读取 HTML/body/表单/JS 状态。
+ * 任何失败（无权限、页面受限、API 缺失）都返回 null —— 解析本身继续。
+ * 日志只记链接数量，绝不记录链接值/标题。
+ */
+async function collectPageSnapshot(tabId) {
+  if (typeof tabId !== "number" || tabId < 0) return null;
+  try {
+    const results = await browser.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      func: () => ({
+        url: location.href,
+        title: document.title,
+        links: Array.from(document.querySelectorAll("a[href]"))
+          .map((anchor) => anchor.href)
+          .filter((href) => typeof href === "string" && href.length > 0),
+      }),
+    });
+    const first = Array.isArray(results) && results.length > 0 ? results[0] : null;
+    const snapshot = first && typeof first === "object" ? first.result : null;
+    if (!snapshot || typeof snapshot !== "object") return null;
+    const links = Array.isArray(snapshot.links) ? snapshot.links : [];
+    debug("页面链接快照: links=" + links.length);
+    return {
+      url: typeof snapshot.url === "string" ? snapshot.url : "",
+      title: typeof snapshot.title === "string" ? snapshot.title : "",
+      links,
+    };
+  } catch (err) {
+    debug(
+      "采集页面链接快照失败（不阻塞解析）: " +
+        truncate(err && err.message ? err.message : err, 160)
+    );
+    return null;
+  }
+}
+
+/**
+ * 组装 ai_parse 消息：只有用户勾选「附带 Cookie 凭证」时才读取并携带 Cookie，
+ * 并在同一授权下采集页面链接快照。Cookie/快照失败都不阻塞解析。
+ */
+async function buildAiMessage(options) {
+  const settings = options.settings;
+  const url = firstHttpUrl([options.url]);
+  if (!url) return null;
+  const includeCredentials = resolveAiIncludeCredentials(
+    settings,
+    options.includeCredentials
+  );
+  let cookie = "";
+  if (includeCredentials) {
+    try {
+      const cookies = await browser.cookies.getAll({ url });
+      cookie = buildCookieHeader(cookies);
+    } catch (err) {
+      debug("读取 AI 解析 Cookie 失败: " + err);
+    }
+  }
+  let snapshot = null;
+  if (includeCredentials) {
+    try {
+      let tabId = Number.isInteger(options.tabId) ? options.tabId : null;
+      let tabUrl = firstHttpUrl([options.tabUrl]);
+      if (tabId === null) {
+        const tab = await getActiveTab();
+        if (tab && Number.isInteger(tab.id)) {
+          tabId = tab.id;
+          tabUrl = firstHttpUrl([tab.url]);
+        }
+      }
+      // 只采集「同一页面」的快照：标签页 URL 必须与要解析的 URL 一致。
+      if (tabId !== null && (!tabUrl || samePageUrl(tabUrl, url))) {
+        snapshot = await collectPageSnapshot(tabId);
+      }
+    } catch (err) {
+      debug("页面快照初始化失败（不阻塞解析）: " + truncate(err, 160));
+    }
+  }
+  if (snapshot && snapshot.url && !samePageUrl(snapshot.url, url)) {
+    debug("页面快照与目标页面不一致，已忽略");
+    snapshot = null;
+  }
+  return buildAiParseRequest({
+    url,
+    title: options.title,
+    sourcePage: firstHttpUrl([options.sourcePage, url]),
+    includeCredentials,
+    cookie,
+    referer: aiReferer(url),
+    userAgent:
+      typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : "",
+    launchGui: settings.autoStartGui,
+    pageUrl: snapshot ? snapshot.url : "",
+    pageTitle: snapshot ? snapshot.title : "",
+    pageLinks: snapshot ? snapshot.links : [],
+  });
+}
+
+async function sendAiParse(message) {
+  return nativeClient.request(message, AI_PARSE_TIMEOUT_MS);
+}
+
+/**
+ * popup 消息 / 右键菜单共用的 AI 解析入口。
+ * @returns {Promise<{ok: boolean, message: string, code?: string, requestId?: number}>}
+ */
+async function handleAiParseRequest(request) {
+  const settings = await loadSettings();
+  let url = firstHttpUrl([request && request.url]);
+  let title = typeof (request && request.title) === "string" ? request.title : "";
+  if (!url) {
+    const tab = await getActiveTab();
+    if (!tab) {
+      return {
+        ok: false,
+        code: "no_tab",
+        message: "AI 解析未发送：没有可解析的当前标签页",
+      };
+    }
+    url = firstHttpUrl([tab.url]);
+    title = title || (typeof tab.title === "string" ? tab.title : "");
+    if (!url) {
+      return {
+        ok: false,
+        code: "non_http",
+        message: "AI 解析未发送：当前页面不是 http(s) 页面",
+      };
+    }
+  }
+
+  const message = await buildAiMessage({
+    url,
+    title,
+    settings,
+    includeCredentials: request ? request.includeCredentials : undefined,
+    tabId: request ? request.tabId : undefined,
+    tabUrl: request ? request.tabUrl : undefined,
+  });
+  if (!message) {
+    return { ok: false, code: "invalid_url", message: "AI 解析未发送：页面地址无效" };
+  }
+
+  // 只记录脱敏 URL 与是否带凭据；绝不打 Cookie 值。
+  debug(
+    "AI 解析请求: url=" +
+      redactUrl(message.url) +
+      " credentials=" +
+      (message.include_credentials === true)
+  );
+
+  let response;
+  try {
+    response = await sendAiParse(message);
+  } catch (err) {
+    const text = String((err && err.message) || err);
+    const classified = classifyHostError(text);
+    setStatus(classified.host, false, classified.detail);
+    return {
+      ok: false,
+      code: "host_error",
+      message: "AI 解析未发送：" + truncate(classified.detail || text, 160),
+    };
+  }
+
+  const result = formatAiParseResult(response);
+  if (result.ok) {
+    setStatus("ok", true, "");
+    flashBadge("✓");
+  } else {
+    flashBadge("!");
+  }
+  return result;
+}
+
+/** 右键菜单「用 RDM AI 解析此页」：解析当前标签页并写入最近记录。 */
+async function handleContextMenuAiParse(info, tab) {
+  const pageUrl = firstHttpUrl([tab && tab.url]);
+  if (!pageUrl) {
+    flashBadge("!");
+    return;
+  }
+  const pageTitle = tab && typeof tab.title === "string" ? tab.title : "";
+  // 快照采集需要标签页 id（buildAiMessage 用它定位当前页面）。
+  const result = await handleAiParseRequest({
+    url: pageUrl,
+    title: pageTitle,
+    tabId: tab && Number.isInteger(tab.id) ? tab.id : undefined,
+    tabUrl: pageUrl,
+  });
+  await pushRecent(aiParseRecentEntry({ url: pageUrl, title: pageTitle }, result));
+}
+
 function recentEntryFromResponse(request, response) {
   const handed = response.type === "enqueued";
   const queuedDetail = response.credentials_stripped
@@ -607,6 +1006,9 @@ function recentEntryFromResponse(request, response) {
     fileName: request.file_name || fileNameFromUrl(request.url),
     url: redactUrl(request.url),
     status: handed ? "handed" : "queued",
+    // 只有 handed（GUI 在线、已入队）才有 download_id；queued 落盘无 id，用 "" 表示。
+    downloadId:
+      handed && typeof response.download_id === "string" ? response.download_id : "",
     detail: handed
       ? "已交给 RDM" + (response.download_id ? "（" + response.download_id + "）" : "")
       : queuedDetail,
@@ -780,12 +1182,22 @@ async function ensureContextMenu(settings) {
   } catch (_err) {
     /* 不存在 */
   }
+  try {
+    await browser.contextMenus.remove(AI_MENU_ID);
+  } catch (_err) {
+    /* 不存在 */
+  }
   if (!current.contextMenu) return;
   try {
     await browser.contextMenus.create({
       id: MENU_ID,
       title: "使用 RDM 下载",
       contexts: ["link", "image", "audio", "video", "selection"],
+    });
+    await browser.contextMenus.create({
+      id: AI_MENU_ID,
+      title: "用 RDM AI 解析此页",
+      contexts: ["page", "link"],
     });
   } catch (err) {
     debug("创建右键菜单失败: " + err);
@@ -881,6 +1293,10 @@ browser.runtime.onMessage.addListener((message) => {
       return saveSettings(message.settings).then(() => getState());
     case "clearRecent":
       return clearRecent().then(() => getState());
+    case "status":
+      return fetchDownloadStatus();
+    case "aiParse":
+      return handleAiParseRequest(message);
     case "openOptions":
       return browser.runtime.openOptionsPage().then(() => ({ ok: true }));
     default:
@@ -943,7 +1359,14 @@ browser.downloads.onCreated.addListener((item) => {
 });
 
 browser.contextMenus.onClicked.addListener((info, tab) => {
-  if (!info || info.menuItemId !== MENU_ID) return;
+  if (!info || typeof info.menuItemId !== "string") return;
+  if (info.menuItemId === AI_MENU_ID) {
+    handleContextMenuAiParse(info, tab).catch((err) => {
+      debug("右键 AI 解析失败: " + err);
+    });
+    return;
+  }
+  if (info.menuItemId !== MENU_ID) return;
   handleContextMenuClick(info, tab).catch((err) => {
     debug("右键转交失败: " + err);
   });

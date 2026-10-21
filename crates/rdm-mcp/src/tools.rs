@@ -1,4 +1,4 @@
-//! The 16 MCP tool implementations (contract §3.1).
+//! The 17 MCP tool implementations (contract §3.1).
 //!
 //! Every tool returns the same envelope in `structuredContent`:
 //! `{schema_version, ok, task_id, data, error}` and sets `isError` on failure.
@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rdm_agent::{
@@ -16,6 +16,10 @@ use rdm_agent::{
     TaskState, SCHEMA_VERSION,
 };
 use rdm_core::{DownloadRequest, RemoteMeta};
+use rdm_resolve::{
+    Budget as ResolveBudget, RecipeHealth, ResolveErrorKind, ResolveMode, ResolveOutcome,
+    ResolveRequest, ResolverService, RunStatus,
+};
 use serde_json::{json, Map, Value};
 
 use crate::server::ServerState;
@@ -35,11 +39,27 @@ pub struct CallContext {
     pub call_id: Value,
     pub progress_token: Option<Value>,
     pub wait_cancel: Arc<AtomicBool>,
+    /// Tools that must keep their payload in `structuredContent.data` even on
+    /// failure (`rdm_resolve`: contract §3.1 says a failed resolution still
+    /// returns the complete `ResolveOutcome` for diagnostics) stash it here
+    /// before returning the typed error.
+    pub(crate) failure_data: Mutex<Option<Value>>,
 }
 
 impl CallContext {
     pub fn wait_cancelled(&self) -> bool {
         self.wait_cancel.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_failure_data(&self, data: Value) {
+        *self.failure_data.lock().expect("failure data poisoned") = Some(data);
+    }
+
+    fn take_failure_data(&self) -> Option<Value> {
+        self.failure_data
+            .lock()
+            .expect("failure data poisoned")
+            .take()
     }
 
     /// Emit `notifications/progress` (only when the client supplied a token).
@@ -123,7 +143,7 @@ fn structured_success(ok: &ToolOk) -> Value {
     })
 }
 
-fn structured_error(error: &AgentErrorInfo, task_id: Option<&str>) -> Value {
+fn structured_error(error: &AgentErrorInfo, task_id: Option<&str>, data: Option<Value>) -> Value {
     let task_id = task_id
         .map(str::to_owned)
         .or_else(|| {
@@ -144,7 +164,7 @@ fn structured_error(error: &AgentErrorInfo, task_id: Option<&str>) -> Value {
         "schema_version": SCHEMA_VERSION,
         "ok": false,
         "task_id": task_id,
-        "data": null,
+        "data": data,
         "error": error,
     })
 }
@@ -191,6 +211,7 @@ pub async fn call_tool(ctx: &CallContext, name: &str, arguments: &Value) -> Valu
         }
         Err(error) => {
             let error = util::redact_error(error);
+            let failure_data = ctx.take_failure_data();
             ctx.log(
                 "info",
                 &format!(
@@ -199,7 +220,11 @@ pub async fn call_tool(ctx: &CallContext, name: &str, arguments: &Value) -> Valu
                     error.message
                 ),
             );
-            text_result(error_text(&error), structured_error(&error, None), true)
+            text_result(
+                error_text(&error),
+                structured_error(&error, None, failure_data),
+                true,
+            )
         }
     }
 }
@@ -212,6 +237,7 @@ async fn dispatch(
     match name {
         "rdm_capabilities" => capabilities(ctx),
         "rdm_probe" => probe(ctx, args).await,
+        "rdm_resolve" => resolve(ctx, args).await,
         "rdm_download" => download(ctx, args).await,
         "rdm_plan_download" => plan_download(ctx, args).await,
         "rdm_apply_plan" => apply_plan(ctx, args).await,
@@ -537,7 +563,7 @@ async fn finish_task(
 fn capabilities(ctx: &CallContext) -> Result<ToolOk, AgentErrorInfo> {
     let capabilities = capabilities_for(&ctx.server.policy);
     let summary = format!(
-        "RDM {} — 16 tools; {} concurrent tasks; allowed_dirs={}; allow_private_hosts={}",
+        "RDM {} — 17 tools; {} concurrent tasks; allowed_dirs={}; allow_private_hosts={}",
         env!("CARGO_PKG_VERSION"),
         ctx.server.policy.max_concurrent_tasks,
         ctx.server
@@ -602,6 +628,247 @@ async fn probe(ctx: &CallContext, args: &Map<String, Value>) -> Result<ToolOk, A
         meta.http_version.as_deref().unwrap_or("HTTP/?"),
     );
     Ok(ToolOk::new(data, summary))
+}
+
+// ---------------------------------------------------------------------------
+// Link resolution (v1.2, contract §3.1 `rdm_resolve`)
+// ---------------------------------------------------------------------------
+
+/// Map the effective agent policy onto the resolver's network scope.
+///
+/// Mirrors the `rdm resolve` CLI mapping so both entry points enforce the same
+/// host allow-list and the same private/loopback opt-in.
+fn resolver_policy(policy: &rdm_agent::Policy) -> rdm_resolve::ResolvePolicy {
+    rdm_resolve::ResolvePolicy {
+        allowed_hosts: policy.allowed_hosts.clone(),
+        allow_private_hosts: policy.allow_private_hosts,
+        max_redirects: 5,
+    }
+}
+
+async fn resolve(ctx: &CallContext, args: &Map<String, Value>) -> Result<ToolOk, AgentErrorInfo> {
+    let url = util::required_str(args, "url")?;
+    // URL syntax/scheme first: invalid_url, never a policy mask.
+    util::validate_url(&url)?;
+    let goal = util::optional_str(args, "goal")?;
+    if let Some(goal) = &goal {
+        if goal.trim().is_empty() || goal.chars().count() > 512 {
+            return Err(util::invalid_arg("goal", "a string of 1..=512 characters"));
+        }
+    }
+    let mode = match util::optional_str(args, "mode")?.as_deref() {
+        None | Some("auto") => ResolveMode::Auto,
+        Some("recipe_only") => ResolveMode::RecipeOnly,
+        Some("explore") => ResolveMode::Explore,
+        Some(_) => return Err(util::invalid_arg("mode", "one of auto|recipe_only|explore")),
+    };
+    let recipe_id = util::optional_str(args, "recipe_id")?;
+    let max_resources = match util::optional_usize(args, "max_resources")? {
+        Some(value) if !(1..=40).contains(&value) => {
+            return Err(util::invalid_arg("max_resources", "an integer in 1..=40"))
+        }
+        other => other,
+    };
+    let max_llm_calls = match util::optional_usize(args, "max_llm_calls")? {
+        Some(value) if !(1..=32).contains(&value) => {
+            return Err(util::invalid_arg("max_llm_calls", "an integer in 1..=32"))
+        }
+        other => other.map(|value| value as u32),
+    };
+    let budget = resolve_budget(args)?;
+
+    // Recipes live in the RDM state directory (`%LOCALAPPDATA%\RDM\resolve\
+    // recipes` on Windows, i.e. the parent of the default task-store root), the
+    // same root `rdm resolve` uses. `--state-dir` only relocates the task store
+    // and the policy file. Exploration uses the user's `<state_dir>/ai.json`
+    // provider (or `RDM_AI_API_KEY`); the API key never enters a tool result.
+    let state_dir = rdm_ipc::state_dir();
+    let mut resolver =
+        ResolverService::with_state_dir(&state_dir, resolver_policy(&ctx.server.policy))
+            .with_ai_config(rdm_ai::AiConfig::load(&state_dir));
+    let outcome = resolver
+        .resolve(ResolveRequest {
+            url: url.clone(),
+            goal,
+            mode,
+            recipe_id,
+            budget,
+            max_resources,
+            max_llm_calls,
+        })
+        .await;
+    let data = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+    // v1.6 §8.6: additive optional method health for library recipes (the
+    // service records the health side effect inside `resolve()`). Direct-link
+    // and draft/exploration runs omit the field entirely.
+    let data = match library_recipe_health(&resolver, &outcome) {
+        Some(health) => with_recipe_health(data, &health),
+        None => data,
+    };
+    if let Some(error) = resolve_outcome_error(&outcome) {
+        // Contract §3.1: a failed call is isError=true but still carries the
+        // complete ResolveOutcome in structuredContent.data for diagnostics.
+        ctx.set_failure_data(data);
+        return Err(error);
+    }
+    let summary = format!(
+        "resolve {} -> {:?}: {} resource(s), {} step(s), {} request(s)",
+        redact_url(&url),
+        outcome.status,
+        outcome
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.resources.len())
+            .unwrap_or(0),
+        outcome.diagnostics.steps,
+        outcome.diagnostics.http_requests,
+    );
+    Ok(ToolOk::new(data, summary))
+}
+
+/// Optional health of the local method library recipe behind this outcome
+/// (v1.6 §8.6). Only `matched`/`published` recipes that still exist in the
+/// registry report health; direct-link (`recipe = null`) and exploration
+/// drafts (`state = draft`) omit the field.
+fn library_recipe_health(
+    resolver: &ResolverService,
+    outcome: &ResolveOutcome,
+) -> Option<RecipeHealth> {
+    let recipe = outcome.recipe.as_ref()?;
+    if !matches!(recipe.state.as_str(), "matched" | "published") {
+        return None;
+    }
+    resolver.registry().get(&recipe.id, None)?;
+    Some(resolver.registry().health(&recipe.id))
+}
+
+/// Add the optional `recipe_health` field to the serialized `ResolveOutcome`.
+fn with_recipe_health(mut data: Value, health: &RecipeHealth) -> Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert(
+            "recipe_health".to_string(),
+            serde_json::to_value(health).unwrap_or(Value::Null),
+        );
+    }
+    data
+}
+
+/// Parse the optional `budget` object; every field is range-checked against
+/// the documented schema (an out-of-range value is an `invalid_request`).
+fn resolve_budget(args: &Map<String, Value>) -> Result<Option<ResolveBudget>, AgentErrorInfo> {
+    let Some(value) = args.get("budget") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Value::Object(fields) = value else {
+        return Err(util::invalid_arg("budget", "an object"));
+    };
+    for key in fields.keys() {
+        if !["wall_ms", "http_requests", "bytes_read", "redirects"].contains(&key.as_str()) {
+            return Err(util::invalid_request(format!(
+                "unknown parameter `budget.{key}` for rdm_resolve"
+            )));
+        }
+    }
+    Ok(Some(ResolveBudget {
+        wall_ms: util::optional_u64_bounded(fields, "wall_ms", 1_000, 300_000, 60_000)?,
+        http_requests: util::optional_u64_bounded(fields, "http_requests", 1, 64, 24)? as u32,
+        bytes_read: util::optional_u64_bounded(
+            fields,
+            "bytes_read",
+            65_536,
+            33_554_432,
+            4_194_304,
+        )?,
+        redirects: util::optional_u64_bounded(fields, "redirects", 0, 10, 5)? as u32,
+    }))
+}
+
+/// Map a non-success [`ResolveOutcome`] onto the stable agent error taxonomy
+/// (contract §2.3): `invalid_url`/`policy_denied`/`network_error`/`timeout`
+/// keep their codes; everything else is the new `resolve_failed` with
+/// `details.kind`/`details.run_id`/`details.retryable`.
+fn resolve_outcome_error(outcome: &ResolveOutcome) -> Option<AgentErrorInfo> {
+    if matches!(outcome.status, RunStatus::Succeeded | RunStatus::Partial) {
+        return None;
+    }
+    let diagnostics = &outcome.diagnostics;
+    let Some(error) = diagnostics.error.as_ref() else {
+        return Some(
+            AgentErrorInfo::new(
+                ErrorCode::ResolveFailed,
+                format!("resolution ended with status {:?}", outcome.status),
+            )
+            .with_hint("Re-run rdm_resolve to inspect the full ResolveOutcome.")
+            .with_details(json!({
+                "kind": "internal",
+                "retryable": false,
+                "run_id": outcome.run_id,
+                "status": outcome.status,
+            })),
+        );
+    };
+    let code = match error.kind {
+        ResolveErrorKind::InvalidUrl | ResolveErrorKind::UnsupportedScheme => ErrorCode::InvalidUrl,
+        ResolveErrorKind::PolicyDenied => ErrorCode::PolicyDenied,
+        ResolveErrorKind::NetworkError => ErrorCode::NetworkError,
+        ResolveErrorKind::Timeout => ErrorCode::Timeout,
+        _ => ErrorCode::ResolveFailed,
+    };
+    let retryable = error.is_transient();
+    let hint = match error.kind {
+        ResolveErrorKind::RecipeNoMatch => {
+            "No local recipe matched. Install one under <state_dir>/resolve/recipes or pass an \
+             explicit recipe_id; mode=explore needs a configured AI provider."
+        }
+        ResolveErrorKind::RecipeStale => {
+            "The recipe no longer matches the site (structure drift); update the recipe."
+        }
+        ResolveErrorKind::ExploreUnavailable | ResolveErrorKind::ModelUnavailable => {
+            "mode=explore needs a configured AI provider: set enabled=true + api_key in \
+             <state_dir>/ai.json (or RDM_AI_API_KEY); otherwise use mode=auto or recipe_only."
+        }
+        ResolveErrorKind::ModelProtocolError => {
+            "The configured model did not return a valid JsonAction after retrying; check the \
+             provider/model in <state_dir>/ai.json or raise max_llm_calls."
+        }
+        ResolveErrorKind::NoResources => {
+            "Exploration found no verifiable resource; try a more specific goal, a larger budget, \
+             or install a recipe for the site."
+        }
+        ResolveErrorKind::NotAFile | ResolveErrorKind::EmptyBody => {
+            "The URL returned a page/JSON/empty body instead of a file; resolve the share page \
+             with a recipe or probe a direct file URL."
+        }
+        ResolveErrorKind::BudgetExhausted | ResolveErrorKind::RecipeBudgetExceeded => {
+            "Raise the `budget` limits or simplify the input URL."
+        }
+        ResolveErrorKind::PolicyDenied => {
+            "Add the host to policy.json allowed_hosts or set allow_private_hosts=true."
+        }
+        _ => "Inspect structuredContent.data.diagnostics and retry with a narrower budget.",
+    };
+    let message = if diagnostics.summary.trim().is_empty() {
+        error.detail.clone()
+    } else {
+        diagnostics.summary.clone()
+    };
+    let mut info = AgentErrorInfo::new(code, message)
+        .with_hint(hint)
+        .with_details(json!({
+            "kind": error.kind,
+            "retryable": retryable,
+            "run_id": outcome.run_id,
+            "status": outcome.status,
+            "recipe": outcome.recipe,
+            "diagnostics": diagnostics,
+        }));
+    // `resolve_failed` is not retryable by default; transient kinds advertise
+    // it in both `error.retryable` and `details.retryable`.
+    info.retryable = retryable;
+    Some(info)
 }
 
 async fn download(ctx: &CallContext, args: &Map<String, Value>) -> Result<ToolOk, AgentErrorInfo> {

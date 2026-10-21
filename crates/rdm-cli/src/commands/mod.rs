@@ -5,6 +5,8 @@ pub mod capabilities;
 pub mod doctor;
 pub mod download;
 pub mod probe;
+pub mod recipe;
+pub mod resolve;
 pub mod run;
 pub mod schema;
 pub mod selftest;
