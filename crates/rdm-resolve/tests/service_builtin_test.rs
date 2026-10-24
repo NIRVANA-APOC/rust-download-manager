@@ -72,6 +72,36 @@ async fn auto_falls_back_to_builtin_direct_file_verification() {
 }
 
 #[tokio::test]
+async fn auto_builtin_adds_extension_from_verified_content_type() {
+    // Bilibili-style case: the downloadable URL has no usable suffix (signed
+    // query only), so the manifest name must be normalized from Content-Type.
+    let server = MockServer::start(|request| match request.method.as_str() {
+        "HEAD" => Reply::file_head(45_932_387)
+            .header("accept-ranges", "bytes")
+            .header("content-type", "video/mp4"),
+        _ => Reply::file(45_932_387)
+            .header("accept-ranges", "bytes")
+            .header("content-type", "video/mp4"),
+    })
+    .await;
+    let input_url = server.url("/42924311105-1-192");
+
+    let outcome = empty_library_service()
+        .resolve(resolve_request(&input_url))
+        .await;
+
+    assert_eq!(outcome.status, RunStatus::Succeeded);
+    let manifest = outcome.manifest.as_ref().expect("manifest");
+    let item = &manifest.resources[0];
+    assert_eq!(
+        item.name.as_deref(),
+        Some("42924311105-1-192.mp4"),
+        "verified video/mp4 must give the extensionless URL a .mp4 name"
+    );
+    assert_eq!(item.content_type.as_deref(), Some("video/mp4"));
+}
+
+#[tokio::test]
 async fn auto_builtin_html_page_fails_as_not_a_file() {
     let server = MockServer::start(|_| Reply::html("<!doctype html><html>landing</html>")).await;
 

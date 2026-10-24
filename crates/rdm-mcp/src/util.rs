@@ -339,6 +339,19 @@ pub fn build_request(
         // engine normalizes connections/dynamic/chunk and skips the ranged
         // probe; a legacy payload without the field keeps streaming normally.
         request.single_stream = optional_bool(args, "single_stream", false)?;
+        request.prefer_http2 = optional_bool(args, "prefer_http2", false)?;
+        // Mirrors are additional same-content origins. Every URL is validated
+        // here and policy-checked in `check_download_policy`; the engine itself
+        // drops malformed mirrors defensively.
+        if let Some(mirrors) = optional_str_list(args, "mirrors")? {
+            if mirrors.len() > 16 {
+                return Err(invalid_arg("mirrors", "at most 16 mirror URLs"));
+            }
+            for mirror in &mirrors {
+                validate_url(mirror)?;
+            }
+            request.mirrors = mirrors;
+        }
     }
     request.headers = optional_headers(args)?;
     request.cookie = optional_str(args, "cookie")?;
@@ -363,7 +376,7 @@ pub fn check_policy_url(policy: &Policy, url: &str) -> Result<(), AgentErrorInfo
             format!("URL rejected by policy: {reason}"),
             serde_json::json!({
                 "stage": "url",
-                "url": rdm_agent::redact_url(url),
+                "url": rdm_agent::redact_url_userinfo(url),
                 "allowed_hosts": policy.allowed_hosts,
                 "allow_private_hosts": policy.allow_private_hosts,
             }),
@@ -379,6 +392,9 @@ pub fn check_download_policy(
     dest_dir: &Path,
 ) -> Result<(), AgentErrorInfo> {
     check_policy_url(policy, &request.url)?;
+    for mirror in &request.mirrors {
+        check_policy_url(policy, mirror)?;
+    }
     if !policy.check_dest_dir(dest_dir) {
         return Err(policy_denied(
             format!(
@@ -893,6 +909,60 @@ mod tests {
         let error = build_request(&bad, &policy, true).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert!(error.message.contains("single_stream"));
+    }
+
+    #[test]
+    fn build_request_passes_mirrors_through() {
+        let policy = Policy::default();
+        let args = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "mirrors": ["https://mirror.example.net/a.bin", "http://second.example/a.bin"]
+        }))
+        .unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert_eq!(
+            request.mirrors,
+            vec![
+                "https://mirror.example.net/a.bin".to_string(),
+                "http://second.example/a.bin".to_string()
+            ]
+        );
+
+        let bad = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "mirrors": ["ftp://mirror.example.net/a.bin"]
+        }))
+        .unwrap();
+        let error = build_request(&bad, &policy, true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidUrl);
+
+        let too_many: Vec<String> = (0..17)
+            .map(|i| format!("https://m{i}.example/a.bin"))
+            .collect();
+        let bad = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "mirrors": too_many
+        }))
+        .unwrap();
+        let error = build_request(&bad, &policy, true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("mirrors"));
+    }
+
+    #[test]
+    fn build_request_passes_prefer_http2_through() {
+        let policy = Policy::default();
+        let args = args_object(&serde_json::json!({
+            "url": "https://example.com/a.bin",
+            "prefer_http2": true
+        }))
+        .unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert!(request.prefer_http2);
+
+        let args = args_object(&serde_json::json!({"url": "https://example.com/a.bin"})).unwrap();
+        let request = build_request(&args, &policy, true).unwrap();
+        assert!(!request.prefer_http2, "default must be false");
     }
 
     #[test]

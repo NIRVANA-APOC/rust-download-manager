@@ -265,6 +265,17 @@ pub struct DownloadArgs {
     #[arg(long)]
     pub single_stream: bool,
 
+    /// Allow HTTP/2 multiplexing for chunked range requests (for servers that
+    /// cap concurrent TCP connections; default forces h1 for independent
+    /// congestion windows).
+    #[arg(long = "http2")]
+    pub http2: bool,
+
+    /// Additional URL serving the same bytes (mirror). Repeatable; mirrors must
+    /// return the same file and pass the same policy checks as the URL.
+    #[arg(long = "mirror", value_name = "URL")]
+    pub mirror: Vec<String>,
+
     /// Idempotency key: a completed task with this key is reused instead of
     /// downloading again.
     #[arg(long, value_name = "KEY")]

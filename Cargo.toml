@@ -52,6 +52,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }
 
+gpui-component = { version = "=0.5.1" }
+gpui-component-assets = { version = "=0.5.1" }
+rust-embed = { version = "8.7.2", features = ["interpolate-folder-path"] }
+
 # --- GUI ---
 # Zed's GPU-accelerated UI framework. Default features enable Linux-only
 # backends (wayland/x11) and the Windows manifest resource; the Linux backends
@@ -64,3 +68,4 @@ gpui = { version = "0.2.2", default-features = false, features = ["windows-manif
 lto = "thin"
 codegen-units = 4
 strip = "symbols"
+

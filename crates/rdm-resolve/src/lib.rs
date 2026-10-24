@@ -24,7 +24,9 @@ pub mod action;
 pub mod contract;
 pub mod credentials;
 pub mod draft;
+pub mod experience;
 pub mod explore;
+pub mod generalize;
 pub mod health;
 pub mod http;
 pub mod model_draft;
@@ -58,6 +60,14 @@ pub use draft::{
     remove_draft, replay_sample, save_draft, DraftAction, DraftCandidate, GateResult,
     PublishReport, RecipeDraft, SampleReplay, DRAFT_RECIPE_VERSION, DRAFT_SCHEMA, MAX_DRAFT_STEPS,
 };
+pub use experience::{
+    Experience, ExperienceFlow, ExperienceFlowView, ExperienceStore, ExperienceVersion, FlowEmit,
+    FlowStep,
+};
+pub use generalize::{
+    abstract_url, generalize_recipe, migrate_experience_library, GeneralizeReport, MigrationReport,
+    UrlShape,
+};
 pub use health::{is_structural, FailureRef, MethodStatus, RecipeHealth};
 pub use http::{HttpRequestSpec, HttpTool, Observation};
 pub use model_draft::{draft_messages, parse_and_validate, validate_generated, MAX_PROMPT_ACTIONS};
@@ -67,12 +77,13 @@ pub use page_snapshot::{
 };
 pub use policy::{is_private_host, BudgetTracker, ResolvePolicy};
 pub use recipe::{
-    Recipe, RecipeEmit, RecipeError, RecipeLimits, RecipeMatch, RecipeOutput, RecipeRunner,
-    RecipeStep, RecipeTest, RecipeTestResult, StepWhen, Var, DEFAULT_BOUNDED_EACH_MAX,
-    MAX_BOUNDED_EACH_DEPTH, MAX_BOUNDED_EACH_ITEMS, RECIPE_SCHEMA, SUPPORTED_OPS,
+    Recipe, RecipeEmit, RecipeError, RecipeGeneralization, RecipeLimits, RecipeMatch, RecipeOutput,
+    RecipeRunner, RecipeStep, RecipeTest, RecipeTestResult, StepWhen, Var,
+    DEFAULT_BOUNDED_EACH_MAX, MAX_BOUNDED_EACH_DEPTH, MAX_BOUNDED_EACH_ITEMS, RECIPE_SCHEMA,
+    SUPPORTED_OPS,
 };
 pub use registry::{
-    index_path, MatchHit, RecipeIndex, RecipeIndexEntry, RecipeRegistry, INDEX_SCHEMA,
+    index_path, BundleRef, MatchHit, RecipeIndex, RecipeIndexEntry, RecipeRegistry, INDEX_SCHEMA,
 };
 pub use service::ResolverService;
 pub use trace::{

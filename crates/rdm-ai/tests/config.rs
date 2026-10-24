@@ -43,6 +43,8 @@ fn save_load_roundtrip_in_state_dir() {
         model: "some-model".to_owned(),
         api_key: "stored-key".to_owned(),
         timeout_secs: 9,
+        provider: None,
+        ..AiConfig::default()
     };
     config.save(state.path()).unwrap();
     assert!(AiConfig::config_path(state.path()).is_file());
@@ -51,9 +53,56 @@ fn save_load_roundtrip_in_state_dir() {
     // The file is valid JSON with the documented field names.
     let text = std::fs::read_to_string(AiConfig::config_path(state.path())).unwrap();
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    for key in ["enabled", "base_url", "model", "api_key", "timeout_secs"] {
+    for key in [
+        "enabled",
+        "base_url",
+        "model",
+        "api_key",
+        "timeout_secs",
+        "provider",
+        "active_profile",
+        "profiles",
+    ] {
         assert!(value.get(key).is_some(), "missing field {key}: {text}");
     }
+}
+
+#[test]
+fn legacy_ai_json_is_migrated_and_profile_switches_swap_all_three_fields() {
+    let state = TempDir::new("config-profiles");
+    // Old format: flat fields only, no profiles.
+    std::fs::write(
+        AiConfig::config_path(state.path()),
+        r#"{"enabled":true,"base_url":"https://api.openai.com/v1","model":"gpt-4o-mini","api_key":"legacy-openai"}"#,
+    )
+    .unwrap();
+
+    let mut config = AiConfig::load(state.path());
+    assert_eq!(config.active_profile, "openai");
+    assert_eq!(config.base_url, "https://api.openai.com/v1");
+    assert_eq!(config.api_key, "legacy-openai");
+    assert_eq!(config.model, "gpt-4o-mini");
+
+    // Switching writes the flat values back, then loads the target profile.
+    assert!(config.activate_profile("deepseek"));
+    assert_eq!(config.base_url, "https://api.deepseek.com/v1");
+    assert_eq!(config.model, "deepseek-flash");
+    assert_eq!(config.api_key, "");
+    config.api_key = "new-deepseek-key".to_owned();
+    config.sync_active_profile();
+
+    assert!(config.activate_profile("openai"));
+    assert_eq!(config.base_url, "https://api.openai.com/v1");
+    assert_eq!(config.model, "gpt-4o-mini");
+    assert_eq!(config.api_key, "legacy-openai");
+
+    assert!(config.activate_profile("deepseek"));
+    assert_eq!(config.api_key, "new-deepseek-key");
+
+    config.save(state.path()).unwrap();
+    let reloaded = AiConfig::load(state.path());
+    assert_eq!(reloaded, config);
+    assert_eq!(reloaded.profiles.len(), 3);
 }
 
 #[test]

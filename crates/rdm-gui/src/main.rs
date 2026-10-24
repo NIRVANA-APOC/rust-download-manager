@@ -24,17 +24,23 @@
     windows_subsystem = "windows"
 )]
 
+mod agent;
 mod ai_resolve;
 mod app;
 mod cli;
 mod desktop;
 mod engine;
+mod experience_assistant;
 mod ipc_server;
 mod model;
+mod monitor;
 mod open_path;
+mod resolve_session;
 mod spool;
 mod text_input;
 mod theme;
+mod ui;
+mod views;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -48,6 +54,7 @@ use rdm_ipc::{EnqueueItem, Request};
 use tokio::sync::mpsc;
 
 use crate::app::{Bootstrap, CloseDialog, GuiInputs, RdmApp, SettingsTab};
+use crate::cli::UiModeArg;
 use crate::engine::{EngineMsg, EngineRuntime};
 use crate::text_input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
@@ -82,6 +89,8 @@ fn main() {
         println!("{}", cli::USAGE);
         return;
     }
+    let ui_mode = args.resolved_ui();
+    tracing::info!(ui = ?ui_mode, "UI 模式");
     if args.autostart {
         tracing::info!("由开机自启动项启动");
     }
@@ -166,7 +175,7 @@ fn main() {
     if let Some(url) = cli_url.as_deref() {
         match model::validate_url(url) {
             Ok(url) => initial.push(EnqueueItem {
-                download: settings.build_request(url),
+                download: settings.request_with_defaults(url),
                 source: "cli".to_string(),
                 source_page: None,
             }),
@@ -251,145 +260,191 @@ fn main() {
     // 截获的点击/退出事件经这个通道回到 GPUI 主线程（见 run 闭包里的 async loop）。
     let tray_rx = desktop::init_event_channel();
 
-    Application::new().run(move |cx: &mut App| {
-        bind_keys(cx);
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("RDM — Rust Download Manager".into()),
-                ..Default::default()
-            }),
-            window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-            // 静默启动：窗口照常创建（下载/IPC 全部可用），但不显示、不抢焦点；
-            // 用户点托盘图标后由 RdmApp::show_from_tray 显示。
-            focus: !start_silent,
-            show: !start_silent,
-            ..Default::default()
-        };
-
-        let window = match cx.open_window(options, move |window, cx| {
-            let url_input =
-                cx.new(|cx| TextInput::new(cx, "输入或粘贴下载 URL（http/https）", palette));
-            let dir_input =
-                cx.new(|cx| TextInput::new(cx, "例如 C:\\Users\\you\\Downloads", palette));
-            let limit_input = cx.new(|cx| TextInput::new(cx, "例如 2 或 1.5", palette));
-            let connections_input = cx.new(|cx| {
-                TextInput::new(cx, format!("1..={}", rdm_core::MAX_CONNECTIONS), palette)
-            });
-            let ai_base_url =
-                cx.new(|cx| TextInput::new(cx, "例如 https://api.deepseek.com/v1", palette));
-            let ai_model = cx.new(|cx| TextInput::new(cx, "例如 deepseek-flash", palette));
-            let ai_api_key = cx.new(|cx| TextInput::new(cx, "sk-…（仅本机）", palette));
-            let ai_chat_input = cx.new(|cx| TextInput::new(cx, "追问 AI…", palette));
-
-            let inputs = GuiInputs {
-                url: url_input.clone(),
-                dir: dir_input,
-                limit: limit_input,
-                connections: connections_input,
-                ai_base_url,
-                ai_model,
-                ai_api_key,
-                ai_chat: ai_chat_input.clone(),
-            };
-            let window_handle = window.window_handle();
-            let hwnd = desktop::raw_hwnd(window);
-            let app = cx.new(|cx| RdmApp::new(cx, inputs, bootstrap, window_handle, hwnd));
-
-            // 验收/截图钩子（不写用户文档）：`RDM_TEST_OPEN_SETTINGS=1` 时启动后直接
-            // 打开设置弹窗；也可写成 download/classification/ai/appearance/system 定位到
-            // 某个分类，便于逐页截图。与 `RDM_TEST_TRAY_WITHOUT_ICON` 同一约定：只认
-            // 环境变量、不改变 CLI 参数契约，也不写用户设置（隔离 LOCALAPPDATA 下使用）。
-            if let Some(tab) = test_open_settings_tab() {
-                app.update(cx, |app, cx| {
-                    app.open_settings_for_test(window, cx, tab);
-                });
+    Application::new()
+        .with_assets(ui::assets::RdmAssets)
+        .run(move |cx: &mut App| {
+            if ui_mode == UiModeArg::Kit {
+                gpui_component::init(cx);
+                let settings = bootstrap.settings.clone();
+                ui::showcase::open(cx, &settings);
+                cx.on_window_closed(|cx| cx.quit()).detach();
+                return;
             }
+            if ui_mode == UiModeArg::New {
+                // gpui-component 必须先 init：Root/主题/Input/keymap 都依赖其全局状态。
+                gpui_component::init(cx);
+                views::actions::install(cx);
+                open_hub_window(cx, start_silent, bootstrap, tray_rx);
+                return;
+            }
+            bind_keys(cx);
+            let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("RDM — Rust Download Manager".into()),
+                    ..Default::default()
+                }),
+                window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+                // 静默启动：窗口照常创建（下载/IPC 全部可用），但不显示、不抢焦点；
+                // 用户点托盘图标后由 RdmApp::show_from_tray 显示。
+                focus: !start_silent,
+                show: !start_silent,
+                ..Default::default()
+            };
+            let hotkey_enabled = bootstrap.settings.needs_tray();
 
-            // 关闭到托盘由 `desktop` 安装在主窗口上的消息钩子拦截
-            // （见 `desktop::install_window_hook`）：托盘可用且开关打开时，WM_CLOSE
-            // 直接隐藏窗口、不进入 GPUI 的关闭流程；最小化不拦截，正常到任务栏。
+            let window = match cx.open_window(options, move |window, cx| {
+                let url_input =
+                    cx.new(|cx| TextInput::new(cx, "输入或粘贴下载 URL（http/https）", palette));
+                let dir_input =
+                    cx.new(|cx| TextInput::new(cx, "例如 C:\\Users\\you\\Downloads", palette));
+                let limit_input = cx.new(|cx| TextInput::new(cx, "例如 2 或 1.5", palette));
+                let connections_input = cx.new(|cx| {
+                    TextInput::new(cx, format!("1..={}", rdm_core::MAX_CONNECTIONS), palette)
+                });
+                let ai_base_url =
+                    cx.new(|cx| TextInput::new(cx, "例如 https://api.deepseek.com/v1", palette));
+                let ai_model = cx.new(|cx| TextInput::new(cx, "例如 deepseek-flash", palette));
+                let ai_api_key = cx.new(|cx| TextInput::new(cx, "sk-…（仅本机）", palette));
+                let ai_chat_input = cx.new(|cx| TextInput::new(cx, "追问 AI…", palette));
 
-            // 托盘事件 → GPUI 主线程：显示主窗口 / 真正退出。
-            {
-                let mut rx = tray_rx;
-                let weak_app = app.downgrade();
-                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                    while let Some(event) = rx.recv().await {
-                        match event {
-                            desktop::TrayEvent::ShowMain => {
-                                let _ = weak_app.update(cx, |app, cx| app.show_from_tray(cx));
-                            }
-                            desktop::TrayEvent::Quit => {
-                                // 先移除托盘图标再退，避免残留「幽灵图标」。
-                                desktop::shutdown_tray();
-                                let _ = cx.update(|cx| cx.quit());
-                                break;
+                let inputs = GuiInputs {
+                    url: url_input.clone(),
+                    dir: dir_input,
+                    limit: limit_input,
+                    connections: connections_input,
+                    ai_base_url,
+                    ai_model,
+                    ai_api_key,
+                    ai_chat: ai_chat_input.clone(),
+                };
+                let window_handle = window.window_handle();
+                let hwnd = desktop::raw_hwnd(window);
+                // GPUI 无 per-window icon API：把 exe 内嵌的 RDM 图标显式设到窗口，
+                // 否则标题栏左上角/Alt-Tab 会显示系统占位图标或空白（2026-10-22 反馈）。
+                if let Some(raw) = hwnd {
+                    desktop::set_window_icon(raw);
+                }
+                let app = cx.new(|cx| RdmApp::new(cx, inputs, bootstrap, window_handle, hwnd));
+
+                // 验收/截图钩子（不写用户文档）：`RDM_TEST_OPEN_SETTINGS=1` 时启动后直接
+                // 打开设置弹窗；也可写成 download/classification/ai/appearance/system 定位到
+                // 某个分类，便于逐页截图。与 `RDM_TEST_TRAY_WITHOUT_ICON` 同一约定：只认
+                // 环境变量、不改变 CLI 参数契约，也不写用户设置（隔离 LOCALAPPDATA 下使用）。
+                if let Some(tab) = test_open_settings_tab() {
+                    app.update(cx, |app, cx| {
+                        app.open_settings_for_test(window, cx, tab);
+                    });
+                }
+
+                // 关闭到托盘由 `desktop` 安装在主窗口上的消息钩子拦截
+                // （见 `desktop::install_window_hook`）：托盘可用且开关打开时，WM_CLOSE
+                // 直接隐藏窗口、不进入 GPUI 的关闭流程；最小化不拦截，正常到任务栏。
+
+                // 托盘事件 → GPUI 主线程：显示主窗口 / 真正退出。
+                {
+                    let mut rx = tray_rx;
+                    let weak_app = app.downgrade();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                desktop::TrayEvent::ShowMain => {
+                                    let _ = weak_app.update(cx, |app, cx| app.show_from_tray(cx));
+                                }
+                                desktop::TrayEvent::PauseAll => {
+                                    let _ =
+                                        weak_app.update(cx, |app, cx| app.pause_all_from_tray(cx));
+                                }
+                                desktop::TrayEvent::ResumeAll => {
+                                    let _ =
+                                        weak_app.update(cx, |app, cx| app.resume_all_from_tray(cx));
+                                }
+                                desktop::TrayEvent::OpenDownloadFolder => {
+                                    let _ = weak_app.update(cx, |app, cx| {
+                                        app.open_download_folder_from_tray(cx)
+                                    });
+                                }
+                                desktop::TrayEvent::QuickAdd => {
+                                    let _ =
+                                        weak_app.update(cx, |app, cx| app.quick_add_from_tray(cx));
+                                }
+                                desktop::TrayEvent::Quit => {
+                                    // 先移除托盘图标再退，避免残留「幽灵图标」。
+                                    desktop::shutdown_hotkey();
+                                    desktop::shutdown_tray();
+                                    let _ = cx.update(|cx| cx.quit());
+                                    break;
+                                }
                             }
                         }
-                    }
-                })
-                .detach();
-            }
-
-            // 静默启动回退：没有托盘就没有恢复入口，直接显示窗口并提示。
-            if start_silent && !desktop::is_tray_alive() {
-                if let Some(raw) = hwnd {
-                    desktop::show_window(raw);
+                    })
+                    .detach();
                 }
-                window.activate_window();
-                cx.activate(true);
-                app.update(cx, |app, cx| {
-                    app.set_toast("托盘不可用，已回退为显示主窗口", true);
-                    cx.notify();
+
+                // 静默启动回退：没有托盘就没有恢复入口，直接显示窗口并提示。
+                if start_silent && !desktop::is_tray_alive() {
+                    if let Some(raw) = hwnd {
+                        desktop::show_window(raw);
+                    }
+                    window.activate_window();
+                    cx.activate(true);
+                    app.update(cx, |app, cx| {
+                        app.set_toast("托盘不可用，已回退为显示主窗口", true);
+                        cx.notify();
+                    });
+                }
+
+                // URL 输入框 Enter = 添加。Entity 引用通过弱句柄回传，避免循环强引用。
+                let weak_app = app.downgrade();
+                url_input.update(cx, |input, _cx| {
+                    input.on_submit = Some(Rc::new(move |window, cx| {
+                        weak_app
+                            .update(cx, |app, cx| app.add_from_input(window, cx))
+                            .ok();
+                    }));
                 });
+
+                // AI 栏聊天输入框 Enter = 发送（上下文含解析摘要）。
+                let weak_app_chat = app.downgrade();
+                ai_chat_input.update(cx, |input, _cx| {
+                    input.on_submit = Some(Rc::new(move |_window, cx| {
+                        weak_app_chat
+                            .update(cx, |app, cx| app.send_ai_chat(cx))
+                            .ok();
+                    }));
+                });
+
+                let focus = url_input.read(cx).focus_handle(cx);
+                window.focus(&focus);
+                app
+            }) {
+                Ok(window) => window,
+                Err(err) => {
+                    eprintln!("rdm-gui: 打开窗口失败: {err}");
+                    desktop::shutdown_tray();
+                    ipc_server::cleanup_info_file();
+                    std::process::exit(1);
+                }
+            };
+            let _ = window;
+            // 全局热键（Ctrl+Shift+D 快速添加）：仅在后台上运行（关闭到托盘/静默启动）时注册。
+            if hotkey_enabled {
+                if let Err(err) = desktop::install_hotkey() {
+                    tracing::warn!(error = %err, "全局热键不可用");
+                }
             }
-
-            // URL 输入框 Enter = 添加。Entity 引用通过弱句柄回传，避免循环强引用。
-            let weak_app = app.downgrade();
-            url_input.update(cx, |input, _cx| {
-                input.on_submit = Some(Rc::new(move |window, cx| {
-                    weak_app
-                        .update(cx, |app, cx| app.add_from_input(window, cx))
-                        .ok();
-                }));
-            });
-
-            // AI 栏聊天输入框 Enter = 发送（上下文含解析摘要）。
-            let weak_app_chat = app.downgrade();
-            ai_chat_input.update(cx, |input, _cx| {
-                input.on_submit = Some(Rc::new(move |_window, cx| {
-                    weak_app_chat
-                        .update(cx, |app, cx| app.send_ai_chat(cx))
-                        .ok();
-                }));
-            });
-
-            let focus = url_input.read(cx).focus_handle(cx);
-            window.focus(&focus);
-            app
-        }) {
-            Ok(window) => window,
-            Err(err) => {
-                eprintln!("rdm-gui: 打开窗口失败: {err}");
+            cx.on_window_closed(|cx| {
+                // 正常退出路径（未开启「关闭到托盘」）：先把托盘图标摘掉。
+                desktop::shutdown_hotkey();
                 desktop::shutdown_tray();
-                ipc_server::cleanup_info_file();
-                std::process::exit(1);
+                cx.quit();
+            })
+            .detach();
+            if !start_silent {
+                cx.activate(true);
             }
-        };
-        let _ = window;
-
-        cx.on_window_closed(|cx| {
-            // 正常退出路径（未开启「关闭到托盘」）：先把托盘图标摘掉。
-            desktop::shutdown_tray();
-            cx.quit();
-        })
-        .detach();
-        if !start_silent {
-            cx.activate(true);
-        }
-    });
+        });
 
     // ---- 6. 清理 ----------------------------------------------------------
     desktop::shutdown_tray();
@@ -398,6 +453,125 @@ fn main() {
     tracing::info!("RDM GUI 退出");
 }
 
+/// 新版 UI（下载中枢）窗口：`gpui_component::Root` 作为窗口根视图，
+/// 提供统一的 dialog/sheet/notification 浮层与焦点恢复。
+fn open_hub_window(
+    cx: &mut App,
+    start_silent: bool,
+    bootstrap: Bootstrap,
+    tray_rx: tokio::sync::mpsc::UnboundedReceiver<desktop::TrayEvent>,
+) {
+    let bounds = Bounds::centered(None, size(px(1280.0), px(760.0)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("RDM".into()),
+            ..Default::default()
+        }),
+        window_min_size: Some(size(px(960.0), px(600.0))),
+        focus: !start_silent,
+        show: !start_silent,
+        ..Default::default()
+    };
+    let hotkey_enabled = bootstrap.settings.needs_tray();
+    let window = match cx.open_window(options, move |window, cx| {
+        let hwnd = desktop::raw_hwnd(window);
+        // GPUI 无 per-window icon API：把 exe 内嵌的 RDM 图标显式设到窗口，
+        // 否则标题栏左上角/Alt-Tab 会显示系统占位图标或空白（2026-10-22 反馈）。
+        if let Some(raw) = hwnd {
+            desktop::set_window_icon(raw);
+        }
+        let app = cx.new(|cx| views::app::RdmApp::new(cx, window, bootstrap, hwnd));
+
+        // 验收钩子：RDM_TEST_OPEN_SETTINGS 打开设置页（新 UI 全屏设置）。
+        if let Some(tab) = test_open_settings_tab() {
+            app.update(cx, |app, cx| {
+                app.open_settings_for_test(settings_section_for_tab(tab), cx)
+            });
+        }
+        // 开发/截图钩子：RDM_TEST_UI_STATE=demo 注入示例任务（仅隔离状态目录使用）。
+        if std::env::var("RDM_TEST_UI_STATE")
+            .map(|value| value.eq_ignore_ascii_case("demo"))
+            .unwrap_or(false)
+        {
+            app.update(cx, |app, cx| app.seed_demo_state(cx));
+        }
+
+        // 托盘事件 → 新 UI 主窗口（显示 / 退出）。
+        {
+            let mut rx = tray_rx;
+            let weak = app.downgrade();
+            cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        desktop::TrayEvent::ShowMain => {
+                            let _ = weak.update(cx, |app, cx| app.show_from_tray(cx));
+                        }
+                        desktop::TrayEvent::PauseAll => {
+                            let _ = weak.update(cx, |app, cx| app.pause_all(cx));
+                        }
+                        desktop::TrayEvent::ResumeAll => {
+                            let _ = weak.update(cx, |app, cx| app.resume_all(cx));
+                        }
+                        desktop::TrayEvent::OpenDownloadFolder => {
+                            let _ = weak.update(cx, |app, cx| app.open_download_folder(cx));
+                        }
+                        desktop::TrayEvent::QuickAdd => {
+                            let _ = weak.update(cx, |app, cx| app.quick_add_from_hotkey(cx));
+                        }
+                        desktop::TrayEvent::Quit => {
+                            desktop::shutdown_hotkey();
+                            desktop::shutdown_tray();
+                            let _ = cx.update(|cx| cx.quit());
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+
+        // 静默启动回退：没有托盘就没有恢复入口，直接显示窗口并提示。
+        if start_silent && !desktop::is_tray_alive() {
+            if let Some(raw) = hwnd {
+                desktop::show_window(raw);
+            }
+            window.activate_window();
+            cx.activate(true);
+            app.update(cx, |app, cx| {
+                app.startup_notice("托盘不可用，已回退为显示主窗口", true, cx);
+            });
+        } else if !start_silent {
+            app.update(cx, |app, cx| app.focus_omnibox(window, cx));
+        }
+
+        cx.new(|cx| gpui_component::Root::new(app, window, cx))
+    }) {
+        Ok(window) => window,
+        Err(err) => {
+            eprintln!("rdm-gui: 打开窗口失败: {err}");
+            desktop::shutdown_tray();
+            ipc_server::cleanup_info_file();
+            std::process::exit(1);
+        }
+    };
+    let _ = window;
+    // 全局热键（Ctrl+Shift+D 快速添加）：仅在后台上运行（关闭到托盘/静默启动）时注册，
+    // 避免在没有托盘驻留需求时抢走浏览器等应用的 Ctrl+Shift+D。
+    if hotkey_enabled {
+        if let Err(err) = desktop::install_hotkey() {
+            tracing::warn!(error = %err, "全局热键不可用");
+        }
+    }
+    cx.on_window_closed(|cx| {
+        desktop::shutdown_tray();
+        cx.quit();
+    })
+    .detach();
+    if !start_silent {
+        cx.activate(true);
+    }
+}
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, None),
@@ -484,4 +658,20 @@ fn test_open_settings_tab() -> Option<Option<SettingsTab>> {
         _ => None,
     };
     Some(tab)
+}
+
+/// 把旧版设置弹窗的 tab 映射到新设置页分类（仅用于 `RDM_TEST_OPEN_SETTINGS` 截图钩子）。
+fn settings_section_for_tab(
+    tab: Option<SettingsTab>,
+) -> Option<crate::views::settings::SettingsSection> {
+    use crate::views::settings::SettingsSection;
+    match tab {
+        Some(SettingsTab::Download) => Some(SettingsSection::General),
+        Some(SettingsTab::Classification) => Some(SettingsSection::Storage),
+        Some(SettingsTab::Ai) => Some(SettingsSection::Ai),
+        Some(SettingsTab::Appearance) => Some(SettingsSection::Appearance),
+        // 「系统」类（自启动/托盘/静默）在新 IA 里并入了「通用」。
+        Some(SettingsTab::System) => Some(SettingsSection::General),
+        None => None,
+    }
 }

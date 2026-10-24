@@ -54,6 +54,26 @@ pub struct Recipe {
     pub emit: RecipeEmit,
     #[serde(default)]
     pub tests: Vec<RecipeTest>,
+    /// Reusability diagnostics written by [`crate::generalize`] (design 18
+    /// §2.1). Additive and optional: older files simply have no value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generalization: Option<RecipeGeneralization>,
+}
+
+/// How a recipe was abstracted into a reusable template (design 18 §2.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecipeGeneralization {
+    /// `www.bilibili.com/video` (UI display / same-class grouping key).
+    pub scope: String,
+    /// Abstracted variable names (mirrors [`Recipe::captures`]).
+    pub captures: Vec<String>,
+    /// Internal parameters still hardcoded in the steps (short names such as
+    /// `cid`; never URLs or credentials).
+    pub leftover_hardcoded: Vec<String>,
+    /// `true` = at least one variable was abstracted, so the recipe replays on
+    /// same-class URLs; `false` = exact path only.
+    pub reusable: bool,
 }
 
 /// Applicability: host list plus an optional URL regex.

@@ -280,6 +280,7 @@ mod tests {
             notes: vec!["需要 Referer".to_owned()],
             ai_used: true,
             model: Some("gpt-4o-mini".to_owned()),
+            usage: crate::usage::TokenUsage::default(),
             created_ms,
             cache_hit: false,
             failure_kind: None,

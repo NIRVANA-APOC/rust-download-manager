@@ -484,12 +484,12 @@ test("formatAiParseResult: accepted / error / 未知响应", () => {
     {
       ok: true,
       requestId: 12,
-      message: "已发送到 RDM（#12），解析结果在桌面端 AI 栏查看",
+      message: "已发送到 RDM（#12），解析结果在桌面端打开",
     }
   );
   assert.equal(
     pure.formatAiParseResult({ type: "ai_parse_accepted", ok: true }).message,
-    "已发送到 RDM，解析结果在桌面端 AI 栏查看"
+    "已发送到 RDM，解析结果在桌面端打开"
   );
 
   const unavailable = pure.formatAiParseResult({
@@ -849,4 +849,480 @@ test("pickActiveDownloads: 只保留 downloading/paused，最多 3 条并给出�
   assert.equal(exact.visible.length, 3);
   assert.equal(exact.overflow, 0);
   assert.equal(exact.total, 3);
+});
+
+// ---------------------------------------------------------------------------
+// M4 popup / options 语义层
+// ---------------------------------------------------------------------------
+
+test("isFileLinkUrl / classifyTabContext: 文件链接、普通页面、选中链接与非 http", () => {
+  assert.equal(pure.isFileLinkUrl("https://example.com/download/file.iso"), true);
+  assert.equal(pure.isFileLinkUrl("https://example.com/page?x=1"), false);
+  assert.equal(pure.isFileLinkUrl("https://example.com/file.iso?token=1"), true);
+
+  const file = pure.classifyTabContext({
+    url: "https://example.com/a.iso",
+    title: "下载 a.iso",
+    fileName: "a.iso",
+    sizeBytes: 2048,
+  });
+  assert.equal(file.kind, "file");
+  assert.equal(file.host, "example.com");
+  assert.equal(file.sizeBytes, 2048);
+
+  // Content-Disposition 给出的已知扩展名也算文件链接。
+  const fromHeader = pure.classifyTabContext({
+    url: "https://example.com/download?id=7",
+    fileName: "big.zip",
+  });
+  assert.equal(fromHeader.kind, "file");
+
+  assert.equal(
+    pure.classifyTabContext({ url: "https://example.com/article", title: "文章" }).kind,
+    "page"
+  );
+  assert.equal(
+    pure.classifyTabContext({
+      url: "https://example.com/article",
+      selectedUrls: ["https://cdn.example.com/a.iso"],
+    }).kind,
+    "selection"
+  );
+  assert.equal(
+    pure.classifyTabContext({
+      url: "https://example.com/article",
+      selectedUrls: ["https://a.example.com/1", "https://b.example.com/2"],
+    }).kind,
+    "selection-multi"
+  );
+  assert.equal(pure.classifyTabContext({ url: "about:addons" }).kind, "unsupported");
+  assert.equal(pure.classifyTabContext({ url: "file:///C:/a.iso" }).kind, "unsupported");
+});
+
+test("parseUrlsFromText: 提取/去重/去尾部中文标点/限量", () => {
+  const text =
+    "先看 https://example.com/a.iso，再看 https://example.com/b.zip。 重复 https://example.com/a.iso";
+  assert.deepEqual(pure.parseUrlsFromText(text), [
+    "https://example.com/a.iso",
+    "https://example.com/b.zip",
+  ]);
+  assert.deepEqual(pure.parseUrlsFromText("没有链接"), []);
+  assert.deepEqual(
+    pure.parseUrlsFromText("https://a.example/1 https://a.example/2 https://a.example/3", 2),
+    ["https://a.example/1", "https://a.example/2"]
+  );
+  assert.deepEqual(pure.parseUrlsFromText("ftp://example.com/x"), []);
+});
+
+test("choosePrimaryAction: 按上下文/连接状态给出唯一主按钮", () => {
+  const settings = pure.normalizeSettings({});
+  const statusOk = { host: "ok", gui: true };
+  const fileTab = { url: "https://example.com/a.iso", fileName: "a.iso" };
+  const pageTab = { url: "https://example.com/article", title: "文章" };
+
+  assert.deepEqual(
+    pure.choosePrimaryAction({ settings, status: statusOk, tabContext: fileTab }),
+    { kind: "download-file", label: "用 RDM 下载此文件", disabled: false, forceLaunch: false }
+  );
+  assert.deepEqual(
+    pure.choosePrimaryAction({ settings, status: statusOk, tabContext: pageTab }),
+    { kind: "parse-page", label: "解析本页资源", disabled: false, forceLaunch: false }
+  );
+  assert.equal(
+    pure.choosePrimaryAction({
+      settings,
+      status: statusOk,
+      tabContext: { url: "https://example.com/article", selectedUrls: ["https://a.example/1"] },
+    }).label,
+    "用 RDM 下载选中的链接"
+  );
+  assert.equal(
+    pure.choosePrimaryAction({
+      settings,
+      status: statusOk,
+      tabContext: { url: "https://example.com/article", selectedUrls: ["https://a.example/1", "https://a.example/2"] },
+    }).label,
+    "下载选中的 2 个链接"
+  );
+
+  // 宿主/GUI/开关异常优先于页面上下文。
+  assert.equal(
+    pure.choosePrimaryAction({ settings, status: { host: "missing" }, tabContext: fileTab }).label,
+    "安装浏览器接管"
+  );
+  assert.equal(
+    pure.choosePrimaryAction({ settings, status: { host: "error" }, tabContext: fileTab }).label,
+    "重新检测"
+  );
+  assert.equal(
+    pure.choosePrimaryAction({
+      settings: pure.normalizeSettings({ enabled: false }),
+      status: statusOk,
+      tabContext: fileTab,
+    }).label,
+    "开启下载接管"
+  );
+  assert.equal(
+    pure.choosePrimaryAction({ settings, status: { host: "unknown" }, tabContext: fileTab })
+      .disabled,
+    true
+  );
+  assert.equal(
+    pure.choosePrimaryAction({ settings, status: statusOk, tabContext: { url: "about:addons" } })
+      .label,
+    "当前页面不支持"
+  );
+
+  // 自动启动关闭 + GUI 未运行：主按钮显式承诺「启动 RDM 并...」。
+  const noAutoStart = pure.normalizeSettings({ autoStartGui: false });
+  const wakeFile = pure.choosePrimaryAction({
+    settings: noAutoStart,
+    status: { host: "ok", gui: false },
+    tabContext: fileTab,
+  });
+  assert.equal(wakeFile.label, "启动 RDM 并下载此文件");
+  assert.equal(wakeFile.forceLaunch, true);
+  assert.equal(
+    pure.choosePrimaryAction({
+      settings: noAutoStart,
+      status: { host: "ok", gui: false },
+      tabContext: pageTab,
+    }).label,
+    "启动 RDM 并解析本页资源"
+  );
+});
+
+test("formatTabSubtitle: 文件/页面/选中/不支持", () => {
+  assert.equal(
+    pure.formatTabSubtitle({
+      url: "https://example.com/a.iso",
+      fileName: "a.iso",
+      sizeBytes: 2 * 1024 * 1024,
+    }),
+    "a.iso · 2.0 MiB · example.com"
+  );
+  assert.equal(
+    pure.formatTabSubtitle({ url: "https://example.com/article", title: "一篇文章" }),
+    "一篇文章 · example.com"
+  );
+  assert.equal(
+    pure.formatTabSubtitle({
+      url: "https://example.com/article",
+      selectedUrls: ["https://a.example/1", "https://b.example/2"],
+    }),
+    "2 个选中的链接 · example.com"
+  );
+  assert.equal(pure.formatTabSubtitle({ url: "about:addons" }), "仅支持 http(s) 页面");
+});
+
+test("describeBanner / readyStateLabel: 仅异常出现状态条，正常只有「已就绪」", () => {
+  const settings = pure.normalizeSettings({});
+  assert.equal(pure.describeBanner({ settings, status: { host: "ok", gui: true } }), null);
+  assert.deepEqual(pure.readyStateLabel({ settings, status: { host: "ok", gui: true } }), {
+    text: "已就绪",
+    tone: "ok",
+  });
+
+  assert.deepEqual(pure.describeBanner({ settings, status: { host: "missing" } }), {
+    kind: "danger",
+    text: "浏览器接管尚未安装，无法接收下载",
+    action: { id: "copy-install-command", label: "复制安装命令" },
+  });
+  assert.deepEqual(pure.describeBanner({ settings, status: { host: "error" } }), {
+    kind: "danger",
+    text: "无法连接本机 RDM，请重试",
+    action: { id: "retry-detect", label: "重新检测" },
+  });
+  assert.deepEqual(pure.describeBanner({ settings, status: { host: "ok", gui: false } }), {
+    kind: "warn",
+    text: "RDM 未运行，下载会先排队",
+    action: { id: "start-gui", label: "启动 RDM" },
+  });
+  assert.equal(
+    pure.describeBanner({
+      settings: pure.normalizeSettings({ enabled: false }),
+      status: { host: "ok", gui: true },
+    }).kind,
+    "info"
+  );
+  assert.equal(pure.readyStateLabel({ settings, status: { host: "ok", gui: false } }).text, "未运行");
+  assert.equal(
+    pure.readyStateLabel({
+      settings: pure.normalizeSettings({ enabled: false }),
+      status: { host: "ok", gui: true },
+    }).text,
+    "已关闭"
+  );
+});
+
+test("buildRecentItems: 最多 5 条、倒序、状态词符合契约", () => {
+  const now = Date.now();
+  const list = [
+    { at: now - 120000, fileName: "a.iso", status: "handed" },
+    { at: now - 1000, fileName: "b.iso", status: "queued" },
+    { at: now - 90000, fileName: "c.iso", status: "ai" },
+    { at: now - 5000, fileName: "d.iso", status: "duplicate" },
+    { at: now - 12000, fileName: "e.iso", status: "fallback" },
+    { at: now - 4000, fileName: "f.iso", status: "error" },
+    { at: now - 3000, fileName: "g.iso", status: "unknown-status" },
+  ];
+  const items = pure.buildRecentItems(list, { now, limit: 5 });
+  assert.equal(items.length, 5);
+  assert.deepEqual(
+    items.map((item) => item.name),
+    ["b.iso", "g.iso", "f.iso", "d.iso", "e.iso"]
+  );
+  const byName = Object.fromEntries(items.map((item) => [item.name, item]));
+  assert.equal(byName["b.iso"].statusLabel, "已排队");
+  assert.equal(byName["g.iso"].statusLabel, "失败", "未知状态按失败处理");
+  assert.equal(byName["d.iso"].statusLabel, "已在 RDM 中");
+  assert.equal(byName["e.iso"].statusLabel, "失败", "不再出现「已回退」实现词");
+  assert.equal(byName["d.iso"].type, "download");
+  assert.equal(items.find((item) => item.name === "b.iso").ageText, "刚刚");
+
+  const parsed = pure.buildRecentItems([{ at: now, fileName: "x", status: "ai" }], { now });
+  assert.equal(parsed[0].type, "parse");
+  assert.equal(parsed[0].statusLabel, "已解析");
+  assert.deepEqual(pure.buildRecentItems(null), []);
+});
+
+test("popupActiveRow / formatActiveHeadline / summarizeActivity", () => {
+  const downloading = {
+    state: "downloading",
+    downloaded: 50,
+    total: 100,
+    speedBps: 1024,
+  };
+  assert.deepEqual(pure.popupActiveRow(downloading), {
+    state: "downloading",
+    stateLabel: "下载中",
+    percent: 50,
+    indeterminate: false,
+    detail: "50% · 1.0 KiB/s",
+  });
+  const unknown = pure.popupActiveRow({ state: "downloading", downloaded: 2048, total: null, speedBps: 0 });
+  assert.equal(unknown.indeterminate, true);
+  assert.equal(unknown.detail, "已下载 2.0 KiB");
+  const paused = pure.popupActiveRow({ state: "paused", downloaded: 30, total: 100 });
+  assert.equal(paused.stateLabel, "已暂停");
+  assert.equal(paused.detail, "已暂停 · 30%");
+  assert.equal(pure.popupActiveRow({ state: "completed" }), null);
+
+  const headline = pure.formatActiveHeadline(
+    [
+      { id: "1", state: "downloading", speedBps: 1024 },
+      { id: "2", state: "paused" },
+      { id: "3", state: "downloading" },
+      { id: "4", state: "downloading" },
+    ],
+    4096
+  );
+  assert.equal(headline.total, 4);
+  assert.equal(headline.title, "正在下载 4");
+  assert.equal(headline.speedText, "总速度 4.0 KiB/s");
+  assert.equal(headline.overflowText, "还有 1 个 · 打开 RDM");
+
+  assert.deepEqual(
+    pure.summarizeActivity([
+      { id: "1", state: "downloading", speedBps: 100 },
+      { id: "2", state: "paused" },
+      { id: "3", state: "failed" },
+      { id: "4", state: "completed" },
+    ]),
+    { downloading: 1, paused: 1, failed: 1, active: 2, speedBps: 100 }
+  );
+});
+
+test("computeBadge: 关闭/未安装/未运行/暂停/失败/下载中/空闲", () => {
+  const settings = pure.normalizeSettings({});
+  const statusOk = { host: "ok", gui: true };
+  const idle = { downloading: 0, paused: 0, failed: 0, active: 0, speedBps: 0 };
+  assert.deepEqual(pure.computeBadge({ settings, status: statusOk, activity: idle }), {
+    text: "",
+    color: null,
+    title: "RDM：已就绪",
+    tone: "ok",
+  });
+  assert.equal(
+    pure.computeBadge({
+      settings: pure.normalizeSettings({ enabled: false }),
+      status: statusOk,
+      activity: idle,
+    }).text,
+    "off"
+  );
+  assert.equal(pure.computeBadge({ settings, status: { host: "missing" }, activity: idle }).text, "!");
+  assert.equal(pure.computeBadge({ settings, status: { host: "error" }, activity: idle }).text, "!");
+  assert.equal(
+    pure.computeBadge({ settings, status: { host: "ok", gui: false }, activity: idle }).text,
+    "Q"
+  );
+
+  const downloading = { downloading: 2, paused: 0, failed: 0, active: 2, speedBps: 1048576 };
+  const badge = pure.computeBadge({ settings, status: statusOk, activity: downloading });
+  assert.equal(badge.text, "2");
+  assert.equal(badge.tone, "accent");
+  assert.match(badge.title, /2 个下载中/);
+  assert.match(badge.title, /1\.0 MiB\/s/);
+
+  const paused = pure.computeBadge({
+    settings,
+    status: statusOk,
+    activity: { downloading: 1, paused: 2, failed: 0, active: 3, speedBps: 0 },
+  });
+  assert.equal(paused.text, "3");
+  assert.equal(paused.tone, "warn");
+  assert.match(paused.title, /3 个下载（2 个暂停）/);
+
+  const failed = pure.computeBadge({
+    settings,
+    status: statusOk,
+    activity: { downloading: 0, paused: 0, failed: 1, active: 0, speedBps: 0 },
+  });
+  assert.equal(failed.text, "1!");
+  assert.equal(failed.tone, "danger");
+  assert.equal(pure.badgeCountText(12), "9+");
+});
+
+test("describeActivityFailure / formatHandoffResult: 错误码 → 人话 + 下一步", () => {
+  assert.match(pure.describeActivityFailure({ code: "host_outdated" }), /版本过旧/);
+  assert.match(pure.describeActivityFailure({ code: "timeout" }), /正在重试/);
+  assert.match(pure.describeActivityFailure({ code: "error" }), /读取下载状态失败/);
+
+  assert.deepEqual(pure.formatHandoffResult({ ok: true }), {
+    ok: true,
+    tone: "ok",
+    text: "已交给 RDM",
+  });
+  assert.equal(pure.formatHandoffResult({ ok: true, duplicate: true }).text, "该下载已在 RDM 中");
+  assert.equal(pure.formatHandoffResult({ ok: true, queued: true }).text, "已排队，启动 RDM 后自动开始");
+  assert.equal(
+    pure.formatHandoffResult({ ok: false, code: "duplicate" }).text,
+    "该下载已在 RDM 中"
+  );
+  assert.equal(
+    pure.formatHandoffResult({ ok: false, code: "unauthorized" }).text,
+    "无法连接本机 RDM（认证失败）"
+  );
+  assert.equal(
+    pure.formatHandoffResult({ ok: false, code: "invalid_request" }).text,
+    "这个链接无法交给 RDM 下载"
+  );
+  assert.equal(
+    pure.formatHandoffResult({ ok: false, code: "timeout" }).text,
+    "无法连接本机 RDM，请重试"
+  );
+  assert.equal(pure.formatHandoffResult({ ok: false, code: "weird" }).text, "转交失败，请重试");
+});
+
+test("formatConnectionResult / formatDiagnosticText: 人话结果且不含敏感 URL", () => {
+  const connected = pure.formatConnectionResult({
+    status: { host: "ok", gui: true, hostVersion: "0.2.0", checkedAt: Date.now() },
+    latencyMs: 42,
+  });
+  assert.equal(connected.ok, true);
+  assert.equal(connected.tone, "ok");
+  assert.match(connected.headline, /原生宿主已连接（v0\.2\.0） · RDM 运行中/);
+  assert.match(connected.detail, /42 ms/);
+
+  const guiOff = pure.formatConnectionResult({ status: { host: "ok", gui: false } });
+  assert.equal(guiOff.tone, "warn");
+  assert.match(guiOff.headline, /RDM 未运行/);
+
+  const missing = pure.formatConnectionResult({ status: { host: "missing" } });
+  assert.equal(missing.ok, false);
+  assert.match(missing.headline, /原生宿主未安装/);
+
+  const diagnostic = pure.formatDiagnosticText({
+    status: {
+      host: "error",
+      gui: false,
+      detail: "invalid_request",
+      checkedAt: Date.now(),
+    },
+    extensionVersion: "0.2.0",
+    browser: "chrome",
+    latencyMs: 12,
+  });
+  assert.match(diagnostic, /RDM 浏览器接管诊断/);
+  assert.match(diagnostic, /浏览器：Chrome（实验性）/);
+  assert.match(diagnostic, /原生宿主：连接异常/);
+  assert.match(diagnostic, /延迟 12 ms/);
+  assert.equal(diagnostic.includes("http"), false, "诊断文本不得包含 URL");
+  assert.equal(diagnostic.includes("Cookie"), false);
+});
+
+test("options 字段校验: 绝对路径 / 数值 / 扩展名列表", () => {
+  assert.equal(pure.validateOutputDir(""), "");
+  assert.equal(pure.validateOutputDir("D:\\Downloads"), "");
+  assert.equal(pure.validateOutputDir("\\\\server\\share"), "");
+  assert.equal(pure.validateOutputDir("/home/me/Downloads"), "");
+  assert.match(pure.validateOutputDir("Downloads\\sub"), /必须是绝对路径/);
+
+  assert.equal(pure.validateMinSizeText(""), "");
+  assert.equal(pure.validateMinSizeText("0"), "");
+  assert.equal(pure.validateMinSizeText("12.5"), "");
+  assert.match(pure.validateMinSizeText("-1"), /不小于 0/);
+  assert.match(pure.validateMinSizeText("abc"), /不小于 0/);
+
+  assert.deepEqual(pure.validateExtensionField("iso, .ZIP 7z"), {
+    ok: true,
+    list: ["iso", "zip", "7z"],
+    error: "",
+  });
+  const invalid = pure.validateExtensionField("iso, bad/ext");
+  assert.equal(invalid.ok, false);
+  assert.deepEqual(invalid.list, ["iso"]);
+  assert.match(invalid.error, /扩展名/);
+});
+
+test("onboardingSteps / connectionCommands: 首次引导与按浏览器安装命令", () => {
+  const missing = pure.onboardingSteps({ status: { host: "missing" } });
+  assert.deepEqual(
+    missing.map((step) => step.status),
+    ["todo", "todo", "todo"]
+  );
+  assert.equal(missing[0].action, "copy-install-command");
+
+  const ready = pure.onboardingSteps({ status: { host: "ok", gui: true } });
+  assert.equal(ready.every((step) => step.status === "done"), true);
+
+  const firefox = pure.connectionCommands("firefox");
+  assert.equal(firefox.experimental, false);
+  assert.match(firefox.installCommand, /install-firefox-host\.ps1/);
+  const chrome = pure.connectionCommands("chrome");
+  assert.equal(chrome.experimental, true);
+  assert.match(chrome.installCommand, /install-chrome-host\.ps1/);
+  assert.match(chrome.installCommand, /ExtensionId/);
+  assert.match(chrome.note, /实验性/);
+});
+
+test("页面内接管提示默认关闭，且 normalizeSettings 不丢已有设置 key", () => {
+  assert.equal(pure.DEFAULT_SETTINGS.pageToast, false);
+  assert.equal(pure.normalizeSettings(undefined).pageToast, false);
+  assert.equal(pure.normalizeSettings({ pageToast: "true" }).pageToast, true);
+  const normalized = pure.normalizeSettings({
+    enabled: false,
+    minSizeBytes: 1024,
+    allowExtensions: ["iso"],
+    blockExtensions: ["html"],
+    outputDir: "D:\\Downloads",
+    speedLimitKiBps: 128,
+    autoStartGui: false,
+    forwardCookies: false,
+    aiIncludeCredentials: true,
+    contextMenu: false,
+    pageToast: true,
+  });
+  assert.equal(normalized.enabled, false);
+  assert.equal(normalized.minSizeBytes, 1024);
+  assert.deepEqual(normalized.allowExtensions, ["iso"]);
+  assert.deepEqual(normalized.blockExtensions, ["html"]);
+  assert.equal(normalized.outputDir, "D:\\Downloads");
+  assert.equal(normalized.speedLimitKiBps, 128);
+  assert.equal(normalized.autoStartGui, false);
+  assert.equal(normalized.forwardCookies, false);
+  assert.equal(normalized.aiIncludeCredentials, true);
+  assert.equal(normalized.contextMenu, false);
+  assert.equal(normalized.pageToast, true);
 });

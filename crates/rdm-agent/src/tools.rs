@@ -265,6 +265,13 @@ fn plan_schema() -> Value {
             "connections": { "type": "integer", "minimum": 1 },
             "dynamic_connections": { "type": "boolean" },
             "single_stream": { "type": "boolean" },
+            "prefer_http2": { "type": "boolean" },
+            "mirrors": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Mirror URLs used by this plan (userinfo redacted)"
+            },
+            "prefer_http2": { "type": "boolean" },
             "chunk_size": nullable(json!({ "type": "integer", "minimum": 1 })),
             "expected_sha256": nullable(json!({ "type": "string" })),
             "speed_limit_bps": nullable(json!({ "type": "integer", "minimum": 0 })),
@@ -395,6 +402,23 @@ fn prop_single_stream() -> Value {
         "type": "boolean",
         "default": false,
         "description": "Download with exactly one plain `GET` and NO `Range` header: for one-time/signed links and anti-hotlink servers that reject ranged requests. Forces connections=1, dynamic_connections=false and no chunk plan (a pre-existing .part is restarted from zero). The probe still sends its normal HEAD first."
+    })
+}
+
+fn prop_mirrors() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "pattern": "^https?://" },
+        "maxItems": 16,
+        "description": "Additional URLs serving the same bytes (mirrors). Workers split ranges across primary + mirrors; a failing/mismatched mirror rotates back to the primary. Mirror contents must match the primary (total size + ETag are validated). Every mirror host must also pass policy.allowed_hosts."
+    })
+}
+
+fn prop_prefer_http2() -> Value {
+    json!({
+        "type": "boolean",
+        "default": false,
+        "description": "Allow HTTP/2 multiplexing for chunked range requests. Default false forces one real TCP connection per worker (independent congestion windows, usually fastest); set true for servers that cap concurrent connections. Plain-HTTP servers fall back to h1."
     })
 }
 
@@ -957,6 +981,8 @@ and a previous .part is restarted from zero)."
                     "connections": prop_connections(),
                     "dynamic_connections": prop_dynamic_connections(),
                     "single_stream": prop_single_stream(),
+                    "mirrors": prop_mirrors(),
+                    "prefer_http2": prop_prefer_http2(),
                     "chunk_size": prop_chunk_size(),
                     "expected_sha256": prop_expected_sha256(),
                     "speed_limit_bps": prop_speed_limit(),
@@ -998,6 +1024,8 @@ after 10 minutes."
                     "connections": prop_connections(),
                     "dynamic_connections": prop_dynamic_connections(),
                     "single_stream": prop_single_stream(),
+                    "mirrors": prop_mirrors(),
+                    "prefer_http2": prop_prefer_http2(),
                     "chunk_size": prop_chunk_size(),
                     "expected_sha256": prop_expected_sha256(),
                     "speed_limit_bps": prop_speed_limit(),
@@ -1575,7 +1603,8 @@ pub fn capabilities_for(policy: &Policy) -> Value {
         "transports": ["mcp-stdio", "cli-json"],
         "features": [
             "range-probe", "segmented-download", "work-stealing", "resume",
-            "dynamic-connections", "single-stream", "link-resolution", "link-resolution-explore",
+            "dynamic-connections", "single-stream", "mirrors", "http2", "link-resolution",
+            "link-resolution-explore",
             "rate-limit",
             "sha256-verify", "policy",
             "approval-token", "idempotency", "durable-tasks",
@@ -1817,6 +1846,14 @@ mod tests {
             .iter()
             .position(|feature| *feature == "single-stream")
             .expect("capabilities.features must advertise single-stream");
+        let mirrors = features
+            .iter()
+            .position(|feature| *feature == "mirrors")
+            .expect("capabilities.features must advertise mirrors");
+        let http2 = features
+            .iter()
+            .position(|feature| *feature == "http2")
+            .expect("capabilities.features must advertise http2");
         let link = features
             .iter()
             .position(|feature| *feature == "link-resolution")
@@ -1831,9 +1868,19 @@ mod tests {
             "single-stream must come right after dynamic-connections"
         );
         assert_eq!(
-            features.get(link.wrapping_sub(1)).copied(),
+            features.get(mirrors.wrapping_sub(1)).copied(),
             Some("single-stream"),
-            "link-resolution must come right after single-stream"
+            "mirrors must come right after single-stream"
+        );
+        assert_eq!(
+            features.get(http2.wrapping_sub(1)).copied(),
+            Some("mirrors"),
+            "http2 must come right after mirrors"
+        );
+        assert_eq!(
+            features.get(link.wrapping_sub(1)).copied(),
+            Some("http2"),
+            "link-resolution must come right after http2"
         );
         assert_eq!(
             features.get(link_explore.wrapping_sub(1)).copied(),

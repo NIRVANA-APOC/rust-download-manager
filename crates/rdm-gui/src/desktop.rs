@@ -20,8 +20,16 @@
 pub enum TrayEvent {
     /// 左键单击/双击托盘图标，或右键菜单「显示主界面」。
     ShowMain,
+    /// 右键菜单「全部暂停」。
+    PauseAll,
+    /// 右键菜单「全部继续」。
+    ResumeAll,
+    /// 右键菜单「打开下载目录」。
+    OpenDownloadFolder,
     /// 右键菜单「退出 RDM」。
     Quit,
+    /// 全局热键 `Ctrl+Shift+D`（快速添加）。
+    QuickAdd,
 }
 
 /// 开机自启动（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`）。
@@ -99,8 +107,38 @@ pub fn show_window(hwnd: isize) {
 }
 
 /// 从 GPUI 窗口取 Win32 `HWND` 原始值（非 Windows 返回 `None`）。
+/// 安装全局热键 `Ctrl+Shift+D`（快速添加）；非 Windows 返回 Unsupported。
+pub fn install_hotkey() -> Result<(), String> {
+    imp::install_hotkey()
+}
+
+/// 全局热键是否已注册。
+pub fn is_hotkey_installed() -> bool {
+    imp::is_hotkey_installed()
+}
+
+/// 结束全局热键线程（幂等）。
+pub fn shutdown_hotkey() {
+    imp::shutdown_hotkey()
+}
+
+/// 查询目录所在卷的（可用, 总量）字节数；非 Windows 返回 None。
+pub fn disk_space_for(path: &std::path::Path) -> Option<(u64, u64)> {
+    imp::disk_space_for(path)
+}
+
+/// 更新托盘图标提示文本（活动数/速度变化时调用；含 explorer 重启后的重加图标路径）。
+pub fn update_tray_tooltip(tooltip: &str) {
+    imp::update_tray_tooltip(tooltip);
+}
+
 pub fn raw_hwnd(window: &gpui::Window) -> Option<isize> {
     imp::raw_hwnd(window)
+}
+
+/// 给主窗口设置 exe 内嵌的 RDM 图标（标题栏左上角 / Alt-Tab；非 Windows 无操作）。
+pub fn set_window_icon(hwnd: isize) {
+    imp::set_window_icon(hwnd)
 }
 
 /// 托盘图标的提示文本。

@@ -5,6 +5,11 @@
 //! `{"model","messages":[…],"temperature":0.2}`; replies are read as
 //! `choices[0].message.content`.
 //!
+//! [`AiClient::list_models`] additionally performs
+//! `GET {base_url}/models` (same `Authorization` header) and returns the
+//! provider's live model ids, which the settings page shows as a searchable
+//! list (`docs/design/16-reuse-and-simplification.md` §5.2).
+//!
 //! [`AiClient::chat_stream`] additionally sets `"stream": true` and consumes a
 //! `text/event-stream` (SSE) reply, forwarding every `choices[0].delta.content`
 //! fragment to a caller-supplied callback as soon as it arrives. A provider
@@ -14,6 +19,7 @@
 //! Security: the API key only ever appears in the `Authorization` header. It is
 //! scrubbed from error text and never formatted into `Debug` output.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -23,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::AiConfig;
+use crate::usage::TokenUsage;
 
 /// Upper bound for AI calls triggered from GUI actions (parse/classify), so a
 /// slow provider can never block the UI for long (contract: ≤ 15s).
@@ -121,6 +128,8 @@ pub struct AiClient {
     /// 流式聊天专用 client：`timeout_secs` 只是普通请求的总超时预算，
     /// 而流式回答可能持续数分钟，因此为流式放宽总超时（见 [`STREAM_TIMEOUT_FLOOR_SECS`]）。
     http_stream: reqwest::Client,
+    /// 本 client 所有模型调用消耗的 token（资源监控记账用）。
+    usage: std::sync::Mutex<TokenUsage>,
 }
 
 /// 流式请求的总超时下限（秒）。`AiConfig::timeout_secs` 默认 30s，只适合一次性
@@ -171,7 +180,35 @@ impl AiClient {
             config,
             http,
             http_stream,
+            usage: std::sync::Mutex::new(TokenUsage::ZERO),
         })
+    }
+
+    /// Accumulated token usage of every model call made through this client.
+    pub fn usage(&self) -> TokenUsage {
+        *self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Read and reset the accumulated usage (callers attribute it to one task).
+    pub fn take_usage(&self) -> TokenUsage {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *usage)
+    }
+
+    fn add_usage(&self, usage: TokenUsage) {
+        if usage.is_zero() {
+            return;
+        }
+        self.usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .merge(usage);
     }
 
     /// Borrow the configuration this client was built from.
@@ -179,11 +216,51 @@ impl AiClient {
         &self.config
     }
 
+    /// List the provider's models (`GET {base_url}/models`).
+    ///
+    /// Uses the same `Authorization: Bearer <key>` header and timeout as chat
+    /// calls. The OpenAI-compatible reply shape is `{"data":[{"id":"…"}, …]}`;
+    /// a bare top-level array is tolerated as well. The returned ids are
+    /// trimmed, case-insensitively deduped and sorted. No token usage is
+    /// recorded (listing models is not a model call).
+    ///
+    /// Errors never carry the API key: bodies and JSON parse messages are
+    /// scrubbed exactly like chat errors.
+    pub async fn list_models(&self) -> Result<Vec<String>, AiError> {
+        let (key, authorization) = self.authorization()?;
+        let endpoint = self.config.models_endpoint();
+        let response = self
+            .http
+            .get(&endpoint)
+            .header(AUTHORIZATION, authorization)
+            .header(USER_AGENT, concat!("rdm-ai/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|error| AiError::Http(scrub(&describe_transport_error(&error), &key)))?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| AiError::Http(scrub(&describe_transport_error(&error), &key)))?;
+        let text = String::from_utf8_lossy(&bytes);
+
+        if !status.is_success() {
+            return Err(AiError::Status {
+                status: status.as_u16(),
+                body: truncate(&scrub(&text, &key), 600),
+            });
+        }
+        parse_model_list(&text, &key)
+    }
+
     /// Send one chat turn and return `choices[0].message.content` (trimmed).
     pub async fn chat(&self, system: &str, user: &str) -> Result<String, AiError> {
         let (key, authorization) = self.authorization()?;
         let body = self.chat_body(system, user, false)?;
-        self.post_chat_body(&body, &key, authorization).await
+        let prompt_text = format!("{system}\n{user}");
+        self.post_chat_body(&body, &key, authorization, &prompt_text)
+            .await
     }
 
     /// Send a complete multi-turn context and return the next assistant reply
@@ -197,15 +274,26 @@ impl AiClient {
     pub async fn chat_messages(&self, messages: &[ChatMessage]) -> Result<String, AiError> {
         let (key, authorization) = self.authorization()?;
         let body = self.chat_messages_body(messages)?;
-        self.post_chat_body(&body, &key, authorization).await
+        let prompt_text = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.post_chat_body(&body, &key, authorization, &prompt_text)
+            .await
     }
 
     /// POST one already-encoded chat body and parse the reply.
+    ///
+    /// Token usage is read from the provider's `usage` object and recorded on
+    /// this client; providers that omit it get a clearly-marked estimate from
+    /// `prompt_text` and the reply text.
     async fn post_chat_body(
         &self,
         body: &[u8],
         key: &str,
         authorization: HeaderValue,
+        prompt_text: &str,
     ) -> Result<String, AiError> {
         let response = self
             .http
@@ -232,7 +320,11 @@ impl AiClient {
             });
         }
 
-        parse_chat_content(&text, key)
+        let (content, reported_usage) = parse_chat_completion(&text, key)?;
+        self.add_usage(
+            reported_usage.unwrap_or_else(|| TokenUsage::estimate_from_text(prompt_text, &content)),
+        );
+        Ok(content)
     }
 
     /// Send one chat turn and stream the reply.
@@ -264,6 +356,7 @@ impl AiClient {
         F: FnMut(&str),
     {
         let (key, authorization) = self.authorization()?;
+        let prompt_text = format!("{system}\n{user}");
         let body = self.chat_body(system, user, true)?;
 
         let response = self
@@ -304,12 +397,17 @@ impl AiClient {
                 .await
                 .map_err(|error| AiError::Http(scrub(&describe_transport_error(&error), &key)))?;
             let text = String::from_utf8_lossy(&bytes);
-            let content = parse_chat_content(&text, &key)?;
+            let (content, reported_usage) = parse_chat_completion(&text, &key)?;
+            self.add_usage(
+                reported_usage
+                    .unwrap_or_else(|| TokenUsage::estimate_from_text(&prompt_text, &content)),
+            );
             on_delta(&content);
             return Ok(content);
         }
 
         let mut accumulated = String::new();
+        let mut reported_usage: Option<TokenUsage> = None;
         let mut buffer: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
         let mut done = false;
@@ -322,6 +420,9 @@ impl AiClient {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     let failure = AiError::Http(scrub(&describe_transport_error(&error), &key));
+                    self.add_usage(reported_usage.unwrap_or_else(|| {
+                        TokenUsage::estimate_from_text(&prompt_text, &accumulated)
+                    }));
                     return keep_partial(failure, accumulated);
                 }
             };
@@ -339,12 +440,21 @@ impl AiClient {
                         break;
                     }
                     SseLine::Payload(payload) => match decode_sse_payload(payload, &key) {
-                        Ok(Some(delta)) => {
-                            accumulated.push_str(&delta);
-                            on_delta(&delta);
+                        Ok((delta, usage)) => {
+                            if let Some(usage) = usage {
+                                merge_stream_usage(&mut reported_usage, usage);
+                            }
+                            if let Some(delta) = delta {
+                                accumulated.push_str(&delta);
+                                on_delta(&delta);
+                            }
                         }
-                        Ok(None) => {}
-                        Err(failure) => return keep_partial(failure, accumulated),
+                        Err(failure) => {
+                            self.add_usage(reported_usage.unwrap_or_else(|| {
+                                TokenUsage::estimate_from_text(&prompt_text, &accumulated)
+                            }));
+                            return keep_partial(failure, accumulated);
+                        }
                     },
                 }
             }
@@ -357,19 +467,35 @@ impl AiClient {
                 SseLine::Ignore => {}
                 SseLine::Done => {}
                 SseLine::Payload(payload) => match decode_sse_payload(payload, &key) {
-                    Ok(Some(delta)) => {
-                        accumulated.push_str(&delta);
-                        on_delta(&delta);
+                    Ok((delta, usage)) => {
+                        if let Some(usage) = usage {
+                            merge_stream_usage(&mut reported_usage, usage);
+                        }
+                        if let Some(delta) = delta {
+                            accumulated.push_str(&delta);
+                            on_delta(&delta);
+                        }
                     }
-                    Ok(None) => {}
-                    Err(failure) => return keep_partial(failure, accumulated),
+                    Err(failure) => {
+                        self.add_usage(reported_usage.unwrap_or_else(|| {
+                            TokenUsage::estimate_from_text(&prompt_text, &accumulated)
+                        }));
+                        return keep_partial(failure, accumulated);
+                    }
                 },
             }
         }
 
         if accumulated.is_empty() {
+            self.add_usage(
+                reported_usage.unwrap_or_else(|| TokenUsage::estimate_from_text(&prompt_text, "")),
+            );
             return Err(AiError::Empty);
         }
+        self.add_usage(
+            reported_usage
+                .unwrap_or_else(|| TokenUsage::estimate_from_text(&prompt_text, &accumulated)),
+        );
         Ok(accumulated)
     }
 
@@ -425,9 +551,11 @@ impl AiClient {
     }
 }
 
-/// Parse a complete non-streaming chat completion body and return the trimmed
-/// `choices[0].message.content`.
-fn parse_chat_content(text: &str, key: &str) -> Result<String, AiError> {
+/// Parse a complete non-streaming chat completion body.
+///
+/// Returns the trimmed `choices[0].message.content` plus the provider-reported
+/// token usage (when present).
+fn parse_chat_completion(text: &str, key: &str) -> Result<(String, Option<TokenUsage>), AiError> {
     let value: Value = serde_json::from_str(text).map_err(|error| {
         AiError::Json(truncate(
             &format!("{error} (body: {})", scrub(text, key)),
@@ -442,7 +570,57 @@ fn parse_chat_content(text: &str, key: &str) -> Result<String, AiError> {
     if content.is_empty() {
         return Err(AiError::Empty);
     }
-    Ok(content.to_owned())
+    let usage = TokenUsage::from_json_usage(value.get("usage"));
+    Ok((content.to_owned(), usage))
+}
+
+/// Parse a `GET /models` reply into trimmed, case-insensitively deduped and
+/// sorted model ids (`data[].id`, bare-array fallback).
+///
+/// An empty model list is a valid answer (`Ok(vec![])`): the settings page shows
+/// "0 models" and keeps the manual model input usable.
+fn parse_model_list(text: &str, key: &str) -> Result<Vec<String>, AiError> {
+    let value: Value = serde_json::from_str(text).map_err(|error| {
+        AiError::Json(truncate(
+            &format!("{error} (body: {})", scrub(text, key)),
+            400,
+        ))
+    })?;
+    let entries: Vec<&Value> = match &value {
+        Value::Array(items) => items.iter().collect(),
+        _ => match value.get("data") {
+            Some(Value::Array(items)) => items.iter().collect(),
+            _ => {
+                return Err(AiError::Json(
+                    "model list response has no data[] array".to_owned(),
+                ));
+            }
+        },
+    };
+    let mut unique: BTreeMap<String, String> = BTreeMap::new();
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| entry.as_str())
+            .unwrap_or_default()
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        unique
+            .entry(id.to_ascii_lowercase())
+            .or_insert_with(|| id.to_owned());
+    }
+    Ok(unique.into_values().collect())
+}
+
+/// Merge one streamed usage object into the running total.
+fn merge_stream_usage(total: &mut Option<TokenUsage>, usage: TokenUsage) {
+    match total {
+        Some(existing) => existing.merge(usage),
+        None => *total = Some(usage),
+    }
 }
 
 /// One decoded SSE line.
@@ -472,13 +650,18 @@ fn classify_sse_line(line: &str) -> SseLine<'_> {
     }
 }
 
-/// Extract one content delta from a `data:` payload.
+/// Extract one content delta and/or token usage from a `data:` payload.
 ///
 /// The standard streaming shape is `choices[0].delta.content`; some compatible
 /// gateways send the non-streaming `choices[0].message.content` instead, so the
-/// latter is accepted as a fallback. `Ok(None)` means "no text in this event"
-/// (for example a role-only first delta or a usage-only trailer).
-fn decode_sse_payload(payload: &str, key: &str) -> Result<Option<String>, AiError> {
+/// latter is accepted as a fallback. `Ok((None, None))` means "no text and no
+/// usage in this event" (for example a role-only first delta). A payload with a
+/// `usage` object (some gateways attach one to the last chunk) is returned so
+/// streaming chats can report exact usage when the provider offers it.
+fn decode_sse_payload(
+    payload: &str,
+    key: &str,
+) -> Result<(Option<String>, Option<TokenUsage>), AiError> {
     let value: Value = serde_json::from_str(payload).map_err(|error| {
         AiError::Json(truncate(
             &format!("{error} (body: {})", scrub(payload, key)),
@@ -490,11 +673,13 @@ fn decode_sse_payload(payload: &str, key: &str) -> Result<Option<String>, AiErro
         .or_else(|| value.pointer("/choices/0/message/content"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if content.is_empty() {
-        Ok(None)
+    let usage = TokenUsage::from_json_usage(value.get("usage"));
+    let delta = if content.is_empty() {
+        None
     } else {
-        Ok(Some(content.to_owned()))
-    }
+        Some(content.to_owned())
+    };
+    Ok((delta, usage))
 }
 
 /// A mid-stream failure must not discard text the caller already displayed: log
@@ -633,23 +818,47 @@ mod tests {
 
     #[test]
     fn decode_sse_payload_accepts_delta_and_message_shapes() {
-        let delta =
+        let (delta, _usage) =
             decode_sse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#, "key").unwrap();
         assert_eq!(delta.as_deref(), Some("hi"));
-        let message =
+        let (message, _usage) =
             decode_sse_payload(r#"{"choices":[{"message":{"content":"there"}}]}"#, "key").unwrap();
         assert_eq!(message.as_deref(), Some("there"));
-        let role_only =
+        let (role_only, _usage) =
             decode_sse_payload(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#, "key").unwrap();
         assert_eq!(role_only, None);
-        let null_content =
+        let (null_content, _usage) =
             decode_sse_payload(r#"{"choices":[{"delta":{"content":null}}]}"#, "key").unwrap();
         assert_eq!(null_content, None);
+        // Usage-only trailers are decoded for streaming accounting.
+        let (no_content, usage) = decode_sse_payload(
+            r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}"#,
+            "key",
+        )
+        .unwrap();
+        assert!(no_content.is_none());
+        assert_eq!(usage.expect("usage").total_tokens, 13);
         // Parse failures carry the payload but never the key.
         let error = decode_sse_payload("{secret-key", "secret-key").unwrap_err();
         let rendered = format!("{error:?}") + &error.to_string();
         assert!(!rendered.contains("secret-key"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_chat_completion_returns_usage_when_present() {
+        let (content, usage) = parse_chat_completion(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}"#,
+            "key",
+        )
+        .expect("completion");
+        assert_eq!(content, "ok");
+        assert_eq!(usage.expect("usage").total_tokens, 13);
+
+        let (_, usage) =
+            parse_chat_completion(r#"{"choices":[{"message":{"content":"ok"}}]}"#, "key")
+                .expect("completion without usage");
+        assert!(usage.is_none());
     }
 
     #[test]
@@ -795,8 +1004,40 @@ mod tests {
             model: "mock-model".into(),
             api_key: api_key.into(),
             timeout_secs: 5,
+            // A loopback mock is not a bundled provider: no preset/no prices.
+            provider: None,
+            ..AiConfig::default()
         })
         .expect("mock client")
+    }
+
+    #[test]
+    fn parse_model_list_reads_data_ids_and_normalizes_them() {
+        let models = parse_model_list(
+            r#"{"object":"list","data":[{"id":" b-model"},{"id":"A-Model"},{"id":"a-model"},{"id":""},{}, {"id":7}]}"#,
+            "key",
+        )
+        .expect("model list");
+        assert_eq!(models, ["A-Model", "b-model"]);
+    }
+
+    #[test]
+    fn parse_model_list_accepts_bare_arrays_and_empty_lists() {
+        let models = parse_model_list(r#"["m2","m1","M1"]"#, "key").expect("bare array");
+        assert_eq!(models, ["m1", "m2"]);
+        let empty = parse_model_list(r#"{"object":"list","data":[]}"#, "key").expect("empty");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn parse_model_list_errors_are_scrubbed_and_typed() {
+        let missing = parse_model_list(r#"{"object":"list"}"#, "key").unwrap_err();
+        assert!(matches!(missing, AiError::Json(_)), "{missing:?}");
+
+        let error = parse_model_list("{secret-key", "secret-key").unwrap_err();
+        let rendered = format!("{error:?}") + &error.to_string();
+        assert!(!rendered.contains("secret-key"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[tokio::test]
@@ -858,5 +1099,52 @@ mod tests {
         let rendered = format!("{error:?}") + &error.to_string();
         assert!(!rendered.contains("secret-key"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn provider_usage_is_recorded_and_taken_once() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base_url = spawn_completion_server(
+            200,
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}"#,
+            captured,
+        )
+        .await;
+        let client = mock_client(&base_url, "k");
+        assert!(client.usage().is_zero(), "fresh client has no usage");
+
+        client.chat("sys", "hello").await.expect("chat reply");
+        let usage = client.usage();
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.total_tokens, 13);
+        assert_eq!(usage.calls, 1);
+        assert!(!usage.estimated, "reported usage is never estimated");
+
+        // `take_usage` attributes the calls to their owner and resets the ledger.
+        assert_eq!(client.take_usage(), usage);
+        assert!(client.usage().is_zero());
+    }
+
+    #[tokio::test]
+    async fn missing_provider_usage_is_estimated() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base_url = spawn_completion_server(
+            200,
+            r#"{"choices":[{"message":{"content":"a reply without usage"}}]}"#,
+            captured,
+        )
+        .await;
+        let client = mock_client(&base_url, "k");
+
+        client
+            .chat("system prompt", "user prompt")
+            .await
+            .expect("chat reply");
+        let usage = client.usage();
+        assert_eq!(usage.calls, 1);
+        assert!(usage.estimated, "missing usage must be labelled estimated");
+        assert!(usage.total_tokens > 0, "estimate is never zero for a reply");
+        assert!(usage.prompt_tokens > 0, "prompt is counted by the estimate");
     }
 }

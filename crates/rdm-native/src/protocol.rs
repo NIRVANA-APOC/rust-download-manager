@@ -101,6 +101,13 @@ pub enum Incoming {
     /// (`docs/design-next-features.md` §5.2). The GUI shows the result in its
     /// AI panel; unlike `enqueue`, an AI parse request is **never** spooled to
     /// disk: parsing needs the live GUI and credentials must not be persisted.
+    /// Ask the running GUI to show/activate its main window (`type:"activate"`,
+    /// extension「打开 RDM」按钮). Added after 07 §17#9; the extension already
+    /// sends it with a short timeout and degrades gracefully on old hosts.
+    Activate {
+        #[serde(default)]
+        id: Option<u64>,
+    },
     AiParse {
         #[serde(default)]
         id: Option<u64>,
@@ -183,6 +190,15 @@ pub enum Outgoing {
         version: String,
         gui_running: bool,
         protocol: u32,
+    },
+    /// Reply to an `activate` request: `ok:true` when the GUI window was
+    /// shown/activated; failures use [`Outgoing::Error`] with
+    /// `gui_unavailable` (the extension then tells the user to open RDM from
+    /// the taskbar).
+    Activated {
+        id: u64,
+        ok: bool,
+        gui_running: bool,
     },
     /// Progress snapshot for a `status` poll.
     ///
@@ -270,6 +286,15 @@ impl Outgoing {
             version: HOST_VERSION.to_string(),
             gui_running,
             protocol: rdm_ipc::PROTOCOL_VERSION,
+        }
+    }
+
+    /// Successful `activate` reply.
+    pub fn activated(id: u64, gui_running: bool) -> Self {
+        Outgoing::Activated {
+            id,
+            ok: true,
+            gui_running,
         }
     }
 
@@ -430,7 +455,7 @@ impl AiParseRequest {
 
         logger.info(&format!(
             "ai_parse request accepted: host={host} url={} source_page={} title_bytes={} include_credentials={} cookie_bytes={} referer={} user_agent={} page_links={} page_title_bytes={}",
-            url_util::redact_url(&url),
+            url_util::redact_url_for_log(&url),
             source_page.is_some(),
             title.as_deref().map_or(0, str::len),
             self.include_credentials,
@@ -705,7 +730,7 @@ impl ExtensionRequest {
 
         logger.info(&format!(
             "request accepted: url={} file={} connections={} headers={} cookie={} referer={}",
-            url_util::redact_url(url.as_str()),
+            url_util::redact_url_for_log(url.as_str()),
             download.file_name.as_deref().unwrap_or("<server-derived>"),
             connections,
             download.headers.len(),
@@ -958,8 +983,20 @@ mod tests {
 
     #[test]
     fn unknown_type_is_captured_not_fatal() {
-        match parse(r#"{"type":"activate","id":3}"#).unwrap() {
+        match parse(r#"{"type":"future_feature","id":3}"#).unwrap() {
             Incoming::Unknown => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activate_parses_with_optional_id() {
+        match parse(r#"{"type":"activate","id":3}"#).unwrap() {
+            Incoming::Activate { id } => assert_eq!(id, Some(3)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(r#"{"type":"activate"}"#).unwrap() {
+            Incoming::Activate { id } => assert!(id.is_none()),
             other => panic!("unexpected: {other:?}"),
         }
     }

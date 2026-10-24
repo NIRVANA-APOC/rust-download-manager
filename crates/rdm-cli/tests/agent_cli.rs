@@ -2163,6 +2163,108 @@ async fn download_text_mode_still_works() {
 }
 
 #[tokio::test]
+async fn download_with_mirror_splits_ranges_across_origins() {
+    // `--mirror`: both origins serve part of the file and the payload matches.
+    let total = 8 * 1024 * 1024u64;
+    let primary = TestServer::start(Config::new(total)).await.unwrap();
+    let mirror = TestServer::start(Config::new(total)).await.unwrap();
+    assert_eq!(primary.content(), mirror.content());
+    let state = TempDir::new("mirror-cli");
+    let out_dir = TempDir::new("mirror-cli-out");
+    let output = run(
+        &[
+            "download",
+            &primary.file_url(),
+            "-d",
+            out_dir.path().to_str().unwrap(),
+            "--connections",
+            "8",
+            "--chunk-size",
+            "1048576",
+            "--mirror",
+            &mirror.file_url(),
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+    let value = output.json();
+    assert_eq!(value["ok"], true);
+    let file_name = value["data"]["file_name"].as_str().unwrap();
+    let payload = std::fs::read(out_dir.path().join(file_name)).unwrap();
+    assert_eq!(payload, primary.content());
+    let primary_bytes = primary.stats().body_bytes_sent;
+    let mirror_bytes = mirror.stats().body_bytes_sent;
+    assert!(
+        primary_bytes > 0 && mirror_bytes > 0,
+        "both origins must serve part of the file: primary={primary_bytes} mirror={mirror_bytes}"
+    );
+    primary.shutdown().await;
+    mirror.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_rejects_invalid_mirror_url() {
+    let fixture = fixture(128 * 1024).await;
+    let state = TempDir::new("mirror-bad");
+    let out_dir = TempDir::new("mirror-bad-out");
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out_dir.path().to_str().unwrap(),
+            "--mirror",
+            "ftp://mirror.example/file.bin",
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 2, "stderr: {}", output.stderr);
+    assert!(
+        output.stderr.contains("mirror") || output.stdout.contains("mirror"),
+        "invalid mirror must be reported: stdout={} stderr={}",
+        output.stdout,
+        output.stderr
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn download_http2_flag_falls_back_on_a_plain_fixture() {
+    let fixture = fixture(512 * 1024).await;
+    let state = TempDir::new("http2-cli");
+    let out_dir = TempDir::new("http2-cli-out");
+    let output = run(
+        &[
+            "download",
+            &fixture.file_url(),
+            "-d",
+            out_dir.path().to_str().unwrap(),
+            "--http2",
+            "--output",
+            "json",
+        ],
+        state.path(),
+    )
+    .await;
+    assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+    let value = output.json();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["data"]["http_version"], "HTTP/1.1");
+    let file_name = value["data"]["file_name"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read(out_dir.path().join(file_name)).unwrap(),
+        fixture.content()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn download_single_stream_uses_one_plain_get() {
     // v1.2 / engine `single_stream`: exactly one HEAD probe + one plain `GET`
     // with no `Range` header — the shape one-time/signed links and anti-hotlink

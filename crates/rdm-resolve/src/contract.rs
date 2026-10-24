@@ -517,6 +517,14 @@ pub struct Diagnostics {
     pub http_requests: u32,
     pub bytes_read: u64,
     pub llm_calls: u32,
+    /// Prompt tokens consumed by the run's LLM calls (0 when unknown).
+    pub llm_prompt_tokens: u64,
+    /// Completion tokens consumed by the run's LLM calls (0 when unknown).
+    pub llm_completion_tokens: u64,
+    /// Total tokens consumed by the run's LLM calls (0 when unknown).
+    pub llm_total_tokens: u64,
+    /// `true` when at least one LLM call's usage was estimated from text length.
+    pub llm_estimated: bool,
     pub elapsed_ms: u64,
 }
 

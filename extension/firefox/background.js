@@ -7,8 +7,8 @@
  *        原生宿主可用 → 取消并抹掉浏览器下载 → native messaging 转交 RDM；
  *        宿主不可用/转交失败 → 重新发起浏览器下载（并防止再次拦截形成死循环）；
  *   3. 维护原生宿主 / GUI 在线状态与工具栏徽章；
- *   4. 右键菜单「使用 RDM 下载」/「用 RDM AI 解析此页」；
- *   5. 为 popup / options 提供消息接口（含 AI 解析 ai_parse）。
+ *   4. 右键菜单「使用 RDM 下载链接 / 解析页面资源…」；
+ *   5. 为 popup / options 提供消息接口（含解析页面资源 ai_parse）。
  *
  * 设计约束（Firefox MV3）：
  *   - background 使用 background.scripts（Firefox 不支持 service worker）；
@@ -36,22 +36,43 @@ const {
   formatAiParseResult,
   aiParseRecentEntry,
   normalizeDownloads,
+  sanitizePageLinks,
+  parseUrlsFromText,
+  summarizeActivity,
+  computeBadge,
+  formatHandoffResult,
 } = RDMPure;
 
 const HOST_NAME = "com.rdm.download";
 const SETTINGS_KEY = "rdm.settings";
 const RECENT_KEY = "rdm.recent";
 const STATUS_KEY = "rdm.status";
+const ACTIVITY_KEY = "rdm.activity";
 const PING_ALARM = "rdm.status.ping";
-const MENU_ID = "rdm-download-with";
-const AI_MENU_ID = "rdm-ai-parse-page";
+const ACTIVITY_ALARM = "rdm.activity.poll";
+const MENU_LINK_ID = "rdm-download-with";
+const MENU_IMAGE_ID = "rdm-download-image";
+const MENU_MEDIA_ID = "rdm-download-media";
+const MENU_PAGE_ID = "rdm-parse-page";
+const MENU_SELECTION_ID = "rdm-download-selection";
+const MENU_OPTIONS_ID = "rdm-options";
+const MENU_SEPARATOR_ID = "rdm-menu-separator";
 const MAX_RECENT = 20;
+/** popup 只展示 5 条最近活动；background 仍然保留 20 条供桌面端/历史使用。 */
+const POPUP_RECENT = 5;
 const PING_TIMEOUT_MS = 3000;
+/** 「打开 RDM」：v0.3 宿主已支持 activate（含冷启动拉起，最多约 8s），
+ *  留 9.5s 超时；旧宿主回 unknown message type 时由调用方降级提示。 */
+const ACTIVATE_TIMEOUT_MS = 9500;
+/** popup 主按钮批量转交最多 URL 数（07 §4.2：选中多个链接时批量转交）。 */
+const MAX_HANDOFF_URLS = 10;
+/** 页面选中文本最多读取字符数（仅本地解析，不发送原始文本）。 */
+const MAX_SELECTION_CHARS = 8000;
 /** popup 每秒轮询一次下载进度；宿主/GUI 正常时应远快于该预算。 */
 const STATUS_TIMEOUT_MS = 3000;
 /** GUI 未被启动时，宿主最多轮询 8 秒，这里留足余量。 */
 const ENQUEUE_TIMEOUT_MS = 16000;
-/** AI 解析同样可能触发 GUI 启动，给与 enqueue 相同的预算。 */
+/** 解析页面资源同样可能触发 GUI 启动，给与 enqueue 相同的预算。 */
 const AI_PARSE_TIMEOUT_MS = 16000;
 const CACHE_TTL_MS = 90 * 1000;
 const MAX_CACHE_ENTRIES = 80;
@@ -169,8 +190,8 @@ function setStatus(host, gui, detail, hostVersion) {
   }, 250);
 }
 
-/** 「最近转交」允许的状态；未知值按 error 处理（保持旧行为）。 */
-const RECENT_STATES = ["handed", "queued", "fallback", "ai", "error"];
+/** 「最近活动」允许的状态；未知值按 error 处理（保持旧行为）。 */
+const RECENT_STATES = ["handed", "queued", "duplicate", "fallback", "ai", "error"];
 
 /**
  * 归一化一条「最近转交」记录。
@@ -205,9 +226,96 @@ async function pushRecent(entry) {
   await storageSet({ [RECENT_KEY]: recent });
 }
 
+/** 清空后暂存的列表，供 popup 撤销（07 §7：restoreRecent，仅内存不落盘）。 */
+let lastClearedRecent = null;
+
 async function clearRecent() {
+  const list = (await loadRecent()).slice();
+  lastClearedRecent = list.slice();
   recent = [];
   await storageSet({ [RECENT_KEY]: [] });
+}
+
+/** 撤销「清空最近活动」：把清空前内存里的列表合并回来（去重、限 20 条）。 */
+async function restoreRecent() {
+  if (!Array.isArray(lastClearedRecent) || lastClearedRecent.length === 0) return false;
+  const current = (await loadRecent()).slice();
+  const merged = [];
+  const seen = new Set();
+  for (const entry of lastClearedRecent.concat(current)) {
+    const key = String(entry.at || 0) + "|" + entry.url + "|" + entry.fileName + "|" + entry.status;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(normalizeRecentEntry(entry));
+  }
+  recent = merged.slice(0, MAX_RECENT);
+  lastClearedRecent = null;
+  await storageSet({ [RECENT_KEY]: recent });
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 活动下载缓存（badge 用；07 §8）
+// ---------------------------------------------------------------------------
+
+/** 最近一次 status 快照的活动汇总（持久化，启动后 badge 不必等网络）。 */
+let cachedActivity = { downloading: 0, paused: 0, failed: 0, active: 0, speedBps: 0, updatedAt: 0 };
+
+function normalizeStoredActivity(raw) {
+  const input = raw && typeof raw === "object" ? raw : {};
+  const clamp = (value) => {
+    const parsed = typeof value === "number" ? value : parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 0;
+  };
+  return {
+    downloading: clamp(input.downloading),
+    paused: clamp(input.paused),
+    failed: clamp(input.failed),
+    active: clamp(input.active),
+    speedBps: Number.isFinite(input.speedBps) && input.speedBps > 0 ? input.speedBps : 0,
+    updatedAt: typeof input.updatedAt === "number" ? input.updatedAt : 0,
+  };
+}
+
+async function loadStoredActivity() {
+  const stored = await storageGet(ACTIVITY_KEY);
+  cachedActivity = normalizeStoredActivity(stored[ACTIVITY_KEY]);
+  return cachedActivity;
+}
+
+/** status 结果 → badge 活动汇总缓存（失败快照不覆盖上一次已知值）。 */
+function recordActivity(result) {
+  if (!result || result.ok !== true) return cachedActivity;
+  const summary = summarizeActivity(normalizeDownloads(result.downloads));
+  cachedActivity = Object.assign(summary, { updatedAt: Date.now() });
+  updateBadge();
+  storageSet({ [ACTIVITY_KEY]: cachedActivity });
+  return cachedActivity;
+}
+
+let activityRefreshTimer = null;
+
+/** 转交成功后延迟刷新 badge（不阻塞 popup 反馈）。 */
+function refreshActivitySoon() {
+  if (activityRefreshTimer) clearTimeout(activityRefreshTimer);
+  activityRefreshTimer = setTimeout(() => {
+    activityRefreshTimer = null;
+    fetchDownloadStatus()
+      .then((result) => recordActivity(result))
+      .catch(() => {});
+  }, 800);
+}
+
+/** 浏览器类型（popup/options 显示 Chrome 实验性标签、按浏览器给安装命令）。 */
+function detectBrowserKind() {
+  try {
+    const url = browser.runtime.getURL("");
+    if (url.indexOf("moz-extension:") === 0) return "firefox";
+    if (url.indexOf("chrome-extension:") === 0) return "chrome";
+  } catch (_err) {
+    /* 测试/旧环境没有 getURL */
+  }
+  return "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -494,31 +602,32 @@ async function fetchDownloadStatus() {
 function setBadge(text, color, title) {
   if (!browser.action) return;
   try {
-    browser.action.setBadgeText({ text }).catch(() => {});
-    browser.action.setBadgeBackgroundColor({ color }).catch(() => {});
-    browser.action.setTitle({ title }).catch(() => {});
+    const textPromise = browser.action.setBadgeText({ text: text || "" });
+    if (textPromise && typeof textPromise.catch === "function") textPromise.catch(() => {});
+    if (color) {
+      const colorPromise = browser.action.setBadgeBackgroundColor({ color });
+      if (colorPromise && typeof colorPromise.catch === "function") colorPromise.catch(() => {});
+    }
+    const titlePromise = browser.action.setTitle({ title });
+    if (titlePromise && typeof titlePromise.catch === "function") titlePromise.catch(() => {});
   } catch (err) {
     debug("设置徽章失败: " + err);
   }
 }
 
+/**
+ * badge（07 §8）：接管关闭 off / 宿主缺失 ! / GUI 未运行 Q /
+ * 活动数（暂停橙、失败红、下载中蓝）/ 空闲无角标。
+ * 颜色/文案全部由 lib/pure.js 的 computeBadge 决定，便于单测。
+ */
 function updateBadge() {
   const settings = cachedSettings || RDMPure.DEFAULT_SETTINGS;
-  if (!settings.enabled) {
-    setBadge("off", "#6e7781", "RDM 下载接管：已关闭");
-    return;
-  }
-  if (status.host === "ok" && status.gui) {
-    setBadge("ON", "#1f883d", "RDM 在线：下载将交给 RDM（点击查看）");
-  } else if (status.host === "ok") {
-    setBadge("Q", "#bf8700", "RDM GUI 未运行：下载会先排队（点击查看）");
-  } else if (status.host === "missing") {
-    setBadge("!", "#cf222e", "未安装 RDM 原生宿主（点击查看安装方法）");
-  } else if (status.host === "error") {
-    setBadge("!", "#cf222e", "RDM 连接异常（点击查看）");
-  } else {
-    setBadge("?", "#6e7781", "RDM 状态未知（点击检测）");
-  }
+  const badge = computeBadge({
+    settings,
+    status,
+    activity: cachedActivity,
+  });
+  setBadge(badge.text, badge.color || "#6E7781", badge.title);
 }
 
 let flashTimer = null;
@@ -539,6 +648,13 @@ async function ensureAlarm() {
       // 5 分钟一次足够让徽章状态不至于长期失真；popup 打开/下载转交时
       // 都会立即刷新，避免频繁唤醒事件页和拉起原生宿主。
       await browser.alarms.create(PING_ALARM, { periodInMinutes: 5 });
+    }
+    // badge 活动数轮询（07 §8）：Chrome/Firefox 的 alarms 最小粒度都是 1 分钟，
+    // 设计里的 5s/30s 预算在 MV3 下不可用，这里采用保守的 1 分钟兜底；
+    // popup 打开期间的 1s 轮询与转交后的延迟刷新负责实时性。
+    const activityAlarm = await browser.alarms.get(ACTIVITY_ALARM);
+    if (!activityAlarm) {
+      await browser.alarms.create(ACTIVITY_ALARM, { periodInMinutes: 1 });
     }
   } catch (err) {
     debug("创建状态轮询 alarm 失败: " + err);
@@ -757,11 +873,13 @@ async function buildRequest(options) {
   return request;
 }
 
-async function sendHandoff(request, settings) {
+async function sendHandoff(request, settings, launchGuiOverride) {
+  const launchGui =
+    typeof launchGuiOverride === "boolean" ? launchGuiOverride : settings.autoStartGui;
   return nativeClient.request(
     {
       type: "enqueue",
-      launch_gui: settings.autoStartGui,
+      launch_gui: launchGui,
       request,
     },
     ENQUEUE_TIMEOUT_MS
@@ -769,7 +887,7 @@ async function sendHandoff(request, settings) {
 }
 
 // ---------------------------------------------------------------------------
-// AI 解析（ai_parse）
+// 解析页面资源（ai_parse）
 // ---------------------------------------------------------------------------
 
 /** 当前窗口的活动标签页（拿不到时返回 null，调用方给出可读错误）。 */
@@ -860,7 +978,7 @@ async function buildAiMessage(options) {
       const cookies = await browser.cookies.getAll({ url });
       cookie = buildCookieHeader(cookies);
     } catch (err) {
-      debug("读取 AI 解析 Cookie 失败: " + err);
+      debug("读取解析用 Cookie 失败: " + err);
     }
   }
   let snapshot = null;
@@ -896,7 +1014,8 @@ async function buildAiMessage(options) {
     referer: aiReferer(url),
     userAgent:
       typeof navigator !== "undefined" && navigator.userAgent ? navigator.userAgent : "",
-    launchGui: settings.autoStartGui,
+    // 用户显式点击「启动 RDM 并解析」时 forceLaunch=true（07 §4.2）。
+    launchGui: options.forceLaunch === true ? true : settings.autoStartGui,
     pageUrl: snapshot ? snapshot.url : "",
     pageTitle: snapshot ? snapshot.title : "",
     pageLinks: snapshot ? snapshot.links : [],
@@ -908,7 +1027,7 @@ async function sendAiParse(message) {
 }
 
 /**
- * popup 消息 / 右键菜单共用的 AI 解析入口。
+ * popup 消息 / 右键菜单共用的「解析页面资源」入口。
  * @returns {Promise<{ok: boolean, message: string, code?: string, requestId?: number}>}
  */
 async function handleAiParseRequest(request) {
@@ -921,7 +1040,7 @@ async function handleAiParseRequest(request) {
       return {
         ok: false,
         code: "no_tab",
-        message: "AI 解析未发送：没有可解析的当前标签页",
+        message: "解析未发送：没有可解析的当前标签页",
       };
     }
     url = firstHttpUrl([tab.url]);
@@ -930,7 +1049,7 @@ async function handleAiParseRequest(request) {
       return {
         ok: false,
         code: "non_http",
-        message: "AI 解析未发送：当前页面不是 http(s) 页面",
+        message: "解析未发送：当前页面不是 http(s) 页面",
       };
     }
   }
@@ -942,14 +1061,15 @@ async function handleAiParseRequest(request) {
     includeCredentials: request ? request.includeCredentials : undefined,
     tabId: request ? request.tabId : undefined,
     tabUrl: request ? request.tabUrl : undefined,
+    forceLaunch: request ? request.forceLaunch === true : false,
   });
   if (!message) {
-    return { ok: false, code: "invalid_url", message: "AI 解析未发送：页面地址无效" };
+    return { ok: false, code: "invalid_url", message: "解析未发送：页面地址无效" };
   }
 
   // 只记录脱敏 URL 与是否带凭据；绝不打 Cookie 值。
   debug(
-    "AI 解析请求: url=" +
+    "解析请求: url=" +
       redactUrl(message.url) +
       " credentials=" +
       (message.include_credentials === true)
@@ -965,7 +1085,7 @@ async function handleAiParseRequest(request) {
     return {
       ok: false,
       code: "host_error",
-      message: "AI 解析未发送：" + truncate(classified.detail || text, 160),
+      message: "解析未发送：" + truncate(classified.detail || text, 160),
     };
   }
 
@@ -979,7 +1099,7 @@ async function handleAiParseRequest(request) {
   return result;
 }
 
-/** 右键菜单「用 RDM AI 解析此页」：解析当前标签页并写入最近记录。 */
+/** 右键菜单「解析页面资源…」：解析当前标签页并写入最近活动。 */
 async function handleContextMenuAiParse(info, tab) {
   const pageUrl = firstHttpUrl([tab && tab.url]);
   if (!pageUrl) {
@@ -995,6 +1115,303 @@ async function handleContextMenuAiParse(info, tab) {
     tabUrl: pageUrl,
   });
   await pushRecent(aiParseRecentEntry({ url: pageUrl, title: pageTitle }, result));
+}
+
+// ---------------------------------------------------------------------------
+// popup 上下文 / 活动查询 / 主按钮交接（M4）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读取当前标签页选中的文本并从中提取 http(s) 链接。
+ * 只在用户打开 popup 时调用；原始文本不离开浏览器、不写日志。
+ */
+async function collectSelectedUrls(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) return [];
+  try {
+    const results = await browser.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      func: () => {
+        try {
+          const selection = window.getSelection ? window.getSelection() : null;
+          return selection ? String(selection.toString()).slice(0, 8000) : "";
+        } catch (_err) {
+          return "";
+        }
+      },
+    });
+    const first = Array.isArray(results) && results.length > 0 ? results[0] : null;
+    const text = first && typeof first.result === "string" ? first.result : "";
+    return parseUrlsFromText(text, MAX_HANDOFF_URLS);
+  } catch (err) {
+    debug(
+      "读取选中文本失败（不阻塞 popup）: " +
+        truncate(err && err.message ? err.message : err, 120)
+    );
+    return [];
+  }
+}
+
+/**
+ * popup 当前 tab 上下文（07 §4.1 / §17 #1）。
+ * 含 URL/标题/可读文件名/已知大小/选中链接；不读取页面正文。
+ */
+async function handleGetTabContext() {
+  const tab = await getActiveTab();
+  if (!tab) {
+    return { ok: false, code: "no_tab", message: "没有可用的当前标签页" };
+  }
+  const rawUrl = typeof tab.url === "string" ? tab.url : "";
+  const cached = isHttpUrl(rawUrl) ? lookupRequest(rawUrl) : null;
+  const fileName = cached ? resolveContextFileName(rawUrl, cached) : fileNameFromUrl(rawUrl);
+  const sizeBytes = cached ? resolveSize({}, cached) : -1;
+  let selectedUrls = [];
+  if (isHttpUrl(rawUrl) && Number.isInteger(tab.id)) {
+    selectedUrls = await collectSelectedUrls(tab.id);
+  }
+  return {
+    ok: true,
+    tabId: Number.isInteger(tab.id) ? tab.id : -1,
+    url: rawUrl,
+    title: typeof tab.title === "string" ? tab.title : "",
+    fileName,
+    sizeBytes: sizeBytes >= 0 ? sizeBytes : -1,
+    selectedUrls,
+    isHttp: isHttpUrl(rawUrl),
+  };
+}
+
+/** getActivity：status + 最近活动（popup 每秒轮询一次，badge 同步更新）。 */
+async function getActivityResult() {
+  const result = await fetchDownloadStatus();
+  recordActivity(result);
+  const recentList = (await loadRecent()).slice(0, POPUP_RECENT);
+  return Object.assign({}, result, { recent: recentList });
+}
+
+/** 页面内接管提示（07 §10）：默认关闭；仅在用户主动动作且设置开启时注入。 */
+function pageToastFunction(text) {
+  try {
+    let host = document.getElementById("__rdm-handoff-toast");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "__rdm-handoff-toast";
+      host.style.cssText =
+        "position:fixed;right:16px;bottom:16px;z-index:2147483647;max-width:320px;" +
+        "padding:10px 14px;border-radius:10px;background:rgba(14,17,22,.92);" +
+        "color:#e8edf4;font:13px/1.5 'Segoe UI','Microsoft YaHei UI',sans-serif;" +
+        "box-shadow:0 4px 16px rgba(0,0,0,.35);pointer-events:none;";
+      (document.body || document.documentElement).appendChild(host);
+    }
+    host.textContent = "✓ " + String(text || "已交给 RDM");
+    if (window.__rdmHandoffToastTimer) clearTimeout(window.__rdmHandoffToastTimer);
+    window.__rdmHandoffToastTimer = setTimeout(function () {
+      if (host.parentNode) host.parentNode.removeChild(host);
+    }, 3500);
+  } catch (_err) {
+    /* 页面不允许注入时静默失败 */
+  }
+}
+
+async function showPageToast(tabId, text) {
+  if (!Number.isInteger(tabId) || tabId < 0) return false;
+  try {
+    await browser.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      func: pageToastFunction,
+      args: [String(text || "已交给 RDM")],
+    });
+    return true;
+  } catch (err) {
+    debug(
+      "页面内接管提示注入失败（不阻塞）: " +
+        truncate(err && err.message ? err.message : err, 120)
+    );
+    return false;
+  }
+}
+
+/**
+ * popup 主按钮交接（下载文件 / 选中的链接）。
+ * duplicate 语义（07 §4.3）：不创建第二个任务、不回退浏览器下载。
+ */
+async function handlePopupHandoff(message) {
+  const settings = await loadSettings();
+  const rawUrls = Array.isArray(message && message.urls)
+    ? message.urls
+    : [message && message.url];
+  const urls = sanitizePageLinks(rawUrls).slice(0, MAX_HANDOFF_URLS);
+  if (urls.length === 0) {
+    return { ok: false, code: "no_urls", message: "当前页面没有可交给 RDM 的链接" };
+  }
+  const forceLaunch = !!(message && message.forceLaunch === true);
+  const launchGui = forceLaunch ? true : settings.autoStartGui;
+  const tab = await getActiveTab();
+  const sourcePage = firstHttpUrl([message && message.sourcePage, tab && tab.url]);
+  const preferredName =
+    typeof (message && message.fileName) === "string"
+      ? sanitizeFileName(message.fileName)
+      : "";
+
+  const results = [];
+  let successCount = 0;
+  let duplicateCount = 0;
+  let queuedCount = 0;
+
+  for (const url of urls) {
+    const cached = lookupRequest(url);
+    const fallbackName = cached ? resolveContextFileName(url, cached) : fileNameFromUrl(url);
+    const fileName = urls.length === 1 && preferredName ? preferredName : fallbackName;
+    let request;
+    try {
+      request = await buildRequest({
+        url,
+        fileName,
+        cached,
+        settings,
+        sourcePage,
+      });
+    } catch (err) {
+      const text = String((err && err.message) || err);
+      results.push({
+        url: redactUrl(url),
+        ok: false,
+        code: "internal",
+        message: truncate(text, 160),
+      });
+      continue;
+    }
+    try {
+      const response = await sendHandoff(request, settings, launchGui);
+      if (response && (response.type === "enqueued" || response.type === "queued")) {
+        successCount += 1;
+        if (response.type === "queued") queuedCount += 1;
+        setStatus(
+          "ok",
+          response.type === "enqueued" ? true : response.gui_running === true,
+          ""
+        );
+        await pushRecent(recentEntryFromResponse(request, response));
+        results.push({ url: redactUrl(url), ok: true, status: response.type });
+        continue;
+      }
+      if (response && response.type === "error" && response.code === "duplicate") {
+        successCount += 1;
+        duplicateCount += 1;
+        setStatus("ok", true, "");
+        await pushRecent({
+          fileName: request.file_name || fallbackName,
+          url: redactUrl(url),
+          status: "duplicate",
+          detail: "该下载已在 RDM 中，未重复创建任务",
+        });
+        results.push({ url: redactUrl(url), ok: true, status: "duplicate" });
+        continue;
+      }
+      const detail =
+        response && response.type === "error"
+          ? [response.code, response.message].filter(Boolean).join("：")
+          : "原生宿主响应异常";
+      if (response && response.type === "error" && response.code === "gui_unavailable") {
+        setStatus("ok", false, "");
+      }
+      await pushRecent({
+        fileName: request.file_name || fallbackName,
+        url: redactUrl(url),
+        status: "error",
+        detail: truncate(detail, 140),
+      });
+      results.push({
+        url: redactUrl(url),
+        ok: false,
+        code:
+          response && response.type === "error" && typeof response.code === "string"
+            ? response.code
+            : "internal",
+        message: truncate(detail, 160),
+      });
+    } catch (err) {
+      const text = String((err && err.message) || err);
+      const classified = classifyHostError(text);
+      setStatus(classified.host, false, classified.detail);
+      await pushRecent({
+        fileName: request.file_name || fallbackName,
+        url: redactUrl(url),
+        status: "error",
+        detail: truncate(text, 140),
+      });
+      results.push({
+        url: redactUrl(url),
+        ok: false,
+        code: "host_unavailable",
+        message: truncate(classified.detail || text, 160),
+      });
+    }
+  }
+
+  const ok = successCount > 0;
+  const firstFailure = results.find((item) => !item.ok);
+  const code = ok ? "" : (firstFailure && firstFailure.code) || "internal";
+  let replyMessage;
+  if (!ok) {
+    replyMessage = formatHandoffResult({ ok: false, code }).text;
+  } else if (duplicateCount === results.length) {
+    replyMessage = "该下载已在 RDM 中";
+  } else if (queuedCount > 0) {
+    replyMessage = "已排队，启动 RDM 后自动开始";
+  } else {
+    replyMessage = urls.length > 1 ? "已交给 RDM（" + successCount + " 个）" : "已交给 RDM";
+  }
+  if (ok) {
+    flashBadge(queuedCount > 0 ? "Q" : "✓");
+    refreshStatusSoon();
+    refreshActivitySoon();
+  }
+  return {
+    ok,
+    code,
+    duplicate: duplicateCount > 0 && successCount === duplicateCount,
+    queued: queuedCount > 0,
+    results,
+    message: replyMessage,
+  };
+}
+
+/**
+ * 「打开 RDM」：宿主 v0.3 起支持 `activate`（会显示/激活主窗口，GUI 未运行时可拉起）。
+ * 旧宿主回 `unknown message type`；这里保留向前兼容的降级提示。
+ */
+async function handleOpenRdm() {
+  try {
+    const response = await nativeClient.request({ type: "activate" }, ACTIVATE_TIMEOUT_MS);
+    if (response && response.type === "error") {
+      const unsupported = response.code === "invalid_request";
+      return {
+        ok: false,
+        code: unsupported ? "activate_unsupported" : response.code || "error",
+        message: unsupported
+          ? "当前宿主不支持从浏览器唤起 RDM，请在桌面端任务栏打开"
+          : "无法在桌面端打开 RDM",
+      };
+    }
+    if (response && (response.type === "activated" || response.type === "pong")) {
+      setStatus("ok", true, "");
+      return { ok: true, message: "已打开 RDM" };
+    }
+    return {
+      ok: false,
+      code: "activate_unsupported",
+      message: "当前宿主不支持从浏览器唤起 RDM，请在桌面端任务栏打开",
+    };
+  } catch (err) {
+    const text = String((err && err.message) || err);
+    const classified = classifyHostError(text);
+    setStatus(classified.host, false, classified.detail);
+    return {
+      ok: false,
+      code: "host_unavailable",
+      message: "无法连接本机 RDM，请在桌面端任务栏打开",
+    };
+  }
 }
 
 function recentEntryFromResponse(request, response) {
@@ -1153,9 +1570,24 @@ async function handleDownloadCreated(item) {
       await pushRecent(recentEntryFromResponse(request, response));
       flashBadge(response.type === "enqueued" ? "✓" : "Q");
       refreshStatusSoon();
+      refreshActivitySoon();
       return;
     }
     if (response && response.type === "error") {
+      // duplicate（07 §4.3）：同一 URL 已在 RDM 下载 —— 不创建第二个任务、
+      // 也绝不能回退浏览器下载（否则会得到两份文件）。
+      if (response.code === "duplicate") {
+        setStatus("ok", true, "");
+        await pushRecent({
+          fileName: request.file_name || fileName,
+          url: redactUrl(url),
+          status: "duplicate",
+          detail: "该下载已在 RDM 中，未重复创建任务",
+        });
+        flashBadge("✓");
+        refreshActivitySoon();
+        return;
+      }
       failure = response.code + "：" + response.message;
     }
     await fallbackToBrowser(request, failure || "原生宿主不可用");
@@ -1175,39 +1607,71 @@ async function handleDownloadCreated(item) {
 // 右键菜单
 // ---------------------------------------------------------------------------
 
+const CONTEXT_MENU_IDS = [
+  MENU_LINK_ID,
+  MENU_IMAGE_ID,
+  MENU_MEDIA_ID,
+  MENU_PAGE_ID,
+  MENU_SELECTION_ID,
+  MENU_OPTIONS_ID,
+  "rdm-menu-separator-1",
+  "rdm-menu-separator-2",
+];
+
+/**
+ * 右键菜单（07 §9）：短、按上下文显示、文案与桌面一致。
+ * 解析入口始终显示（是否配置 AI 由桌面端决定，扩展无法读取）；
+ * 子菜单（最近目录等）暂不做。
+ */
 async function ensureContextMenu(settings) {
   const current = settings || (await loadSettings());
-  try {
-    await browser.contextMenus.remove(MENU_ID);
-  } catch (_err) {
-    /* 不存在 */
-  }
-  try {
-    await browser.contextMenus.remove(AI_MENU_ID);
-  } catch (_err) {
-    /* 不存在 */
+  for (const id of CONTEXT_MENU_IDS) {
+    try {
+      await browser.contextMenus.remove(id);
+    } catch (_err) {
+      /* 不存在 */
+    }
   }
   if (!current.contextMenu) return;
-  try {
-    await browser.contextMenus.create({
-      id: MENU_ID,
-      title: "使用 RDM 下载",
-      contexts: ["link", "image", "audio", "video", "selection"],
-    });
-    await browser.contextMenus.create({
-      id: AI_MENU_ID,
-      title: "用 RDM AI 解析此页",
-      contexts: ["page", "link"],
-    });
-  } catch (err) {
-    debug("创建右键菜单失败: " + err);
+  const items = [
+    { id: MENU_LINK_ID, title: "使用 RDM 下载链接", contexts: ["link"] },
+    { id: MENU_IMAGE_ID, title: "用 RDM 下载图像", contexts: ["image"] },
+    { id: MENU_MEDIA_ID, title: "用 RDM 下载媒体", contexts: ["audio", "video"] },
+    {
+      id: "rdm-menu-separator-1",
+      type: "separator",
+      contexts: ["link", "image", "audio", "video", "page", "selection"],
+    },
+    { id: MENU_PAGE_ID, title: "解析页面资源…", contexts: ["page"] },
+    {
+      id: MENU_SELECTION_ID,
+      title: "用 RDM 下载选中的链接",
+      contexts: ["selection"],
+    },
+    {
+      id: "rdm-menu-separator-2",
+      type: "separator",
+      contexts: ["page", "selection"],
+    },
+    { id: MENU_OPTIONS_ID, title: "RDM 设置…", contexts: ["page", "selection"] },
+  ];
+  for (const item of items) {
+    try {
+      await browser.contextMenus.create(item);
+    } catch (err) {
+      debug("创建右键菜单失败（" + item.id + "）: " + err);
+    }
   }
 }
 
+/** 右键转交（链接 / 图片 / 媒体 / 选中的链接）。 */
 async function handleContextMenuClick(info, tab) {
   const settings = await loadSettings();
-  const selection = typeof info.selectionText === "string" ? info.selectionText.trim() : "";
-  const url = firstHttpUrl([info.linkUrl, info.srcUrl, selection]);
+  let url = firstHttpUrl([info.linkUrl, info.srcUrl]);
+  if (!url && typeof info.selectionText === "string" && info.selectionText.trim()) {
+    const selected = parseUrlsFromText(info.selectionText, 1);
+    url = selected.length > 0 ? selected[0] : "";
+  }
   if (!url) {
     flashBadge("!");
     return;
@@ -1227,6 +1691,21 @@ async function handleContextMenuClick(info, tab) {
       setStatus("ok", response.gui_running === true, "");
       await pushRecent(recentEntryFromResponse(request, response));
       flashBadge(response.type === "enqueued" ? "✓" : "Q");
+      refreshActivitySoon();
+      // 页面内提示默认关闭（07 §10）；只在用户主动右键且设置开启时注入。
+      if (settings.pageToast && tab && Number.isInteger(tab.id)) {
+        const name = request.file_name || fileNameFromUrl(url) || "文件";
+        showPageToast(tab.id, "已交给 RDM · " + name).catch(() => {});
+      }
+    } else if (response && response.type === "error" && response.code === "duplicate") {
+      setStatus("ok", true, "");
+      await pushRecent({
+        fileName: request.file_name || fileNameFromUrl(url),
+        url: redactUrl(url),
+        status: "duplicate",
+        detail: "该下载已在 RDM 中，未重复创建任务",
+      });
+      flashBadge("✓");
     } else {
       const detail =
         response && response.type === "error"
@@ -1277,6 +1756,8 @@ async function getState() {
     debug: debugLines.slice(-10),
     extensionVersion: browser.runtime.getManifest().version,
     nativeHost: HOST_NAME,
+    browser: detectBrowserKind(),
+    activity: cachedActivity,
   };
 }
 
@@ -1287,14 +1768,37 @@ browser.runtime.onMessage.addListener((message) => {
   switch (message.type) {
     case "getState":
       return getState();
+    case "getTabContext":
+      return handleGetTabContext();
+    case "getActivity":
+      return getActivityResult();
+    case "handoff":
+      return handlePopupHandoff(message);
+    case "openRdm":
+      return handleOpenRdm();
     case "testConnection":
-      return refreshStatus().then(() => getState());
+      return (async () => {
+        const startedAt = Date.now();
+        await refreshStatus();
+        const snapshot = await getState();
+        snapshot.latencyMs = Date.now() - startedAt;
+        return snapshot;
+      })();
     case "setSettings":
       return saveSettings(message.settings).then(() => getState());
     case "clearRecent":
-      return clearRecent().then(() => getState());
+      return clearRecent()
+        .then(() => getState())
+        .then((snapshot) => Object.assign(snapshot, { undone: false }));
+    case "restoreRecent":
+      return restoreRecent()
+        .then(() => getState())
+        .then((snapshot) => Object.assign(snapshot, { undone: true }));
     case "status":
-      return fetchDownloadStatus();
+      return fetchDownloadStatus().then((result) => {
+        recordActivity(result);
+        return result;
+      });
     case "aiParse":
       return handleAiParseRequest(message);
     case "openOptions":
@@ -1360,26 +1864,54 @@ browser.downloads.onCreated.addListener((item) => {
 
 browser.contextMenus.onClicked.addListener((info, tab) => {
   if (!info || typeof info.menuItemId !== "string") return;
-  if (info.menuItemId === AI_MENU_ID) {
+  if (info.menuItemId === MENU_OPTIONS_ID) {
+    browser.runtime.openOptionsPage().catch((err) => debug("打开设置失败: " + err));
+    return;
+  }
+  if (info.menuItemId === MENU_PAGE_ID) {
     handleContextMenuAiParse(info, tab).catch((err) => {
-      debug("右键 AI 解析失败: " + err);
+      debug("右键解析页面资源失败: " + err);
     });
     return;
   }
-  if (info.menuItemId !== MENU_ID) return;
+  if (
+    info.menuItemId !== MENU_LINK_ID &&
+    info.menuItemId !== MENU_IMAGE_ID &&
+    info.menuItemId !== MENU_MEDIA_ID &&
+    info.menuItemId !== MENU_SELECTION_ID
+  ) {
+    return;
+  }
   handleContextMenuClick(info, tab).catch((err) => {
     debug("右键转交失败: " + err);
   });
 });
 
 browser.alarms.onAlarm.addListener((alarm) => {
-  if (!alarm || alarm.name !== PING_ALARM) return;
-  refreshStatus().catch(() => {});
+  if (!alarm || typeof alarm.name !== "string") return;
+  if (alarm.name === PING_ALARM) {
+    refreshStatus().catch(() => {});
+    return;
+  }
+  if (alarm.name === ACTIVITY_ALARM) {
+    // badge 活动数兜底轮询（07 §8）。alarms 最小 1 分钟，popup 打开期间
+    // 有更实时的 1s 轮询，这里只保证关闭 popup 后 badge 不会长期失真。
+    fetchDownloadStatus()
+      .then((result) => recordActivity(result))
+      .catch(() => {});
+  }
 });
 
-browser.runtime.onInstalled.addListener(() => {
+browser.runtime.onInstalled.addListener((details) => {
   initialize()
     .then(() => ensureContextMenu())
+    .then(() => {
+      // 首次安装引导（07 §12）：打开设置页的 onboarding 卡。
+      if (details && details.reason === "install") {
+        return browser.runtime.openOptionsPage().catch(() => {});
+      }
+      return undefined;
+    })
     .catch((err) => debug("初始化失败: " + err));
 });
 
@@ -1390,9 +1922,15 @@ browser.runtime.onStartup.addListener(() => {
 });
 
 browser.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local" || !changes[SETTINGS_KEY]) return;
-  cachedSettings = normalizeSettings(changes[SETTINGS_KEY].newValue);
-  updateBadge();
+  if (areaName !== "local") return;
+  if (changes[SETTINGS_KEY]) {
+    cachedSettings = normalizeSettings(changes[SETTINGS_KEY].newValue);
+    updateBadge();
+  }
+  if (changes[ACTIVITY_KEY]) {
+    cachedActivity = normalizeStoredActivity(changes[ACTIVITY_KEY].newValue);
+    updateBadge();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1404,6 +1942,7 @@ const STATUS_MAX_AGE_MS = 5 * 60 * 1000;
 async function initialize() {
   await loadSettings();
   status = await loadStoredStatus();
+  await loadStoredActivity();
   updateBadge();
   await ensureAlarm();
   // 事件页会被 webRequest 事件频繁唤醒；只有状态过期/未知时才拉起原生宿主，
@@ -1415,3 +1954,5 @@ async function initialize() {
 }
 
 void initialize().catch((err) => debug("后台初始化失败: " + err));
+
+

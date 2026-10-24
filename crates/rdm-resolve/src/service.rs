@@ -11,7 +11,15 @@
 //! trace after every run: recipe replay updates `index.json` health and every
 //! run persists `runs/<run_id>.jsonl` when a trace root is configured. A
 //! trace/index I/O failure only logs a warning and never changes the outcome.
+//!
+//! v0.7 (design 16 §1) adds the **resolve experience pipeline** behind the
+//! opt-in [`ResolverService::with_auto_publish`]: one successful AI exploration
+//! is replayed through the model-free publish gates and stored as an active
+//! recipe; a structurally drifted method repaired by exploration is promoted to
+//! its next version; recipe hits are marked in `manifest.notes`. Every step is
+//! best-effort and never changes the resolution outcome.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -25,7 +33,7 @@ use crate::contract::{
 };
 use crate::http::HttpTool;
 use crate::policy::ResolvePolicy;
-use crate::recipe::{Recipe, RecipeRunner};
+use crate::recipe::{Recipe, RecipeOutput, RecipeRunner};
 use crate::registry::RecipeRegistry;
 use crate::trace::{self, RunStep, RunTrace, TraceStore};
 use crate::verify::{Verifier, VerifyHints};
@@ -50,6 +58,11 @@ pub struct ResolverService {
     /// Optional browser page snapshot (P4b-b1, §11.11 v0.13): validated against
     /// the request host, consumed only by the no-method exploration fallback.
     page_snapshot: Option<crate::page_snapshot::PageSnapshot>,
+    /// Opt-in resolve experience pipeline (design 16 §1.2): publish a successful
+    /// exploration's persisted draft through the model-free gates and promote a
+    /// repaired method to its next version. Default `false`; the GUI enables it,
+    /// CLI/MCP behavior stays unchanged.
+    auto_publish: bool,
 }
 
 impl ResolverService {
@@ -63,6 +76,7 @@ impl ResolverService {
             trace_root: None,
             credentials: crate::credentials::HostCredentials::default(),
             page_snapshot: None,
+            auto_publish: false,
         }
     }
 
@@ -144,6 +158,21 @@ impl ResolverService {
         self
     }
 
+    /// Enable the opt-in resolve experience pipeline (design 16 §1.2): after a
+    /// successful exploration, replay the persisted draft through the model-free
+    /// R1/R2/R3/R6 gates with this request's URL as the single positive sample
+    /// and publish it as an active recipe; after a structural recipe failure that
+    /// exploration repaired, promote the new steps to the failed recipe's next
+    /// version. Successful recipe hits are always marked in `manifest.notes`.
+    ///
+    /// Default `false` (CLI/MCP behavior unchanged; the GUI enables it). Every
+    /// publish is best-effort: a failed gate or an I/O error only leaves the
+    /// draft in place and never changes the outcome, its status or the run trace.
+    pub fn with_auto_publish(mut self, enabled: bool) -> Self {
+        self.auto_publish = enabled;
+        self
+    }
+
     /// The configured, usable provider (if any).
     fn ai_config(&self) -> Option<&rdm_ai::AiConfig> {
         self.ai.as_ref().filter(|config| config.is_configured())
@@ -166,54 +195,188 @@ impl ResolverService {
     /// Resolve one request, then record method health + a sanitized run trace as
     /// best-effort side effects (`docs/architecture.md` §11.10).
     ///
+    /// With [`Self::with_auto_publish`] the persisted exploration draft is
+    /// published (or the repaired method promoted) **before** health/trace are
+    /// written, so the trace header reflects the final published state.
+    ///
     /// Always returns an outcome (never panics, never relies on the caller to
     /// interpret a partially filled manifest). I/O failures while persisting the
-    /// trace/index only log `tracing::warn!` and never change the outcome, its
-    /// status or any caller-visible exit code.
+    /// trace/index/published recipe only log `tracing::warn!` and never change
+    /// the outcome, its status or any caller-visible exit code.
     pub async fn resolve(&mut self, request: ResolveRequest) -> ResolveOutcome {
         let started = Instant::now();
         let mode = trace_mode(request.mode);
-        let report = self.resolve_inner(&request, started).await;
+        let mut report = self.resolve_inner(&request, started).await;
+        if self.auto_publish {
+            self.maybe_auto_publish(&request, &mut report).await;
+        }
         self.apply_health(&report);
         self.write_run_trace(&request, &report, mode);
         report.outcome
     }
 
-    /// Persist the health update of a recipe replay (best-effort).
+    /// Explicit "use this experience" (design 18 §2.5): replay the
+    /// experience's main flow plus every merged supplementary flow on any URL
+    /// matching its scope.
+    ///
+    /// Unlike [`Self::resolve`] this **never** falls back to AI or exploration:
+    /// a non-matching URL yields `recipe_no_match` immediately. Usage/health of
+    /// every replayed flow is recorded best-effort, and a successful outcome
+    /// carries the note `使用解析经验 <id>@v<n>（跳过 AI，N 个资源）`.
+    pub async fn apply_experience(
+        &self,
+        experience_id: &str,
+        url: &str,
+        budget: Budget,
+    ) -> ResolveOutcome {
+        let started = Instant::now();
+        let run_id = new_id("run");
+        let diagnostics = Diagnostics::default();
+        let trimmed = url.trim();
+        let parsed = match Url::parse(trimmed) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return fail(
+                    run_id,
+                    ResolveError::new(
+                        ResolveErrorKind::InvalidUrl,
+                        format!("invalid URL: {error}"),
+                    ),
+                    diagnostics,
+                    started,
+                )
+            }
+        };
+        if let Err(error) = self.policy.check_url(&parsed) {
+            return fail(run_id, error, diagnostics, started);
+        }
+        let flows = self.registry.bundle_recipes(experience_id);
+        let Some(main) = flows.first() else {
+            return fail(
+                run_id,
+                ResolveError::new(
+                    ResolveErrorKind::RecipeNoMatch,
+                    format!("解析经验 {experience_id:?} 不存在或没有可用流程"),
+                ),
+                diagnostics,
+                started,
+            );
+        };
+        if main.matches(&parsed).is_none() {
+            return fail(
+                run_id,
+                ResolveError::new(
+                    ResolveErrorKind::RecipeNoMatch,
+                    format!(
+                        "解析经验 {experience_id}@v{} 的匹配规则不适用于 {trimmed}",
+                        main.version
+                    ),
+                ),
+                diagnostics,
+                started,
+            );
+        }
+        let budget = budget.capped_by(self.max_budget);
+        let request = ResolveRequest {
+            url: trimmed.to_owned(),
+            ..ResolveRequest::default()
+        };
+        let mut report = self
+            .replay_experience_flows(
+                &request,
+                &flows,
+                &parsed,
+                budget,
+                run_id,
+                diagnostics,
+                started,
+            )
+            .await;
+        // Record usage/health of every replayed flow before the outcome is
+        // handed to the caller (best-effort, never changes the result).
+        self.persist_report_health(&report);
+        let version = main.version;
+        let resources = report
+            .outcome
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.downloadable().count())
+            .unwrap_or(0);
+        if let Some(manifest) = report.outcome.manifest.as_mut() {
+            manifest.notes.insert(
+                0,
+                format!("使用解析经验 {experience_id}@v{version}（跳过 AI，{resources} 个资源）"),
+            );
+        }
+        report.outcome
+    }
+
+    /// Persist the health and usage/richness update of a recipe replay
+    /// (best-effort, design 17 §1).
     ///
     /// v0.15: health is recorded for the **version that actually replayed**
     /// (`report.recipe.version`); the index entry's `health` field mirrors the
-    /// active version inside the registry.
+    /// active version inside the registry. Bundle replays record one update per
+    /// replayed flow (`report.health_extra`).
     fn apply_health(&mut self, report: &RunReport) {
-        let Some(update) = &report.health else {
-            return;
-        };
-        let Some(recipe) = &report.recipe else {
-            return;
-        };
-        let now = now_ms();
-        let result = match update {
-            HealthUpdate::Success => self.registry.record_success(
+        let run_id = report.outcome.run_id.clone();
+        if let (Some(recipe), Some(update)) = (&report.recipe, &report.health) {
+            if let Err(error) = record_health_update(
+                &mut self.registry,
                 &recipe.id,
                 recipe.version,
-                &report.outcome.run_id,
-                now,
-            ),
-            HealthUpdate::Failure { kind, step_id } => self.registry.record_failure(
-                &recipe.id,
-                recipe.version,
-                &report.outcome.run_id,
-                *kind,
-                step_id.as_deref(),
-                now,
-            ),
+                update,
+                &run_id,
+            ) {
+                tracing::warn!(
+                    recipe = %recipe.id,
+                    error = %error,
+                    "rdm-resolve: cannot persist recipe health (ignored)"
+                );
+            }
+        }
+        for (id, version, update) in &report.health_extra {
+            if let Err(error) =
+                record_health_update(&mut self.registry, id, *version, update, &run_id)
+            {
+                tracing::warn!(
+                    recipe = %id,
+                    error = %error,
+                    "rdm-resolve: cannot persist bundled recipe health (ignored)"
+                );
+            }
+        }
+    }
+
+    /// Persist usage/health for a read-only replay (`apply_experience`).
+    ///
+    /// The service is borrowed immutably there, so the registry is reloaded from
+    /// disk; without an on-disk root the counters cannot be recorded.
+    fn persist_report_health(&self, report: &RunReport) {
+        let Some(root) = self.registry.root().map(std::path::Path::to_path_buf) else {
+            return;
         };
-        if let Err(error) = result {
-            tracing::warn!(
-                recipe = %recipe.id,
-                error = %error,
-                "rdm-resolve: cannot persist recipe health (ignored)"
-            );
+        let mut registry = RecipeRegistry::with_root(root);
+        let run_id = report.outcome.run_id.clone();
+        if let (Some(recipe), Some(update)) = (&report.recipe, &report.health) {
+            if let Err(error) =
+                record_health_update(&mut registry, &recipe.id, recipe.version, update, &run_id)
+            {
+                tracing::warn!(
+                    recipe = %recipe.id,
+                    error = %error,
+                    "rdm-resolve: cannot persist experience-apply health (ignored)"
+                );
+            }
+        }
+        for (id, version, update) in &report.health_extra {
+            if let Err(error) = record_health_update(&mut registry, id, *version, update, &run_id) {
+                tracing::warn!(
+                    recipe = %id,
+                    error = %error,
+                    "rdm-resolve: cannot persist bundled experience-apply health (ignored)"
+                );
+            }
         }
     }
 
@@ -338,6 +501,31 @@ impl ResolverService {
             state: "matched".to_owned(),
         };
 
+        // Design 18 §2.5: a matched experience with merged supplementary flows
+        // replays the whole bundle (main flow first, supplements after it).
+        let bundle_flows = self.experience_bundle_flows(&recipe.id);
+        if bundle_flows.len() > 1 {
+            let report = self
+                .replay_experience_flows(
+                    request,
+                    &bundle_flows,
+                    &url,
+                    budget,
+                    run_id,
+                    diagnostics,
+                    started,
+                )
+                .await;
+            if report.outcome.status == RunStatus::Failed
+                && self.should_auto_repair(request, &report)
+            {
+                return self
+                    .auto_repair(request, report, url, budget, started, snapshot.as_ref())
+                    .await;
+            }
+            return report;
+        }
+
         let mut http = match HttpTool::new(self.policy.clone(), recipe.budget_within(budget)) {
             Ok(http) => http.with_credentials(self.credentials_for_run()),
             Err(error) => {
@@ -412,6 +600,7 @@ impl ResolverService {
             verification,
             &mut diagnostics,
         );
+        let downloadable = manifest.downloadable().count();
         let succeeded = manifest
             .resources
             .first()
@@ -422,10 +611,7 @@ impl ResolverService {
             RunStatus::Partial
         };
         if succeeded {
-            let verified = manifest
-                .downloadable()
-                .count()
-                .max(manifest.resources.len().min(1));
+            let verified = downloadable.max(manifest.resources.len().min(1));
             diagnostics.summary = format!(
                 "recipe {}@{} resolved {} resource(s); {} verified",
                 recipe.id,
@@ -440,7 +626,9 @@ impl ResolverService {
             );
         }
         let health = if succeeded {
-            HealthUpdate::Success
+            HealthUpdate::Success {
+                resources: u32::try_from(downloadable).unwrap_or(u32::MAX),
+            }
         } else {
             HealthUpdate::Failure {
                 kind: diagnostics
@@ -466,6 +654,14 @@ impl ResolverService {
         report.recipe = Some(recipe_ref);
         report.steps = recipe_trace_steps(steps_run, None);
         report.health = Some(health);
+        // Design 16 §1.2.3: a deterministic recipe replay is visible in the
+        // notes (GUI status card renders them), so "no AI was called" is true
+        // for this run without a contract change.
+        if let Some(manifest) = report.outcome.manifest.as_mut() {
+            manifest
+                .notes
+                .push(recipe_hit_note(&recipe.id, recipe.version));
+        }
         report
     }
 
@@ -562,15 +758,23 @@ impl ResolverService {
                     None,
                 )
                 .await;
-                if outcome.status == RunStatus::Succeeded {
+                let publish = if outcome.status == RunStatus::Succeeded {
                     self.attach_draft(request, &mut outcome, &draft_actions)
-                        .await;
-                }
+                        .await
+                        .map(|draft| PublishCandidate {
+                            draft,
+                            repair: None,
+                        })
+                } else {
+                    None
+                };
                 return RunReport {
                     outcome,
                     recipe: None,
                     steps,
                     health: None,
+                    health_extra: Vec::new(),
+                    publish,
                 };
             }
             if request.mode == ResolveMode::Explore {
@@ -655,15 +859,23 @@ impl ResolverService {
             ),
             AUTO_REPAIR_SUMMARY_CHARS,
         );
-        if outcome.status == RunStatus::Succeeded {
+        let publish = if outcome.status == RunStatus::Succeeded {
             self.attach_draft(request, &mut outcome, &draft_actions)
-                .await;
-        }
+                .await
+                .map(|draft| PublishCandidate {
+                    draft,
+                    repair: None,
+                })
+        } else {
+            None
+        };
         RunReport {
             outcome,
             recipe: None,
             steps,
             health: None,
+            health_extra: Vec::new(),
+            publish,
         }
     }
 
@@ -673,38 +885,35 @@ impl ResolverService {
     /// is not expressible as a recipe, or an I/O error only leaves
     /// `outcome.recipe = None`.
     ///
+    /// Returns the persisted draft so [`Self::maybe_auto_publish`] can publish it
+    /// in the same run (design 16 §1.2), or `None` when no draft was written.
+    ///
     /// P3b-b (§11.11 v0.12): when deterministic [`crate::draft::distill`] cannot
     /// express the chain and the run still has model-call budget, **one** extra
     /// model call may generate a draft proposal. That call is always counted in
-    /// `diagnostics.llm_calls` (success, unusable output or transport error) and
-    /// is never attempted when a draft was distilled deterministically.
+    /// `diagnostics.llm_calls` **and** its token usage is merged into
+    /// `diagnostics.llm_*` (success, unusable output or transport error) so the
+    /// resource monitor sees the full cost of the run; it is never attempted when
+    /// a draft was distilled deterministically.
     async fn attach_draft(
         &self,
         request: &ResolveRequest,
         outcome: &mut ResolveOutcome,
         actions: &[crate::draft::DraftAction],
-    ) {
-        let Some(root) = self.trace_root.as_deref() else {
-            return;
-        };
-        let Some(manifest) = outcome.manifest.as_ref() else {
-            return;
-        };
-        let emitted = manifest.resources.clone();
+    ) -> Option<crate::draft::RecipeDraft> {
+        let root = self.trace_root.as_deref()?;
+        let emitted = outcome.manifest.as_ref()?.resources.clone();
         let created_ms = now_ms();
         if let Some(draft) =
             crate::draft::distill(request, &outcome.run_id, created_ms, actions, &emitted)
         {
-            self.persist_draft(root, outcome, draft, "draft saved");
-            return;
+            return self.persist_draft(root, outcome, draft, "draft saved");
         }
         tracing::debug!(
             run_id = %outcome.run_id,
             "rdm-resolve: exploration result is not expressible as a deterministic draft"
         );
-        let Some(ai) = self.ai_config() else {
-            return;
-        };
+        let ai = self.ai_config()?;
         // Never exceed the caller's model-call budget: the exploration already
         // spent `llm_calls`, and the assisted draft is one more call.
         if outcome.diagnostics.llm_calls >= request.llm_call_limit() {
@@ -713,9 +922,9 @@ impl ResolverService {
                 llm_calls = outcome.diagnostics.llm_calls,
                 "rdm-resolve: no model-call budget left for a model-assisted draft"
             );
-            return;
+            return None;
         }
-        let generated = crate::model_draft::generate(
+        let (generated, usage) = crate::model_draft::generate_with_usage(
             ai,
             request,
             &outcome.run_id,
@@ -725,32 +934,43 @@ impl ResolverService {
         )
         .await;
         // The extra call counts regardless of its outcome (transport error or
-        // unusable proposal still consumed a provider request).
-        outcome.diagnostics.llm_calls = outcome.diagnostics.llm_calls.saturating_add(1);
+        // unusable proposal still consumed a provider request), and its token
+        // usage is merged in the same step so `llm_calls` and the token counters
+        // can never diverge (`docs/design/13-resource-monitor.md` accounting).
+        record_model_draft_call(&mut outcome.diagnostics, usage);
         match generated {
             Ok(Some(draft)) => {
                 self.persist_draft(root, outcome, draft, "model-assisted draft saved")
             }
-            Ok(None) => tracing::debug!(
-                run_id = %outcome.run_id,
-                "rdm-resolve: model-assisted draft proposal rejected by server-side validation"
-            ),
-            Err(error) => tracing::warn!(
-                run_id = %outcome.run_id,
-                error = %error,
-                "rdm-resolve: model-assisted draft call failed (ignored)"
-            ),
+            Ok(None) => {
+                tracing::debug!(
+                    run_id = %outcome.run_id,
+                    "rdm-resolve: model-assisted draft proposal rejected by server-side validation"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %outcome.run_id,
+                    error = %error,
+                    "rdm-resolve: model-assisted draft call failed (ignored)"
+                );
+                None
+            }
         }
     }
 
     /// Save one draft and expose it on the outcome (best-effort).
+    ///
+    /// Returns the persisted draft so the opt-in auto-publish step can reuse it;
+    /// a write failure only warns and leaves the successful outcome untouched.
     fn persist_draft(
         &self,
         root: &std::path::Path,
         outcome: &mut ResolveOutcome,
         draft: crate::draft::RecipeDraft,
         note_label: &str,
-    ) {
+    ) -> Option<crate::draft::RecipeDraft> {
         match crate::draft::save_draft(root, &draft) {
             Ok(path) => {
                 if let Some(manifest) = outcome.manifest.as_mut() {
@@ -759,15 +979,313 @@ impl ResolverService {
                         .push(format!("{note_label}: {}", path.display()));
                 }
                 outcome.recipe = Some(RecipeRef {
-                    id: draft.id,
+                    id: draft.id.clone(),
                     version: draft.version,
                     state: "draft".to_owned(),
                 });
+                Some(draft)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %outcome.run_id,
+                    error = %error,
+                    "rdm-resolve: cannot persist recipe draft (ignored)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Free experience id for a *new* (complementary) publication.
+    ///
+    /// Automatic draft ids are deterministic per `(host, input URL, final URL)`,
+    /// so a second complementary flow for the same page would collide with the
+    /// existing experience; suffix the id instead of overwriting it.
+    fn unique_experience_id(&self, base: &str) -> String {
+        let is_taken = |id: &str| {
+            self.registry.latest_version(id).is_some() || self.registry.entry(id).is_some()
+        };
+        if !is_taken(base) {
+            return base.to_owned();
+        }
+        for suffix in 2..=64u32 {
+            let candidate = format!("{base}-{suffix}");
+            if !is_taken(&candidate) {
+                return candidate;
+            }
+        }
+        format!("{base}-{}", now_ms())
+    }
+
+    /// Publish the run's persisted draft through the model-free replay gates and
+    /// (for an auto-repair run) promote it to the failed method's next version.
+    ///
+    /// Opt-in via [`Self::with_auto_publish`]; design 16 §1.2 and design 18
+    /// §2.5. Best-effort by contract: the gates are
+    /// [`crate::draft::evaluate_publish`] (R1/R2/R3/R6, one positive sample =
+    /// this request URL, no model call) and a failed gate or I/O error only
+    /// appends the design note / logs a warning. Status and diagnostics never
+    /// change, and no credential/header value is written.
+    ///
+    /// Best-flow decision since experience 2.0: when the new flow produces a
+    /// resource *kind* the same-scope experience does not have yet
+    /// (cover vs video), it is published as a **new, mergeable** experience;
+    /// otherwise the v1 quantity gate applies (keep the richer flow, upgrade
+    /// only when richer, repair always upgrades).
+    async fn maybe_auto_publish(&mut self, request: &ResolveRequest, report: &mut RunReport) {
+        if report.outcome.status != RunStatus::Succeeded || report.outcome.manifest.is_none() {
+            return;
+        }
+        let Some(candidate) = report.publish.take() else {
+            return;
+        };
+        let Some(root) = self.trace_root.clone() else {
+            return;
+        };
+        let budget = request
+            .budget
+            .unwrap_or(self.default_budget)
+            .capped_by(self.max_budget);
+        let sample = request.url.trim().to_owned();
+        // Design 17 §1: richness is the number of downloadable resources this
+        // successful run produced. A successful exploration manifest only keeps
+        // verified candidates, so its length is that count.
+        let (new_resources, new_kinds) = report
+            .outcome
+            .manifest
+            .as_ref()
+            .map(|manifest| {
+                (
+                    u32::try_from(manifest.resources.len()).unwrap_or(u32::MAX),
+                    resource_kinds(manifest),
+                )
+            })
+            .unwrap_or((0, Vec::new()));
+        let (mut draft, promotion) = match candidate.repair.as_ref() {
+            Some(failed) => match promote_repair_draft(&candidate.draft, failed) {
+                Some(draft) => {
+                    let origin = (failed.id.clone(), failed.version);
+                    (draft, Some(origin))
+                }
+                None => {
+                    tracing::warn!(
+                        recipe = %failed.id,
+                        "rdm-resolve: cannot promote the repaired recipe draft (ignored)"
+                    );
+                    return;
+                }
+            },
+            None => (candidate.draft.clone(), None),
+        };
+
+        // Best-flow gate (design 17 §2.3 / design 18 §2.5). `existing` is the
+        // same-scope experience with its kind set and bundle richness.
+        let existing: Option<ScopeExperience> = if promotion.is_none() {
+            self.registry
+                .find_experience_by_scope(
+                    &draft.recipe.matcher.hosts,
+                    draft.recipe.matcher.url_pattern.as_deref(),
+                )
+                .map(|recipe| {
+                    let entry = self.registry.entry(&recipe.id).cloned().unwrap_or_default();
+                    let bundle_best = entry
+                        .bundled
+                        .iter()
+                        .map(|bundled| {
+                            self.registry
+                                .entry(&bundled.id)
+                                .map(|entry| entry.best_resources)
+                                .unwrap_or(0)
+                        })
+                        .sum();
+                    ScopeExperience {
+                        id: recipe.id.clone(),
+                        active_version: if entry.active_version != 0 {
+                            entry.active_version
+                        } else {
+                            recipe.version
+                        },
+                        best_resources: entry.best_resources,
+                        resource_kinds: entry.resource_kinds.clone(),
+                        bundle_best,
+                    }
+                })
+        } else {
+            None
+        };
+        // Full richness of the candidate *as a version of the existing
+        // experience*: the existing bundled flows are kept, so their best count
+        // is added (design 18 §2.5).
+        let published_resources = new_resources.saturating_add(
+            existing
+                .as_ref()
+                .map(|existing| existing.bundle_best)
+                .unwrap_or(0),
+        );
+        // Kind complement: a new resource kind means the two experiences are
+        // complementary, not competing (design 18 §2.5 step 3).
+        let complementary = existing.as_ref().is_some_and(|existing| {
+            !existing.resource_kinds.is_empty()
+                && new_kinds
+                    .iter()
+                    .any(|kind| !existing.resource_kinds.contains(kind))
+        });
+        if let Some(existing) = &existing {
+            if !complementary
+                && existing.best_resources > 0
+                && published_resources <= existing.best_resources
+            {
+                push_manifest_note(
+                    &mut report.outcome,
+                    experience_kept_note(
+                        &existing.id,
+                        existing.active_version,
+                        existing.best_resources,
+                        new_resources,
+                    ),
+                );
+                report.outcome.recipe = Some(RecipeRef {
+                    id: existing.id.clone(),
+                    version: existing.active_version,
+                    state: "kept".to_owned(),
+                });
+                // The exploration draft lost: it must not linger as a
+                // publishable candidate (best-effort, the outcome is decided).
+                remove_candidate_draft(&root, &candidate.draft.id);
+                return;
+            }
+        }
+        if promotion.is_none() {
+            match &existing {
+                // Same kinds: upgrade the existing experience (next version).
+                Some(existing) if !complementary => {
+                    let Some(next) = self
+                        .registry
+                        .latest_version(&existing.id)
+                        .and_then(|latest| latest.checked_add(1))
+                    else {
+                        tracing::warn!(
+                            recipe = %existing.id,
+                            "rdm-resolve: cannot allocate the next experience version (ignored)"
+                        );
+                        return;
+                    };
+                    draft.recipe.id = existing.id.clone();
+                    draft.recipe.version = next;
+                }
+                // Complementary kinds: publish as a separate new experience so
+                // the user can merge the two later.
+                _ => {
+                    draft.recipe.id = self.unique_experience_id(&candidate.draft.id);
+                    draft.recipe.version = 1;
+                }
+            }
+        }
+
+        let mut evaluation = crate::draft::evaluate_publish(
+            &draft,
+            std::slice::from_ref(&sample),
+            &[],
+            &self.policy,
+            budget,
+        )
+        .await;
+        if !evaluation.required_passed {
+            tracing::debug!(
+                draft = %draft.id,
+                "rdm-resolve: exploration draft failed the R1/R2/R3/R6 publish gates"
+            );
+            push_manifest_note(&mut report.outcome, experience_gate_failed_note());
+            return;
+        }
+        // Kinds recorded for the published experience: repairs and new
+        // experiences keep their own set, an upgrade unions the old kinds in.
+        let kinds_to_store: Vec<String> = match (&existing, complementary, &promotion) {
+            (Some(existing), false, None) => existing
+                .resource_kinds
+                .iter()
+                .cloned()
+                .chain(new_kinds.iter().cloned())
+                .collect(),
+            _ => new_kinds.clone(),
+        };
+        match crate::draft::publish(&mut self.registry, &root, &draft, &mut evaluation) {
+            Ok(recipe_ref) => {
+                match (&promotion, &existing, complementary) {
+                    (Some((id, old_version)), _, _) => push_manifest_note(
+                        &mut report.outcome,
+                        experience_updated_note(
+                            id,
+                            *old_version,
+                            recipe_ref.version,
+                            published_resources,
+                        ),
+                    ),
+                    (None, Some(existing), false) => push_manifest_note(
+                        &mut report.outcome,
+                        experience_upgraded_note(
+                            &existing.id,
+                            existing.active_version,
+                            recipe_ref.version,
+                            existing.best_resources,
+                            published_resources,
+                        ),
+                    ),
+                    (None, Some(existing), true) => {
+                        push_manifest_note(
+                            &mut report.outcome,
+                            experience_saved_note(&recipe_ref.id, recipe_ref.version),
+                        );
+                        push_manifest_note(
+                            &mut report.outcome,
+                            experience_complement_note(&existing.id),
+                        );
+                    }
+                    (None, None, _) => push_manifest_note(
+                        &mut report.outcome,
+                        experience_saved_note(&recipe_ref.id, recipe_ref.version),
+                    ),
+                }
+                report.outcome.recipe = Some(recipe_ref.clone());
+                // Design 17 §1: fill first-created time, first source URL,
+                // per-version creation times and richness. A repair resets the
+                // old (structurally invalid) flow's best-resource baseline.
+                if let Err(error) = self.registry.note_publish(
+                    &recipe_ref.id,
+                    recipe_ref.version,
+                    published_resources,
+                    Some(sample.as_str()),
+                    now_ms(),
+                    promotion.is_some(),
+                ) {
+                    tracing::warn!(
+                        recipe = %recipe_ref.id,
+                        error = %error,
+                        "rdm-resolve: cannot persist experience metadata (ignored)"
+                    );
+                }
+                // Design 18 §2.5 step 2: record the resource kinds so the next
+                // same-scope flow can detect complementarity.
+                if let Err(error) = self
+                    .registry
+                    .set_resource_kinds(&recipe_ref.id, &kinds_to_store)
+                {
+                    tracing::warn!(
+                        recipe = %recipe_ref.id,
+                        error = %error,
+                        "rdm-resolve: cannot persist experience resource kinds (ignored)"
+                    );
+                }
+                if promotion.is_some() {
+                    // `publish` only removes drafts for the promoted id; the
+                    // original distilled draft has its own id, so drop it here.
+                    remove_candidate_draft(&root, &candidate.draft.id);
+                }
             }
             Err(error) => tracing::warn!(
-                run_id = %outcome.run_id,
+                draft = %draft.id,
                 error = %error,
-                "rdm-resolve: cannot persist recipe draft (ignored)"
+                "rdm-resolve: cannot auto-publish the exploration draft (ignored)"
             ),
         }
     }
@@ -870,11 +1388,278 @@ impl ResolverService {
             );
         }
 
+        // Design 16 §1.2.2: a successful repair promotes the freshly distilled
+        // steps as the next version of the drifted method (same id/matcher),
+        // but only when the run actually persisted a draft.
+        if let Some(candidate) = repaired.publish.as_mut() {
+            if let Some(failed) = self.registry.get(&recipe_ref.id, Some(recipe_ref.version)) {
+                candidate.repair = Some(failed.clone());
+            }
+        }
+
         // Header + health refer to the drifted method; the outcome keeps the
         // exploration result (manifest / draft recipe ref / exploration error).
         repaired.recipe = Some(recipe_ref);
         repaired.health = report.health;
+        repaired.health_extra = report.health_extra;
         repaired
+    }
+
+    /// Recipes of one experience's bundle when supplementary flows were merged
+    /// into it (`bundle_recipes` already returns the main flow when nothing was
+    /// merged, which the caller can recognize by `len == 1`).
+    fn experience_bundle_flows(&self, id: &str) -> Vec<Recipe> {
+        match self.registry.entry(id) {
+            Some(entry) if !entry.bundled.is_empty() => self.registry.bundle_recipes(id),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Replay an experience's main flow plus every merged supplementary flow
+    /// (design 18 §2.5).
+    ///
+    /// Each flow runs with its own [`crate::http::HttpTool`] budget capped by
+    /// `budget` (the design risk notes that a bundle can therefore spend more
+    /// than one flow's budget in total), every emit is verified and resources
+    /// are de-duplicated by URL. Any successful flow makes the run
+    /// `Succeeded`; only when **every** flow fails is the run `Failed` (which
+    /// lets `mode=auto` trigger the regular repair path).
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_experience_flows(
+        &self,
+        request: &ResolveRequest,
+        flows: &[Recipe],
+        url: &Url,
+        budget: Budget,
+        run_id: String,
+        mut diagnostics: Diagnostics,
+        started: Instant,
+    ) -> RunReport {
+        let Some(main) = flows.first() else {
+            return RunReport::new(fail(
+                run_id,
+                ResolveError::new(
+                    ResolveErrorKind::RecipeNoMatch,
+                    "experience has no replayable flow".to_owned(),
+                ),
+                diagnostics,
+                started,
+            ));
+        };
+        let mut replays: Vec<FlowReplay> = Vec::with_capacity(flows.len());
+        for flow in flows {
+            let mut replay = FlowReplay {
+                recipe: flow.clone(),
+                steps_run: 0,
+                error: None,
+                success: None,
+                http_requests: 0,
+                bytes_read: 0,
+            };
+            let mut http = match HttpTool::new(self.policy.clone(), flow.budget_within(budget)) {
+                Ok(http) => http.with_credentials(self.credentials_for_run()),
+                Err(error) => {
+                    replay.error = Some((error.kind, None, error.detail));
+                    replays.push(replay);
+                    continue;
+                }
+            };
+            let vars = flow.matches(url).unwrap_or_default();
+            let (run_result, steps_run) = {
+                let mut runner = RecipeRunner::new(&mut http, flow);
+                runner.seed(vars);
+                let result = runner.run().await;
+                (result, runner.steps_run())
+            };
+            replay.steps_run = steps_run;
+            replay.http_requests = http.budget().requests();
+            replay.bytes_read = http.budget().bytes();
+            match run_result {
+                Ok(output) => {
+                    let hints = VerifyHints {
+                        one_time: output.one_time,
+                        ..VerifyHints::default()
+                    };
+                    let verification = Verifier::new(&mut http).verify(&output.url, &hints).await;
+                    replay.success = Some(FlowSuccess {
+                        output,
+                        verification,
+                    });
+                }
+                Err(error) => {
+                    replay.error = Some((error.kind, error.step_id, error.detail));
+                }
+            }
+            replays.push(replay);
+        }
+        diagnostics.steps = replays.iter().map(|replay| replay.steps_run).sum();
+        diagnostics.http_requests = replays.iter().map(|replay| replay.http_requests).sum();
+        diagnostics.bytes_read = replays.iter().map(|replay| replay.bytes_read).sum();
+        diagnostics.elapsed_ms = started.elapsed().as_millis() as u64;
+
+        let main_ref = RecipeRef {
+            id: main.id.clone(),
+            version: main.version,
+            state: "matched".to_owned(),
+        };
+        let mut trace_steps = Vec::new();
+        let mut health_updates: Vec<(String, u32, HealthUpdate)> = Vec::new();
+        let successes = replays
+            .iter()
+            .filter(|replay| replay.success.is_some())
+            .count();
+        if successes == 0 {
+            // Every flow failed: report the main flow's typed error (that is the
+            // flow the experience is named after) and let auto-repair decide.
+            let (kind, step_id, detail) = replays
+                .first()
+                .and_then(|replay| replay.error.clone())
+                .unwrap_or((
+                    ResolveErrorKind::RecipeStale,
+                    None,
+                    "bundle replay produced no output".to_owned(),
+                ));
+            let failure = ResolveError::new(
+                kind,
+                match &step_id {
+                    Some(step) => format!("recipe {:?} step {step}: {detail}", main.id),
+                    None => format!("recipe {:?}: {detail}", main.id),
+                },
+            );
+            let mut report = RunReport::new(fail(run_id, failure, diagnostics, started));
+            report.recipe = Some(main_ref);
+            for replay in &replays {
+                push_flow_trace(&mut trace_steps, replay);
+                health_updates.push(flow_health_update(replay, 0));
+            }
+            report.steps = trace_steps;
+            report.health = health_updates.first().map(|(_, _, update)| update.clone());
+            report.health_extra = health_updates.into_iter().skip(1).collect();
+            return report;
+        }
+
+        let max_resources = request
+            .max_resources
+            .unwrap_or(DEFAULT_MAX_RESOURCES)
+            .max(1);
+        let mut resources: Vec<ResourceItem> = Vec::new();
+        let mut resource_urls: BTreeSet<String> = BTreeSet::new();
+        let mut per_flow_downloadable: Vec<u32> = Vec::with_capacity(replays.len());
+        for replay in &replays {
+            push_flow_trace(&mut trace_steps, replay);
+            let Some(success) = &replay.success else {
+                per_flow_downloadable.push(0);
+                health_updates.push(flow_health_update(replay, 0));
+                continue;
+            };
+            let item =
+                resource_item_for(&success.output.url, &success.output, &success.verification);
+            let downloadable = u32::from(item.verification.status.is_downloadable());
+            per_flow_downloadable.push(downloadable);
+            health_updates.push((
+                replay.recipe.id.clone(),
+                replay.recipe.version,
+                HealthUpdate::Success {
+                    resources: downloadable,
+                },
+            ));
+            if resource_urls.insert(item.url.clone()) {
+                resources.push(item);
+            }
+        }
+        let verified = resources
+            .iter()
+            .filter(|item| item.verification.status.is_downloadable())
+            .count();
+        resources.truncate(max_resources);
+        let succeeded = verified > 0;
+        if !succeeded {
+            if let Some(item) = resources.first() {
+                diagnostics.error = Some(ResolveError::new(
+                    verification_error_kind(item.verification.status),
+                    format!(
+                        "candidate {} failed verification: {:?}",
+                        item.url, item.verification.status
+                    ),
+                ));
+            }
+        }
+        diagnostics.summary = if succeeded {
+            format!(
+                "recipe {}@{} experience bundle ({} flow(s)) resolved {} resource(s); {} verified",
+                main.id,
+                main.version,
+                flows.len(),
+                resources.len(),
+                verified
+            )
+        } else {
+            format!(
+                "recipe {}@{} experience bundle ({} flow(s)) produced candidates that did not verify",
+                main.id,
+                main.version,
+                flows.len()
+            )
+        };
+        let status = if succeeded {
+            RunStatus::Succeeded
+        } else {
+            RunStatus::Partial
+        };
+        let final_url = replays
+            .first()
+            .and_then(|replay| replay.success.as_ref())
+            .and_then(|success| success.verification.final_url.clone())
+            .or_else(|| {
+                replays.iter().find_map(|replay| {
+                    replay
+                        .success
+                        .as_ref()
+                        .and_then(|success| success.verification.final_url.clone())
+                })
+            });
+        let mut manifest = ResourceManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            manifest_id: new_id("mf"),
+            source: SourceRef {
+                input_url: request.url.clone(),
+                final_url,
+                title: None,
+                recipe_id: Some(main.id.clone()),
+            },
+            resources,
+            notes: Vec::new(),
+            created_ms: now_ms(),
+        };
+        if flows.len() > 1 {
+            manifest.notes.push(format!(
+                "经验组：主流程 + {} 个补充流程（共 {} 个流程）",
+                flows.len() - 1,
+                flows.len()
+            ));
+        }
+        let failed_flows = replays
+            .iter()
+            .filter(|replay| replay.error.is_some())
+            .count();
+        if failed_flows > 0 {
+            manifest
+                .notes
+                .push(format!("{failed_flows} 个流程回放失败，已跳过"));
+        }
+        manifest.notes.push(recipe_hit_note(&main.id, main.version));
+        let mut report = RunReport::new(ResolveOutcome {
+            run_id,
+            status,
+            manifest: Some(manifest),
+            recipe: Some(main_ref.clone()),
+            diagnostics,
+        });
+        report.recipe = Some(main_ref);
+        report.steps = trace_steps;
+        report.health = health_updates.first().map(|(_, _, update)| update.clone());
+        report.health_extra = health_updates.into_iter().skip(1).collect();
+        report
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -891,33 +1676,7 @@ impl ResolverService {
             .max_resources
             .unwrap_or(DEFAULT_MAX_RESOURCES)
             .max(1);
-        let item = ResourceItem {
-            resource_id: new_id("res"),
-            url: emitted_url.to_owned(),
-            final_url: verification.final_url.clone(),
-            name: output
-                .name
-                .clone()
-                .or_else(|| file_name_from_url(emitted_url)),
-            kind: output.kind.clone(),
-            content_type: verification.content_type.clone(),
-            size_bytes: verification.size_bytes,
-            supports_ranges: verification.supports_ranges,
-            etag: verification.etag.clone(),
-            last_modified: verification.last_modified.clone(),
-            expected_sha256: output.expected_sha256.clone(),
-            credentials: CredentialsHint::default(),
-            transfer: TransferHint {
-                one_time: output.one_time,
-                single_stream: output.single_stream || output.one_time,
-                expires_ms: output.expires_ms,
-                ..TransferHint::default()
-            },
-            evidence: verification.evidence.clone(),
-            notes: Vec::new(),
-            verification: verification.clone(),
-        }
-        .with_transfer_from_verification();
+        let item = resource_item_for(emitted_url, output, &verification);
 
         if !verification.status.is_downloadable() {
             diagnostics.error = Some(ResolveError::new(
@@ -947,6 +1706,264 @@ impl ResolverService {
     }
 }
 
+/// Attribute one model-assisted draft call to the run diagnostics.
+///
+/// The call is always counted in `llm_calls` (a provider request was spent, even
+/// when the reply was unusable or failed) and the token usage drained from the
+/// client is merged in the same step, so the call count and the token counters
+/// stay in sync. Usage is saturating and `estimated` is OR-ed in, matching
+/// [`rdm_ai::TokenUsage::merge`].
+fn record_model_draft_call(diagnostics: &mut Diagnostics, usage: rdm_ai::TokenUsage) {
+    diagnostics.llm_calls = diagnostics.llm_calls.saturating_add(1);
+    diagnostics.llm_prompt_tokens = diagnostics
+        .llm_prompt_tokens
+        .saturating_add(usage.prompt_tokens);
+    diagnostics.llm_completion_tokens = diagnostics
+        .llm_completion_tokens
+        .saturating_add(usage.completion_tokens);
+    diagnostics.llm_total_tokens = diagnostics
+        .llm_total_tokens
+        .saturating_add(usage.total_tokens);
+    diagnostics.llm_estimated |= usage.estimated;
+}
+
+/// Build one verified-candidate [`ResourceItem`] from a recipe emit (used by
+/// both the single-flow and bundled replay paths).
+fn resource_item_for(
+    emitted_url: &str,
+    output: &RecipeOutput,
+    verification: &Verification,
+) -> ResourceItem {
+    let raw_name = output
+        .name
+        .clone()
+        .or_else(|| file_name_from_url(emitted_url))
+        .unwrap_or_default();
+    let name = rdm_ai::ensure_file_extension(
+        &raw_name,
+        verification.content_type.as_deref(),
+        verification.final_url.as_deref().or(Some(emitted_url)),
+        output.kind.as_deref(),
+    );
+    ResourceItem {
+        resource_id: new_id("res"),
+        url: emitted_url.to_owned(),
+        final_url: verification.final_url.clone(),
+        name: Some(name),
+        kind: output.kind.clone(),
+        content_type: verification.content_type.clone(),
+        size_bytes: verification.size_bytes,
+        supports_ranges: verification.supports_ranges,
+        etag: verification.etag.clone(),
+        last_modified: verification.last_modified.clone(),
+        expected_sha256: output.expected_sha256.clone(),
+        credentials: CredentialsHint::default(),
+        transfer: TransferHint {
+            one_time: output.one_time,
+            single_stream: output.single_stream || output.one_time,
+            expires_ms: output.expires_ms,
+            ..TransferHint::default()
+        },
+        evidence: verification.evidence.clone(),
+        notes: Vec::new(),
+        verification: verification.clone(),
+    }
+    .with_transfer_from_verification()
+}
+
+/// Normalized resource-kind set of a manifest (design 18 §2.5 step 1).
+fn resource_kinds(manifest: &ResourceManifest) -> Vec<String> {
+    let mut kinds: Vec<String> = manifest.resources.iter().map(resource_kind).collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+/// One resource's kind: `resource.kind` first, then the file extension.
+fn resource_kind(item: &ResourceItem) -> String {
+    if let Some(kind) = item
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    {
+        let lowered = kind.to_ascii_lowercase();
+        if let Some(category) = kind_category(&lowered) {
+            return category.to_owned();
+        }
+        if let Some(extension) = file_extension(&lowered) {
+            if let Some(category) = kind_from_extension(&extension) {
+                return category.to_owned();
+            }
+        }
+    }
+    for candidate in [
+        item.name.as_deref(),
+        item.final_url.as_deref(),
+        Some(item.url.as_str()),
+    ] {
+        let Some(extension) = candidate.and_then(file_extension) else {
+            continue;
+        };
+        if let Some(category) = kind_from_extension(&extension) {
+            return category.to_owned();
+        }
+    }
+    "other".to_owned()
+}
+
+/// Known resource-kind categories, also accepting MIME-ish values (`video/mp4`).
+fn kind_category(value: &str) -> Option<&'static str> {
+    const CATEGORIES: [&str; 5] = ["video", "image", "audio", "document", "archive"];
+    let head = value.split(['/', '+', ';']).next().unwrap_or(value).trim();
+    CATEGORIES.into_iter().find(|category| *category == head)
+}
+
+/// Lowercased extension of one file name / URL (`None` without a dot).
+fn file_extension(value: &str) -> Option<String> {
+    let path = value.split(['?', '#']).next().unwrap_or(value);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (_, extension) = name.rsplit_once('.')?;
+    let extension = extension.trim();
+    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
+}
+
+/// Extension -> resource-kind category (design 18 §2.5).
+fn kind_from_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" | "flv" | "ts" | "m3u8" => Some("video"),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif" => Some("image"),
+        "mp3" | "m4a" | "flac" | "wav" | "aac" | "ogg" | "opus" => Some("audio"),
+        "pdf" | "epub" | "doc" | "docx" | "txt" | "srt" | "ass" => Some("document"),
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => Some("archive"),
+        _ => None,
+    }
+}
+
+/// Wrap a repaired exploration draft as `failed.version + 1` of the failed
+/// method (design 16 §1.2.2).
+///
+/// The deterministic new steps keep the failed method's id/matcher/name/
+/// description so future similar links hit the repaired method, while the
+/// previous version's history/health stays intact in the registry. Returns
+/// `None` when the promoted recipe does not validate.
+fn promote_repair_draft(
+    draft: &crate::draft::RecipeDraft,
+    failed: &Recipe,
+) -> Option<crate::draft::RecipeDraft> {
+    let mut recipe = draft.recipe.clone();
+    recipe.id = failed.id.clone();
+    recipe.version = failed.version.saturating_add(1);
+    recipe.matcher = failed.matcher.clone();
+    recipe.name = failed.name.clone();
+    recipe.description = failed.description.clone();
+    recipe.validate().ok()?;
+    let mut notes = draft.notes.clone();
+    notes.push(format!(
+        "auto-repair promotion of {}@{} -> v{}",
+        failed.id, failed.version, recipe.version
+    ));
+    Some(crate::draft::RecipeDraft {
+        id: recipe.id.clone(),
+        version: recipe.version,
+        notes,
+        recipe,
+        ..draft.clone()
+    })
+}
+
+/// Append one caller-visible note (design 16 §1.2); no-op without a manifest.
+fn push_manifest_note(outcome: &mut ResolveOutcome, note: String) {
+    if let Some(manifest) = outcome.manifest.as_mut() {
+        manifest.notes.push(note);
+    }
+}
+
+/// Design 16 §1.2.3: this run replayed a local recipe (zero model calls).
+fn recipe_hit_note(id: &str, version: u32) -> String {
+    format!("本地解析经验命中：{id}@v{version}（未调用 AI）")
+}
+
+/// Design 16 §1.2.1: a successful exploration became an active recipe.
+fn experience_saved_note(id: &str, version: u32) -> String {
+    format!("已保存解析经验：{id}@v{version}（下次同类链接优先复用，无需 AI）")
+}
+
+/// Design 16 §1.2.1: the draft exists but the replay gates rejected it.
+fn experience_gate_failed_note() -> String {
+    "解析经验未通过回放校验，本次未启用".to_owned()
+}
+
+/// Design 17 §2.3: this AI flow is poorer than the kept experience.
+fn experience_kept_note(id: &str, active_version: u32, best: u32, new_resources: u32) -> String {
+    format!(
+        "已保留更丰富的解析经验：{id}@v{active_version}（{best} 个资源）；\
+         本次 AI 流程 {new_resources} 个资源未替换"
+    )
+}
+
+/// Design 17 §2.3: the richer AI flow was published as the next version.
+fn experience_upgraded_note(
+    id: &str,
+    old_version: u32,
+    new_version: u32,
+    old_resources: u32,
+    new_resources: u32,
+) -> String {
+    format!(
+        "解析经验已升级：{id}@v{old_version} → v{new_version}（资源 {old_resources} → {new_resources}）"
+    )
+}
+
+/// Design 16 §1.2.2: a repaired method was promoted to its next version.
+fn experience_updated_note(id: &str, old_version: u32, new_version: u32, resources: u32) -> String {
+    format!("解析经验已更新：{id}@v{old_version} → v{new_version}（{resources} 个资源）")
+}
+
+/// Design 18 §2.5: a same-class experience already covers other resource kinds.
+fn experience_complement_note(id: &str) -> String {
+    format!("同类经验已有：{id}（资源互补，可在解析经验页合并以一次获取全部资源）")
+}
+
+/// Best-effort removal of a superseded exploration draft.
+fn remove_candidate_draft(root: &std::path::Path, draft_id: &str) {
+    if let Err(error) = crate::draft::remove_draft(root, draft_id) {
+        tracing::warn!(
+            draft = %draft_id,
+            error = %error,
+            "rdm-resolve: could not remove the superseded exploration draft"
+        );
+    }
+}
+
+/// One flow attempted by [`ResolverService::replay_experience_flows`].
+struct FlowReplay {
+    recipe: Recipe,
+    steps_run: u32,
+    /// `(kind, step id, detail)` of a failed flow.
+    error: Option<(ResolveErrorKind, Option<String>, String)>,
+    success: Option<FlowSuccess>,
+    http_requests: u32,
+    bytes_read: u64,
+}
+
+/// Successful output + verification of one replayed flow.
+struct FlowSuccess {
+    output: RecipeOutput,
+    verification: Verification,
+}
+
+/// Same-scope experience consulted by the auto-publish best-flow gate
+/// (design 17 §2.3 / design 18 §2.5).
+struct ScopeExperience {
+    id: String,
+    active_version: u32,
+    best_resources: u32,
+    resource_kinds: Vec<String>,
+    /// Sum of every bundled supplementary flow's best resource count.
+    bundle_best: u32,
+}
+
 /// One run plus the trace/health side effects it must persist.
 struct RunReport {
     outcome: ResolveOutcome,
@@ -955,6 +1972,10 @@ struct RunReport {
     recipe: Option<RecipeRef>,
     steps: Vec<RunStep>,
     health: Option<HealthUpdate>,
+    /// Health updates of bundled supplementary flows (main flow excluded).
+    health_extra: Vec<(String, u32, HealthUpdate)>,
+    /// Persisted exploration draft eligible for auto-publishing (design 16 §1.2).
+    publish: Option<PublishCandidate>,
 }
 
 impl RunReport {
@@ -964,17 +1985,77 @@ impl RunReport {
             recipe: None,
             steps: Vec::new(),
             health: None,
+            health_extra: Vec::new(),
+            publish: None,
         }
     }
 }
 
+/// One persisted draft the opt-in experience pipeline may publish.
+struct PublishCandidate {
+    /// Draft already written to `<state>/resolve/drafts`.
+    draft: crate::draft::RecipeDraft,
+    /// Failed method the draft repairs: the new steps become its
+    /// `version + 1` (same id/matcher/name/description) when set.
+    repair: Option<Recipe>,
+}
+
 /// Recipe health decision of one replay (`docs/architecture.md` §11.10).
+#[derive(Debug, Clone)]
 enum HealthUpdate {
-    Success,
+    /// `resources` = downloadable resources produced by this replay (richness).
+    Success { resources: u32 },
     Failure {
         kind: ResolveErrorKind,
         step_id: Option<String>,
     },
+}
+
+/// Health update of one replayed flow (`resources` = that flow's count).
+fn flow_health_update(replay: &FlowReplay, resources: u32) -> (String, u32, HealthUpdate) {
+    let update = match &replay.error {
+        Some((kind, step_id, _)) => HealthUpdate::Failure {
+            kind: *kind,
+            step_id: step_id.clone(),
+        },
+        None => HealthUpdate::Success { resources },
+    };
+    (replay.recipe.id.clone(), replay.recipe.version, update)
+}
+
+/// Append one flow's synthetic trace steps with a contiguous global index.
+fn push_flow_trace(steps: &mut Vec<RunStep>, replay: &FlowReplay) {
+    let flow_steps = recipe_trace_steps(
+        replay.steps_run,
+        replay
+            .error
+            .as_ref()
+            .map(|(kind, step_id, _)| (*kind, step_id.as_deref())),
+    );
+    let offset = steps.len() as u32;
+    steps.extend(flow_steps.into_iter().map(|mut step| {
+        step.index += offset;
+        step
+    }));
+}
+
+/// Persist one replay's usage/health (kind-aware; never panics on I/O).
+fn record_health_update(
+    registry: &mut RecipeRegistry,
+    id: &str,
+    version: u32,
+    update: &HealthUpdate,
+    run_id: &str,
+) -> std::io::Result<()> {
+    let now = now_ms();
+    match update {
+        HealthUpdate::Success { resources } => {
+            registry.record_replay(id, version, run_id, None, None, *resources, now)
+        }
+        HealthUpdate::Failure { kind, step_id } => {
+            registry.record_replay(id, version, run_id, Some(*kind), step_id.as_deref(), 0, now)
+        }
+    }
 }
 
 /// `mode` label persisted in a trace header.
@@ -1128,15 +2209,22 @@ fn build_builtin_manifest(
         .unwrap_or(DEFAULT_MAX_RESOURCES)
         .max(1);
     let final_url = verification.final_url.clone();
-    let name = final_url
+    let raw_name = final_url
         .as_deref()
         .and_then(file_name_from_url)
-        .or_else(|| file_name_from_url(input_url));
+        .or_else(|| file_name_from_url(input_url))
+        .unwrap_or_default();
+    let name = rdm_ai::ensure_file_extension(
+        &raw_name,
+        verification.content_type.as_deref(),
+        final_url.as_deref().or(Some(input_url)),
+        None,
+    );
     let item = ResourceItem {
         resource_id: new_id("res"),
         url: input_url.to_owned(),
         final_url: final_url.clone(),
-        name,
+        name: Some(name),
         kind: None,
         content_type: verification.content_type.clone(),
         size_bytes: verification.size_bytes,
@@ -1192,6 +2280,57 @@ fn file_name_from_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_manifest_normalizes_extensionless_names_from_content_type() {
+        let request = ResolveRequest {
+            url: "https://cdn.example.com/stream?sign=1".to_owned(),
+            ..ResolveRequest::default()
+        };
+        let verification = Verification {
+            status: VerificationStatus::Verified,
+            method: crate::contract::VerificationMethod::RangedGet,
+            http_status: Some(206),
+            final_url: Some(request.url.clone()),
+            content_type: Some("video/mp4".to_owned()),
+            size_bytes: Some(45_932_387),
+            supports_ranges: Some(true),
+            etag: None,
+            last_modified: None,
+            evidence: vec!["GET range 0-1023 -> 206 video/mp4".to_owned()],
+            checked_ms: 0,
+        };
+        let manifest = build_builtin_manifest(&request, &request.url, verification);
+        assert_eq!(manifest.resources.len(), 1);
+        assert_eq!(manifest.resources[0].name.as_deref(), Some("stream.mp4"));
+    }
+
+    #[test]
+    fn builtin_manifest_keeps_a_real_url_suffix() {
+        let url = "https://cdn.example.com/42924311105-1-192.mp4?e=sig";
+        let request = ResolveRequest {
+            url: url.to_owned(),
+            ..ResolveRequest::default()
+        };
+        let verification = Verification {
+            status: VerificationStatus::HeadOnlyVerified,
+            method: crate::contract::VerificationMethod::HeadOnly,
+            http_status: Some(200),
+            final_url: Some(url.to_owned()),
+            content_type: None,
+            size_bytes: Some(1024),
+            supports_ranges: Some(true),
+            etag: None,
+            last_modified: None,
+            evidence: vec!["HEAD -> 200".to_owned()],
+            checked_ms: 0,
+        };
+        let manifest = build_builtin_manifest(&request, url, verification);
+        assert_eq!(
+            manifest.resources[0].name.as_deref(),
+            Some("42924311105-1-192.mp4")
+        );
+    }
 
     #[test]
     fn verification_errors_map_to_typed_kinds() {
@@ -1453,6 +2592,9 @@ mod tests {
                 model: "mock-model".to_owned(),
                 api_key: "test-key".to_owned(),
                 timeout_secs: 5,
+                // Loopback mock: not a bundled provider (no preset/no prices).
+                provider: None,
+                ..rdm_ai::AiConfig::default()
             }
         }
 
@@ -1484,8 +2626,13 @@ mod tests {
         if path == "/files/demo.bin" {
             return http_response(200, "application/octet-stream", &FILE_BODY, head_only);
         }
+        if path == "/files/demo2.bin" {
+            return http_response(200, "application/octet-stream", &FILE_BODY, head_only);
+        }
         if path == "/api/meta" {
-            let body = format!(r#"{{"file":{{"url":"{base}/files/demo.bin"}}}}"#);
+            let body = format!(
+                r#"{{"file":{{"url":"{base}/files/demo.bin"}},"file2":{{"url":"{base}/files/demo2.bin"}}}}"#
+            );
             return http_response(200, "application/json", body.as_bytes(), head_only);
         }
         http_response(404, "text/plain", b"not found", head_only)
@@ -1840,6 +2987,9 @@ mod tests {
             model: "mock-model".to_owned(),
             api_key: "test-key".to_owned(),
             timeout_secs: 2,
+            // Loopback mock: not a bundled provider (no preset/no prices).
+            provider: None,
+            ..rdm_ai::AiConfig::default()
         });
         let outcome = service.resolve(request).await;
 
@@ -3659,5 +4809,757 @@ mod tests {
         let json = serde_json::to_string(&outcome).expect("serialize outcome");
         assert!(!json.contains("ignore previous instructions"), "{json}");
         assert!(!json.contains("IGNORE"), "{json}");
+    }
+
+    #[test]
+    fn model_draft_call_usage_keeps_calls_and_tokens_in_sync() {
+        let mut diagnostics = Diagnostics {
+            // Exploration already spent two model calls before the draft.
+            llm_calls: 2,
+            llm_prompt_tokens: 100,
+            llm_completion_tokens: 20,
+            llm_total_tokens: 120,
+            ..Diagnostics::default()
+        };
+
+        // One extra draft call with provider-reported usage: counted once, tokens
+        // merged from the same `TokenUsage`.
+        record_model_draft_call(
+            &mut diagnostics,
+            rdm_ai::TokenUsage {
+                prompt_tokens: 21,
+                completion_tokens: 9,
+                total_tokens: 30,
+                calls: 1,
+                estimated: false,
+            },
+        );
+        assert_eq!(diagnostics.llm_calls, 3);
+        assert_eq!(diagnostics.llm_prompt_tokens, 121);
+        assert_eq!(diagnostics.llm_completion_tokens, 29);
+        assert_eq!(diagnostics.llm_total_tokens, 150);
+        assert!(!diagnostics.llm_estimated);
+
+        // A failed/unusable call is still billed: `estimated` is OR-ed in.
+        record_model_draft_call(
+            &mut diagnostics,
+            rdm_ai::TokenUsage {
+                prompt_tokens: 4,
+                completion_tokens: 1,
+                total_tokens: 5,
+                calls: 1,
+                estimated: true,
+            },
+        );
+        assert_eq!(diagnostics.llm_calls, 4);
+        assert_eq!(diagnostics.llm_total_tokens, 155);
+        assert!(diagnostics.llm_estimated);
+
+        // A client-construction failure sends no request (zero usage) but the
+        // attempt still counts, preserving the pre-existing `llm_calls` behavior.
+        record_model_draft_call(&mut diagnostics, rdm_ai::TokenUsage::ZERO);
+        assert_eq!(diagnostics.llm_calls, 5);
+        assert_eq!(diagnostics.llm_total_tokens, 155);
+    }
+
+    // ------------------------------------------------------------------
+    // Design 16 §1: resolve experience pipeline (auto-publish / repair upgrade)
+    // ------------------------------------------------------------------
+
+    /// Exploration chain that distills deterministically **and** replays: read
+    /// the JSON metadata endpoint, then emit the file URL through a JSON pointer
+    /// (no fixture page-body dependency, so the replay is byte-identical).
+    fn reusable_explore_scripts() -> [&'static str; 2] {
+        [
+            r#"{"action":"http_request","method":"GET","url":"{{base}}/api/meta"}"#,
+            r#"{"action":"emit_manifest","resources":[{"url":"{{base}}/files/demo.bin","evidence":"{{obs}}#/file/url"}]}"#,
+        ]
+    }
+
+    /// Same chain, but emits two verified files: richness = 2.
+    fn rich_two_resource_scripts() -> [&'static str; 2] {
+        [
+            r#"{"action":"http_request","method":"GET","url":"{{base}}/api/meta"}"#,
+            r#"{"action":"emit_manifest","resources":[{"url":"{{base}}/files/demo.bin","evidence":"{{obs}}#/file/url"},{"url":"{{base}}/files/demo2.bin","evidence":"{{obs}}#/file2/url"}]}"#,
+        ]
+    }
+
+    #[tokio::test]
+    async fn as_auto_publish_publishes_a_narrow_recipe_after_one_exploration() {
+        let site = MockSite::start(&reusable_explore_scripts()).await;
+        let page_url = format!("{}/page", site.base_url);
+        let state = TempDir::new("service-auto-publish");
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let request = ResolveRequest {
+            url: page_url.clone(),
+            ..Default::default()
+        };
+
+        // First resolve: one AI exploration, then the same-run replay publish.
+        let first = service.resolve(request.clone()).await;
+        assert_eq!(first.status, RunStatus::Succeeded);
+        assert_eq!(first.diagnostics.llm_calls, 2);
+        let published = first.recipe.clone().expect("published recipe ref");
+        assert_eq!(published.state, "published");
+        assert_eq!(published.version, 1);
+        assert!(published.id.starts_with("draft_"), "{}", published.id);
+        let notes = &first.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes.iter().any(|note| *note
+                == format!(
+                    "已保存解析经验：{}@v1（下次同类链接优先复用，无需 AI）",
+                    published.id
+                )),
+            "{notes:?}"
+        );
+        // The draft became the active recipe and its draft file was removed.
+        assert_eq!(service.registry().len(), 1);
+        assert_eq!(service.registry().active_version(&published.id), Some(1));
+        assert!(
+            crate::draft::list_drafts(&state.path().join("resolve")).is_empty(),
+            "the published draft must be removed"
+        );
+
+        // Second resolve: zero model calls, recipe hit note, still verified.
+        let second = service.resolve(request).await;
+        assert_eq!(second.status, RunStatus::Succeeded);
+        assert_eq!(second.diagnostics.llm_calls, 0, "recipe replay has no AI");
+        assert_eq!(site.chat_requests().len(), 2, "no further model call");
+        let hit = second.recipe.clone().expect("matched recipe ref");
+        assert_eq!(hit.id, published.id);
+        assert_eq!(hit.version, 1);
+        assert_eq!(hit.state, "matched");
+        let manifest = second.manifest.as_ref().expect("manifest");
+        assert!(
+            manifest
+                .notes
+                .iter()
+                .any(|note| *note == format!("本地解析经验命中：{}@v1（未调用 AI）", published.id)),
+            "{:?}",
+            manifest.notes
+        );
+        assert!(manifest.resources[0].verification.status.is_downloadable());
+    }
+
+    #[tokio::test]
+    async fn auto_publish_is_off_by_default() {
+        let site = MockSite::start(&reusable_explore_scripts()).await;
+        let state = TempDir::new("service-auto-publish-off");
+        // No `with_auto_publish`: CLI/MCP behavior must stay unchanged.
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config());
+
+        let outcome = service
+            .resolve(ResolveRequest {
+                url: format!("{}/page", site.base_url),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(outcome.diagnostics.llm_calls, 2);
+        let draft = outcome.recipe.clone().expect("draft ref");
+        assert_eq!(draft.state, "draft");
+        assert!(service.registry().is_empty(), "nothing may be published");
+        assert_eq!(service.registry().active_version(&draft.id), None);
+        assert_eq!(
+            crate::draft::list_drafts(&state.path().join("resolve")).len(),
+            1,
+            "the draft stays reusable as before"
+        );
+        let notes = &outcome.manifest.as_ref().expect("manifest").notes;
+        assert!(notes.iter().any(|note| note.contains("draft saved:")));
+        assert!(
+            !notes.iter().any(|note| note.contains("已保存解析经验")),
+            "{notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_repair_promotes_a_new_version_preserving_matcher() {
+        let site = MockSite::start(&reusable_explore_scripts()).await;
+        let state = TempDir::new("service-auto-publish-repair");
+        // v1 is the previously-active, hand-written method: it drifts
+        // structurally (expects JSON from an HTML page) but its matcher is the
+        // site-wide one the repaired version must keep.
+        let mut drifted = drift_recipe(&site.base_url);
+        drifted["name"] = serde_json::json!("Drifted method");
+        drifted["description"] = serde_json::json!("hand-written v1");
+        write_recipe_file(state.path(), &drifted);
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let request = ResolveRequest {
+            url: format!("{}/page", site.base_url),
+            ..Default::default()
+        };
+
+        // Exploration repairs the drift and the new steps become active v2.
+        let repaired = service.resolve(request.clone()).await;
+        assert_eq!(repaired.status, RunStatus::Succeeded);
+        assert_eq!(repaired.diagnostics.llm_calls, 2);
+        let published = repaired.recipe.clone().expect("published recipe ref");
+        assert_eq!(published.id, "drifted-recipe");
+        assert_eq!(published.version, 2);
+        assert_eq!(published.state, "published");
+        assert_eq!(service.registry().active_version("drifted-recipe"), Some(2));
+        let v2 = service
+            .registry()
+            .get("drifted-recipe", Some(2))
+            .cloned()
+            .expect("v2 recipe");
+        let v1 = service
+            .registry()
+            .get("drifted-recipe", Some(1))
+            .expect("v1 recipe");
+        assert_eq!(v2.matcher.hosts, v1.matcher.hosts);
+        assert_eq!(v2.matcher.url_pattern, v1.matcher.url_pattern);
+        assert_eq!(v2.matcher.priority, v1.matcher.priority);
+        assert_eq!(v2.name, "Drifted method");
+        assert_eq!(v2.description, "hand-written v1");
+        // Steps are the deterministic ones distilled from the repair run.
+        assert!(v2.steps.iter().any(|step| step.op == "json_query"));
+        assert!(v2.steps.iter().any(|step| step.op == "assert"));
+        let notes = &repaired.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes.iter().any(|note| note.starts_with("auto-repair:")),
+            "the auto-repair note must stay: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| *note == "解析经验已更新：drifted-recipe@v1 → v2（1 个资源）"),
+            "{notes:?}"
+        );
+
+        // The next resolve is a deterministic hit of the promoted version.
+        let hit = service.resolve(request).await;
+        assert_eq!(hit.status, RunStatus::Succeeded);
+        assert_eq!(hit.diagnostics.llm_calls, 0);
+        assert_eq!(site.chat_requests().len(), 2, "no further model call");
+        let matched = hit.recipe.clone().expect("matched recipe ref");
+        assert_eq!(matched.id, "drifted-recipe");
+        assert_eq!(matched.version, 2);
+        assert_eq!(matched.state, "matched");
+        assert!(hit
+            .manifest
+            .as_ref()
+            .expect("manifest")
+            .notes
+            .iter()
+            .any(|note| note.contains("本地解析经验命中：drifted-recipe@v2")));
+    }
+
+    #[tokio::test]
+    async fn auto_publish_gate_failure_keeps_the_draft_and_notes_it() {
+        let site = MockSite::start(&[
+            r#"{"action":"emit_manifest","resources":[{"url":"{{base}}/files/demo.bin","evidence":"{{obs}}#links/0"}]}"#,
+        ])
+        .await;
+        let page_url = format!("{}/page", site.base_url);
+        let file_url = format!("{}/files/demo.bin", site.base_url);
+        // The browser snapshot belongs to the same host, but its page no longer
+        // exists: the deterministic replay fetches `/stale-page` (404), the
+        // extracted URL misses and R3 fails. The draft must survive.
+        let seed = snapshot(format!("{}/stale-page", site.base_url), vec![file_url]);
+        let state = TempDir::new("service-auto-publish-gate");
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_page_snapshot(seed)
+            .with_auto_publish(true);
+
+        let outcome = service
+            .resolve(ResolveRequest {
+                url: page_url,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(outcome.diagnostics.llm_calls, 1);
+        let draft = outcome.recipe.clone().expect("draft ref");
+        assert_eq!(draft.state, "draft", "a failed gate must not publish");
+        let notes = &outcome.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note == "解析经验未通过回放校验，本次未启用"),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|note| note.contains("draft saved:")));
+        assert!(service.registry().is_empty());
+        assert_eq!(
+            crate::draft::list_drafts(&state.path().join("resolve")).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_publish_never_leaks_credentials_or_headers() {
+        let site = MockSite::start(&reusable_explore_scripts()).await;
+        let state = TempDir::new("service-auto-publish-secrets");
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true)
+            .with_credentials(
+                HostCredentials::new().with_cookie("127.0.0.1", "session=supersecret-publish"),
+            );
+
+        let outcome = service
+            .resolve(ResolveRequest {
+                url: format!("{}/page", site.base_url),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        let published = outcome.recipe.clone().expect("published ref");
+        assert_eq!(published.state, "published");
+        // Credential values only ever live in memory; the published recipe is
+        // built from URL/method/steps and never records headers or bodies.
+        let outcome_json = serde_json::to_string(&outcome).expect("serialize outcome");
+        assert!(
+            !outcome_json.contains("supersecret-publish"),
+            "outcome leaked the cookie: {outcome_json}"
+        );
+        let recipe = service
+            .registry()
+            .get(&published.id, None)
+            .expect("published recipe");
+        let recipe_json = serde_json::to_string(recipe).expect("serialize recipe");
+        assert!(
+            !recipe_json.contains("supersecret-publish"),
+            "published recipe leaked the cookie: {recipe_json}"
+        );
+        assert!(!recipe
+            .steps
+            .iter()
+            .any(|step| step.args.get("headers").is_some()));
+        assert!(outcome
+            .manifest
+            .as_ref()
+            .expect("manifest")
+            .notes
+            .iter()
+            .all(|note| !note.contains("supersecret-publish")));
+    }
+
+    // ------------------------------------------------------------------
+    // Design 17 §2.3: best-flow gate (keep the richer flow, upgrade only when
+    // richer) + repair reset
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn auto_publish_keeps_the_richer_experience_for_a_poorer_ai_flow() {
+        let mut scripts = rich_two_resource_scripts().to_vec();
+        scripts.extend(reusable_explore_scripts());
+        let site = MockSite::start(&scripts).await;
+        let page_url = format!("{}/page", site.base_url);
+        let state = TempDir::new("service-best-flow-keep");
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let request = explore_request(page_url.clone());
+
+        let first = service.resolve(request.clone()).await;
+        assert_eq!(first.status, RunStatus::Succeeded);
+        let published = first.recipe.clone().expect("published recipe ref");
+        assert_eq!(published.state, "published");
+        assert_eq!(published.version, 1);
+        let entry = service
+            .registry()
+            .index()
+            .entries
+            .get(&published.id)
+            .cloned()
+            .expect("index entry");
+        assert_eq!(entry.best_resources, 2);
+        assert_eq!(entry.last_resources, 2);
+        assert_eq!(entry.version_resources.get(&1), Some(&2));
+        assert_eq!(entry.source_url.as_deref(), Some(page_url.as_str()));
+        assert!(entry.created_ms > 0);
+        assert!(entry.version_created_ms.contains_key(&1));
+        assert_eq!(entry.use_count, 0, "publishing is not a replay");
+
+        // Second forced exploration is poorer (1 resource): the richer v1 stays.
+        let second = service.resolve(request).await;
+        assert_eq!(second.status, RunStatus::Succeeded);
+        assert_eq!(second.diagnostics.llm_calls, 2, "a real new AI exploration");
+        let kept = second.recipe.clone().expect("kept recipe ref");
+        assert_eq!(kept.id, published.id);
+        assert_eq!(kept.version, 1);
+        assert_eq!(kept.state, "kept");
+        let notes = &second.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes.iter().any(|note| *note
+                == format!(
+                    "已保留更丰富的解析经验：{}@v1（2 个资源）；本次 AI 流程 1 个资源未替换",
+                    published.id
+                )),
+            "{notes:?}"
+        );
+        assert_eq!(service.registry().active_version(&published.id), Some(1));
+        assert_eq!(service.registry().latest_version(&published.id), Some(1));
+        let entry = service
+            .registry()
+            .index()
+            .entries
+            .get(&published.id)
+            .cloned()
+            .expect("index entry");
+        assert_eq!(entry.best_resources, 2, "the old best is preserved");
+        assert_eq!(entry.last_resources, 2);
+        assert!(
+            !state
+                .path()
+                .join("resolve")
+                .join("recipes")
+                .join(format!("{}@2.json", published.id))
+                .exists(),
+            "the poorer flow must not be published"
+        );
+        assert!(
+            crate::draft::list_drafts(&state.path().join("resolve")).is_empty(),
+            "the superseded candidate draft is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_publish_upgrades_the_experience_when_the_ai_flow_is_richer() {
+        let mut scripts = reusable_explore_scripts().to_vec();
+        scripts.extend(rich_two_resource_scripts());
+        let site = MockSite::start(&scripts).await;
+        let page_url = format!("{}/page", site.base_url);
+        let state = TempDir::new("service-best-flow-upgrade");
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let request = explore_request(page_url.clone());
+
+        let first = service.resolve(request.clone()).await;
+        assert_eq!(first.status, RunStatus::Succeeded);
+        let published = first.recipe.clone().expect("published recipe ref");
+        let first_created_ms = service
+            .registry()
+            .index()
+            .entries
+            .get(&published.id)
+            .expect("entry")
+            .created_ms;
+
+        let second = service.resolve(request).await;
+        assert_eq!(second.status, RunStatus::Succeeded);
+        let upgraded = second.recipe.clone().expect("upgraded recipe ref");
+        assert_eq!(upgraded.id, published.id);
+        assert_eq!(upgraded.version, 2);
+        assert_eq!(upgraded.state, "published");
+        let notes = &second.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| *note
+                    == format!("解析经验已升级：{}@v1 → v2（资源 1 → 2）", published.id)),
+            "{notes:?}"
+        );
+
+        // v2 is active, v1 stays on disk and both version records survive.
+        assert_eq!(service.registry().active_version(&published.id), Some(2));
+        assert_eq!(service.registry().latest_version(&published.id), Some(2));
+        let recipes = state.path().join("resolve").join("recipes");
+        assert!(recipes.join(format!("{}@1.json", published.id)).is_file());
+        assert!(recipes.join(format!("{}@2.json", published.id)).is_file());
+        let entry = service
+            .registry()
+            .index()
+            .entries
+            .get(&published.id)
+            .cloned()
+            .expect("index entry");
+        assert_eq!(entry.best_resources, 2);
+        assert_eq!(entry.last_resources, 2);
+        assert_eq!(entry.version_resources.get(&1), Some(&1));
+        assert_eq!(entry.version_resources.get(&2), Some(&2));
+        assert!(entry.version_created_ms.contains_key(&1));
+        assert!(entry.version_created_ms.contains_key(&2));
+        assert_eq!(entry.created_ms, first_created_ms, "created_ms is stable");
+        assert_eq!(entry.source_url.as_deref(), Some(page_url.as_str()));
+        assert_eq!(entry.use_count, 0);
+
+        // The upgrade is persisted for the next process.
+        let reloaded = RecipeRegistry::with_root(&recipes);
+        assert_eq!(reloaded.active_version(&published.id), Some(2));
+        assert_eq!(reloaded.index().entries[&published.id].best_resources, 2);
+    }
+
+    #[tokio::test]
+    async fn auto_repair_always_upgrades_and_resets_best_resources() {
+        let site = MockSite::start(&reusable_explore_scripts()).await;
+        let state = TempDir::new("service-repair-reset");
+        write_recipe_file(state.path(), &drift_recipe(&site.base_url));
+        let page_url = format!("{}/page", site.base_url);
+        // The drifted v1 used to be very rich (5 resources): a repair must still
+        // replace it and reset the baseline to the repaired flow's count.
+        let mut registry = RecipeRegistry::with_root(state.path().join("resolve").join("recipes"));
+        registry
+            .note_publish("drifted-recipe", 1, 5, Some(&page_url), 50, false)
+            .expect("seed rich v1");
+        drop(registry);
+
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let outcome = service
+            .resolve(ResolveRequest {
+                url: page_url.clone(),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Succeeded);
+        assert_eq!(outcome.diagnostics.llm_calls, 2);
+        let repaired = outcome.recipe.clone().expect("published repair ref");
+        assert_eq!(repaired.id, "drifted-recipe");
+        assert_eq!(repaired.version, 2);
+        assert_eq!(repaired.state, "published");
+        let notes = &outcome.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| *note == "解析经验已更新：drifted-recipe@v1 → v2（1 个资源）"),
+            "{notes:?}"
+        );
+        let entry = service
+            .registry()
+            .index()
+            .entries
+            .get("drifted-recipe")
+            .cloned()
+            .expect("index entry");
+        assert_eq!(entry.active_version, 2);
+        assert_eq!(
+            entry.best_resources, 1,
+            "repair resets the richness baseline"
+        );
+        assert_eq!(entry.last_resources, 1);
+        assert_eq!(entry.version_resources.get(&1), Some(&5));
+        assert_eq!(entry.version_resources.get(&2), Some(&1));
+        assert_eq!(entry.created_ms, 50, "v1 creation time is preserved");
+        assert!(entry.version_created_ms.contains_key(&2));
+        let recipes = state.path().join("resolve").join("recipes");
+        assert!(recipes.join("drifted-recipe@1.json").is_file());
+        assert!(recipes.join("drifted-recipe@2.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn recipe_replay_records_usage_and_resource_richness() {
+        let (base_url, task) = spawn_server(200, "application/octet-stream", b"data").await;
+        let state = TempDir::new("service-usage-richness");
+        let file_url = format!("{base_url}/file.bin");
+        write_recipe_file(
+            state.path(),
+            &recipe_json(
+                "usage-recipe",
+                serde_json::json!([{
+                    "id": "fetch",
+                    "op": "http_request",
+                    "args": { "method": "GET", "url": file_url }
+                }]),
+                &file_url,
+            ),
+        );
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback());
+        let request = ResolveRequest {
+            url: file_url.clone(),
+            ..Default::default()
+        };
+
+        let first = service.resolve(request.clone()).await;
+        assert_eq!(first.status, RunStatus::Succeeded);
+        let entry = service
+            .registry()
+            .index()
+            .entries
+            .get("usage-recipe")
+            .cloned()
+            .expect("index entry");
+        assert_eq!(entry.use_count, 1);
+        assert_eq!(entry.success_count, 1);
+        assert_eq!(entry.failure_count, 0);
+        assert!(entry.last_used_ms.is_some());
+        assert_eq!(entry.last_resources, 1);
+        assert_eq!(entry.best_resources, 1);
+        assert_eq!(entry.version_resources.get(&1), Some(&1));
+        let last_used = entry.last_used_ms;
+
+        // A later network failure counts usage but keeps the last success's
+        // richness (never lowers it).
+        task.abort();
+        let second = service.resolve(request).await;
+        assert_eq!(second.status, RunStatus::Failed);
+        assert_eq!(error_kind(&second), Some(ResolveErrorKind::NetworkError));
+        let entry = service
+            .registry()
+            .index()
+            .entries
+            .get("usage-recipe")
+            .cloned()
+            .expect("index entry");
+        assert_eq!(entry.use_count, 2);
+        assert_eq!(entry.success_count, 1);
+        assert_eq!(entry.failure_count, 1);
+        assert!(entry.last_used_ms >= last_used);
+        assert_eq!(entry.last_resources, 1);
+        assert_eq!(entry.best_resources, 1);
+        assert_eq!(entry.version_resources.get(&1), Some(&1));
+    }
+
+    // ------------------------------------------------------------------
+    // Design 18 §2.5: resource-kind complement + bundle richness
+    // ------------------------------------------------------------------
+
+    const IMAGE_SINGLE_SCRIPTS: [&str; 2] = [
+        r#"{"action":"http_request","method":"GET","url":"{{base}}/api/meta"}"#,
+        r#"{"action":"emit_manifest","resources":[{"url":"{{base}}/files/demo.bin","evidence":"{{obs}}#/file/url","kind":"image","name":"cover.png"}]}"#,
+    ];
+    const VIDEO_SINGLE_SCRIPTS: [&str; 2] = [
+        r#"{"action":"http_request","method":"GET","url":"{{base}}/api/meta"}"#,
+        r#"{"action":"emit_manifest","resources":[{"url":"{{base}}/files/demo2.bin","evidence":"{{obs}}#/file2/url","kind":"video","name":"video.mp4"}]}"#,
+    ];
+    const IMAGE_DOUBLE_SCRIPTS: [&str; 2] = [
+        r#"{"action":"http_request","method":"GET","url":"{{base}}/api/meta"}"#,
+        r#"{"action":"emit_manifest","resources":[{"url":"{{base}}/files/demo.bin","evidence":"{{obs}}#/file/url","kind":"image","name":"cover.png"},{"url":"{{base}}/files/demo2.bin","evidence":"{{obs}}#/file2/url","kind":"image","name":"cover2.png"}]}"#,
+    ];
+
+    #[tokio::test]
+    async fn auto_publish_publishes_complementary_resource_kinds_as_a_new_experience() {
+        let scripts: Vec<&str> = IMAGE_SINGLE_SCRIPTS
+            .iter()
+            .chain(VIDEO_SINGLE_SCRIPTS.iter())
+            .copied()
+            .collect();
+        let site = MockSite::start(&scripts).await;
+        let page_url = format!("{}/page", site.base_url);
+        let state = TempDir::new("service-complement-kinds");
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let request = explore_request(page_url);
+
+        let first = service.resolve(request.clone()).await;
+        assert_eq!(first.status, RunStatus::Succeeded);
+        let image = first.recipe.clone().expect("image experience");
+        assert_eq!(image.state, "published");
+        let entry = service
+            .registry()
+            .entry(&image.id)
+            .cloned()
+            .expect("image entry");
+        assert_eq!(entry.resource_kinds, vec!["image".to_owned()]);
+        assert_eq!(entry.best_resources, 1);
+
+        // A same-scope flow with a *new* resource kind is complementary: it is
+        // published as a separate experience, not as a poorer next version.
+        let second = service.resolve(request).await;
+        assert_eq!(second.status, RunStatus::Succeeded);
+        let video = second.recipe.clone().expect("video experience");
+        assert_eq!(video.state, "published");
+        assert_ne!(video.id, image.id);
+        assert_eq!(video.version, 1);
+        let video_entry = service
+            .registry()
+            .entry(&video.id)
+            .cloned()
+            .expect("video entry");
+        assert_eq!(video_entry.resource_kinds, vec!["video".to_owned()]);
+        assert_eq!(
+            service
+                .registry()
+                .entry(&image.id)
+                .expect("image entry")
+                .resource_kinds,
+            vec!["image".to_owned()],
+            "the original experience keeps its kinds"
+        );
+        let notes = &second.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| *note == experience_saved_note(&video.id, 1)),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| *note
+                == format!(
+                    "同类经验已有：{}（资源互补，可在解析经验页合并以一次获取全部资源）",
+                    image.id
+                )),
+            "{notes:?}"
+        );
+        assert_eq!(service.registry().len(), 2, "two independent experiences");
+    }
+
+    #[tokio::test]
+    async fn auto_publish_adds_bundle_richness_when_a_richer_flow_upgrades() {
+        let scripts: Vec<&str> = IMAGE_SINGLE_SCRIPTS
+            .iter()
+            .chain(VIDEO_SINGLE_SCRIPTS.iter())
+            .chain(IMAGE_DOUBLE_SCRIPTS.iter())
+            .copied()
+            .collect();
+        let site = MockSite::start(&scripts).await;
+        let page_url = format!("{}/page", site.base_url);
+        let state = TempDir::new("service-bundle-richness");
+        let mut publisher =
+            ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+                .with_ai_config(site.ai_config())
+                .with_auto_publish(true);
+        let request = explore_request(page_url);
+
+        let first = publisher.resolve(request.clone()).await;
+        let image = first.recipe.clone().expect("image experience");
+        let second = publisher.resolve(request.clone()).await;
+        let video = second.recipe.clone().expect("video experience");
+        let store = crate::experience::ExperienceStore::from_state_dir(state.path());
+        let merged = store
+            .merge(&image.id, &[video.id.as_str()])
+            .expect("merge complementary experiences");
+        assert_eq!(merged.flows.len(), 2);
+        assert_eq!(merged.best_resources, 2, "1 + 1 bundled richness");
+
+        // A fresh service sees the merged bundle metadata from disk.
+        let mut service = ResolverService::with_state_dir(state.path(), ResolvePolicy::loopback())
+            .with_ai_config(site.ai_config())
+            .with_auto_publish(true);
+        let third = service.resolve(request).await;
+        assert_eq!(third.status, RunStatus::Succeeded);
+        let upgraded = third.recipe.clone().expect("upgraded ref");
+        assert_eq!(upgraded.id, image.id);
+        assert_eq!(upgraded.version, 2);
+        assert_eq!(upgraded.state, "published");
+        let entry = service
+            .registry()
+            .entry(&image.id)
+            .cloned()
+            .expect("index entry");
+        assert_eq!(
+            entry.best_resources, 3,
+            "richness = new main flow (2) + bundled best (1)"
+        );
+        assert_eq!(entry.version_resources.get(&2), Some(&3));
+        assert_eq!(
+            entry.resource_kinds,
+            vec!["image".to_owned(), "video".to_owned()],
+            "kind union keeps the supplementary flow's kind"
+        );
+        assert_eq!(entry.bundled.len(), 1, "the merged bundle stays attached");
+        let notes = &third.manifest.as_ref().expect("manifest").notes;
+        assert!(
+            notes
+                .iter()
+                .any(|note| *note == format!("解析经验已升级：{}@v1 → v2（资源 2 → 3）", image.id)),
+            "{notes:?}"
+        );
     }
 }

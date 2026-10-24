@@ -3,6 +3,20 @@
 //! The engine never awaits on UI consumers — `UnboundedSender::send` is
 //! non-blocking and a closed channel is ignored, so a dropped GUI cannot stall
 //! a transfer.
+//!
+//! [`Counters`] keeps the UI-facing progress counters *and* the kernel's own
+//! measurement counters. They are deliberately separate:
+//!
+//! * `downloaded` is committed progress: bytes written by attempts that are
+//!   still running or succeeded. A failed/aborted attempt is rolled back so the
+//!   UI never shows progress that a retry will download again. It may therefore
+//!   move backwards.
+//! * `net_rx` is monotonic: every body byte read from the network, including
+//!   bytes belonging to attempts that later fail. This is the only honest
+//!   "bandwidth used" signal for the concurrency controller.
+//! * `active_nanos` accumulates the wall-clock time each admitted request held
+//!   a concurrency slot, so the controller can compute the *average* number of
+//!   simultaneous requests instead of sampling aliasing peaks.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -46,16 +60,27 @@ impl EventSink {
 /// Atomic progress counters shared by every worker and the reporter.
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
-    /// Payload bytes written to the `.part` file (partial chunk writes included
-    /// while in flight; retries subtract them again).
+    /// Committed payload bytes (partial in-flight writes included; failed
+    /// attempts are rolled back). Drives UI progress and resume state.
     pub downloaded: AtomicU64,
+    /// Monotonic body bytes received from the network in this transfer.
+    pub net_rx: AtomicU64,
     pub completed_chunks: AtomicU64,
+    /// Number of requests currently holding a concurrency slot.
     pub active_workers: AtomicUsize,
-    /// High-water mark of [`Counters::active_workers`]; reported as
-    /// `DownloadSummary::peak_connections`.
+    /// High-water mark of [`Counters::active_workers`].
     pub peak_workers: AtomicUsize,
+    /// Nanoseconds spent holding a concurrency slot (average concurrency).
+    pub active_nanos: AtomicU64,
+    /// HTTP request attempts started (retries included).
+    pub request_starts: AtomicU64,
+    /// Retryable failures observed (drives window validity).
+    pub retry_count: AtomicU64,
+    /// Sum of time-to-first-byte measurements, in nanoseconds.
+    pub ttfb_nanos: AtomicU64,
+    /// Number of TTFB samples in `ttfb_nanos`.
+    pub ttfb_samples: AtomicU64,
 }
-
 impl Counters {
     pub fn downloaded(&self) -> u64 {
         self.downloaded.load(Ordering::Relaxed)
@@ -76,7 +101,47 @@ impl Counters {
         self.downloaded.store(bytes, Ordering::Relaxed);
     }
 
-    /// Try to enter the "active worker" state while `active < target`.
+    pub fn net_rx(&self) -> u64 {
+        self.net_rx.load(Ordering::Relaxed)
+    }
+
+    pub fn add_net_rx(&self, bytes: u64) {
+        if bytes > 0 {
+            self.net_rx.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn note_request_start(&self) {
+        self.request_starts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn retries(&self) -> u64 {
+        self.retry_count.load(Ordering::Relaxed)
+    }
+
+    pub fn note_retry(&self) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ttfb(&self, elapsed: Duration) {
+        self.ttfb_nanos.fetch_add(
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.ttfb_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn active_nanos(&self) -> u64 {
+        self.active_nanos.load(Ordering::Relaxed)
+    }
+
+    pub fn add_active_nanos(&self, nanos: u64) {
+        if nanos > 0 {
+            self.active_nanos.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    /// Try to enter the "active request" state while `active < target`.
     ///
     /// Returns `false` when the plan is already saturated; the caller parks and
     /// retries after a release/target change.
@@ -101,12 +166,12 @@ impl Counters {
         }
     }
 
-    /// Leave the "active worker" state.
+    /// Leave the "active request" state.
     pub fn leave_active(&self) {
         self.active_workers.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Observed peak of simultaneously active workers.
+    /// Observed peak of simultaneously active requests.
     pub fn peak(&self) -> usize {
         self.peak_workers.load(Ordering::SeqCst)
     }

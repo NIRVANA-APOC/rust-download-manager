@@ -267,7 +267,7 @@ async fn rollback_switches_the_mirror_and_keeps_version_history() {
         index["entries"]["versioned-method"]["versions"]["2"]["status"], "ok",
         "{index}"
     );
-    assert_eq!(index["schema"], "rdm.recipe-index/v2");
+    assert_eq!(index["schema"], "rdm.recipe-index/v4");
 
     // list reflects the new active health and still lists both versions.
     let listed = run_local(&["recipe", "list", "--output", "json"], local.path()).await;

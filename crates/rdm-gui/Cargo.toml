@@ -22,6 +22,9 @@ rdm-ai.workspace = true
 rdm-resolve.workspace = true
 rdm-ipc.workspace = true
 gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+rust-embed.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -42,7 +45,10 @@ rdm-fixture-server = { path = "../rdm-fixture-server" }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
+    "Win32_System_Time",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -50,3 +56,8 @@ windows = { version = "0.61", features = [
 windows-registry = "0.5"
 # 从 GPUI 窗口取 Win32 HWND（`desktop::raw_hwnd`）。
 raw-window-handle = "0.6"
+
+
+
+
+

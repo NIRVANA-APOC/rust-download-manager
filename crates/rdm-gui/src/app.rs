@@ -185,7 +185,6 @@ pub struct RdmApp {
     draft_auto_start: bool,
     draft_dynamic: bool,
     draft_save_by_extension: bool,
-    draft_ai_classify: bool,
     /// 系统集成：开机自启动（登录 Windows 时运行）。
     draft_launch_at_startup: bool,
     /// 系统集成：关闭窗口时隐藏到托盘（最小化仍留在任务栏）。
@@ -290,7 +289,6 @@ impl RdmApp {
             draft_auto_start: settings.auto_start,
             draft_dynamic: settings.dynamic_connections,
             draft_save_by_extension: settings.save_by_extension,
-            draft_ai_classify: settings.ai_classify,
             draft_launch_at_startup: settings.launch_at_startup,
             draft_minimize_to_tray: settings.minimize_to_tray,
             draft_silent_start: settings.silent_start,
@@ -423,6 +421,55 @@ impl RdmApp {
         warning
     }
 
+    /// 托盘「全部暂停」：与主界面一致，等引擎确认 Paused。
+    pub fn pause_all_from_tray(&mut self, cx: &mut Context<Self>) {
+        let mut count = 0usize;
+        for index in 0..self.items.len() {
+            if self.items[index].state == ItemState::Downloading {
+                self.pause_item(index);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.set_toast(format!("已暂停 {count} 个下载"), false);
+        }
+        cx.notify();
+    }
+
+    /// 托盘「全部继续」。
+    pub fn resume_all_from_tray(&mut self, cx: &mut Context<Self>) {
+        let mut count = 0usize;
+        for index in 0..self.items.len() {
+            if self.items[index].state == ItemState::Paused {
+                self.resume_item(index);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.set_toast(format!("已继续 {count} 个下载"), false);
+        }
+        cx.notify();
+    }
+
+    /// 全局热键 `Ctrl+Shift+D`：恢复窗口并提示粘贴链接（旧版没有添加弹层）。
+    pub fn quick_add_from_tray(&mut self, cx: &mut Context<Self>) {
+        self.show_from_tray(cx);
+        self.set_toast("已通过全局热键唤醒：粘贴链接后按 Enter 开始下载", false);
+        cx.notify();
+    }
+
+    /// 托盘「打开下载目录」。
+    pub fn open_download_folder_from_tray(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.settings.default_dir.clone() else {
+            self.set_toast("尚未设置默认保存目录", true);
+            return;
+        };
+        if let Err(err) = open_path::open_directory(&dir) {
+            self.set_toast(format!("打开下载目录失败: {err}"), true);
+        }
+        cx.notify();
+    }
+
     /// 从托盘/第二次启动/IPC `Activate` 恢复主窗口（静默启动或关闭到托盘后）。
     pub fn show_from_tray(&mut self, cx: &mut Context<Self>) {
         self.restore_window(cx);
@@ -460,7 +507,7 @@ impl RdmApp {
                 return;
             }
         };
-        let request = self.settings.build_request(url);
+        let request = self.settings.request_with_defaults(url);
         self.url_input.update(cx, |input, cx| input.clear(cx));
         match model::prepare_request(&self.settings, request) {
             Ok(request) => {
@@ -481,7 +528,6 @@ impl RdmApp {
         self.draft_auto_start = self.settings.auto_start;
         self.draft_dynamic = self.settings.dynamic_connections;
         self.draft_save_by_extension = self.settings.save_by_extension;
-        self.draft_ai_classify = self.settings.ai_classify;
         self.draft_launch_at_startup = self.settings.launch_at_startup;
         self.draft_minimize_to_tray = self.settings.minimize_to_tray;
         self.draft_silent_start = self.settings.silent_start;
@@ -582,7 +628,6 @@ impl RdmApp {
         settings.auto_start = self.draft_auto_start;
         settings.dynamic_connections = self.draft_dynamic;
         settings.save_by_extension = self.draft_save_by_extension;
-        settings.ai_classify = self.draft_ai_classify;
         settings.launch_at_startup = self.draft_launch_at_startup;
         settings.minimize_to_tray = self.draft_minimize_to_tray;
         settings.silent_start = self.draft_silent_start;
@@ -807,7 +852,7 @@ impl RdmApp {
         let mut first_error: Option<String> = None;
         let mut failed = 0usize;
         for resource in resources {
-            let mut request = self.settings.build_request(resource.url.clone());
+            let mut request = self.settings.request_with_defaults(resource.url.clone());
             if !resource.name.trim().is_empty() {
                 request.file_name = Some(resource.name.clone());
             }
@@ -943,12 +988,12 @@ impl RdmApp {
             return;
         };
         let item = &self.items[index];
-        let target = open_path::resolve_folder_target(
+        let target = open_path::reveal_target_for_item(
             item.path.as_deref(),
             item.request.output_dir.as_deref(),
             &self.state_dir,
         );
-        if let Err(err) = open_path::open_folder(&target) {
+        if let Err(err) = open_path::reveal_path(&target) {
             self.set_toast(format!("打开文件夹失败: {err}"), true);
         }
         cx.notify();
@@ -1033,8 +1078,6 @@ impl RdmApp {
     fn start_item(&mut self, index: usize) {
         // 先复制路由参数，避免与 `items[index]` 的可变借用冲突。
         let settings = self.settings.clone();
-        let ai_config = self.ai_config.clone();
-        let state_dir = self.state_dir.clone();
         let item = &mut self.items[index];
         item.run_id += 1;
         let run_id = item.run_id;
@@ -1044,12 +1087,10 @@ impl RdmApp {
         let routing = if let Some(dir) = item.save_dir.clone() {
             request.output_dir = Some(dir);
             None
-        } else if settings.save_by_extension || settings.ai_classify {
+        } else if settings.save_by_extension {
             Some(RoutingOptions {
-                save_by_extension: settings.save_by_extension,
-                use_ai_classify: settings.ai_classify,
-                ai_config,
-                state_dir,
+                save_by_extension: true,
+                classification: settings.classification.clone(),
             })
         } else {
             None
@@ -1201,7 +1242,11 @@ impl RdmApp {
                         notify = true;
                     }
                 }
-                EngineMsg::AiChatFinished { request_id, reply } => {
+                EngineMsg::AiChatFinished {
+                    request_id,
+                    reply,
+                    usage: _,
+                } => {
                     if self.ai_chat_request == Some(request_id) {
                         self.ai_chat_request = None;
                         // 用完整回复覆盖流式占位（网络丢包时 delta 可能缺字/重复）。
@@ -1212,7 +1257,11 @@ impl RdmApp {
                         notify = true;
                     }
                 }
-                EngineMsg::AiChatFailed { request_id, error } => {
+                EngineMsg::AiChatFailed {
+                    request_id,
+                    error,
+                    usage: _,
+                } => {
                     if self.ai_chat_request == Some(request_id) {
                         self.ai_chat_request = None;
                         self.ai.fail_chat_stream(&error);
@@ -1238,6 +1287,9 @@ impl RdmApp {
                         }
                     }
                     self.flush_if_dirty();
+                }
+                EngineMsg::ExperienceApplied { .. } => {
+                    // 旧版 UI（--ui=legacy）不承载解析经验；没有对应界面可更新。
                 }
                 EngineMsg::Ipc { envelope, reply } => {
                     let response = self.handle_ipc(envelope, cx);
@@ -1315,6 +1367,8 @@ impl RdmApp {
                 page_url,
                 page_title,
                 page_links,
+                // 旧版 UI 不提供「强制 AI 重新解析」入口；字段仍接受（IPC 兼容）。
+                force_ai: _force_ai,
             } => {
                 match validate_url(&url) {
                     Ok(url) => {
@@ -2318,7 +2372,7 @@ impl RdmApp {
         fields
     }
 
-    /// 分类与校验：按后缀分类保存 / AI 分类 / SHA-256 校验（含原底部 SHA 提示）。
+    /// 分类与校验：按后缀分类保存 / SHA-256 校验（含原底部 SHA 提示）。
     fn render_settings_classification(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let palette = self.palette;
         let mut fields: Vec<AnyElement> = Vec::new();
@@ -2336,20 +2390,6 @@ impl RdmApp {
                 palette,
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.draft_save_by_extension = !this.draft_save_by_extension;
-                    cx.notify();
-                }),
-            )
-            .into_any_element(),
-        );
-        fields.push(
-            settings_toggle_row(
-                "toggle-ai-classify",
-                "AI 分类",
-                "让模型决定保存目录（需启用 AI）",
-                self.draft_ai_classify,
-                palette,
-                cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    this.draft_ai_classify = !this.draft_ai_classify;
                     cx.notify();
                 }),
             )

@@ -1,23 +1,13 @@
-//! Integration tests for the OpenAI-compatible client and AI classification,
-//! backed by the in-crate mock HTTP server (no public network, no real key).
+//! Integration tests for the OpenAI-compatible client: chat completions and
+//! live model listing (`GET {base_url}/models`), backed by the in-crate mock
+//! HTTP server (no public network, no real key).
 
 mod support;
 
-use std::path::PathBuf;
 use std::time::Instant;
 
-use rdm_ai::{classify, AiClient, AiError, ClassifyInput};
+use rdm_ai::{AiClient, AiError};
 use support::{ai_config, local_config, MockServer, Reply};
-
-fn classify_input(file_name: &str, existing: &[&str]) -> ClassifyInput {
-    ClassifyInput {
-        url: format!("https://example.com/{file_name}"),
-        file_name: file_name.to_owned(),
-        content_type: Some("video/mp4".to_owned()),
-        root_dir: PathBuf::from("C:/Downloads"),
-        existing_dirs: existing.iter().map(|dir| (*dir).to_owned()).collect(),
-    }
-}
 
 #[tokio::test]
 async fn chat_sends_openai_compatible_request() {
@@ -123,72 +113,108 @@ async fn chat_timeout_is_enforced() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Live model listing (`GET {base_url}/models`, design 16 §5.2)
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
-async fn classify_with_ai_uses_suggested_directory() {
+async fn list_models_gets_the_live_catalog_with_bearer_auth() {
     let server = MockServer::start(|request| {
-        if request.method == "POST" {
-            Reply::chat(r#"{"dir":"视频","create":true,"reason":"mp4 视频"}"#)
+        if request.method == "GET" && request.path == "/v1/models" {
+            Reply::json(
+                r#"{"object":"list","data":[
+                    {"id":"deepseek-v4-pro","object":"model"},
+                    {"id":"deepseek-flash","object":"model"},
+                    {"id":"deepseek-flash","object":"model"},
+                    {"id":"DeepSeek-Reasoner","object":"model"}
+                ]}"#,
+            )
         } else {
-            Reply::status(405, "only POST")
+            Reply::status(404, "not found")
         }
     })
     .await;
-    let outcome = rdm_ai::classify_with_ai(&ai_config(&server), &classify_input("movie.mp4", &[]))
-        .await
-        .expect("AI classification");
-    assert_eq!(outcome.dir_name, "视频");
-    assert!(outcome.ai_used);
-    assert!(outcome.new_dir);
-    assert_eq!(outcome.reason, "mp4 视频");
-    assert_eq!(server.count_method("POST"), 1);
+
+    let client = AiClient::new(ai_config(&server)).expect("client");
+    let models = client.list_models().await.expect("live model list");
+    // Sorted case-insensitively by model id, duplicates removed.
+    assert_eq!(
+        models,
+        ["deepseek-flash", "DeepSeek-Reasoner", "deepseek-v4-pro"]
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/v1/models");
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer test-key-12345")
+    );
+    let user_agent = request.header("user-agent").expect("user-agent header");
+    assert!(user_agent.starts_with("rdm-ai/"), "{user_agent}");
 }
 
 #[tokio::test]
-async fn classify_with_ai_reuses_existing_directory() {
-    let server = MockServer::start(|_| Reply::chat(r#"{"dir":"视频","reason":"video"}"#)).await;
-    let outcome =
-        rdm_ai::classify_with_ai(&ai_config(&server), &classify_input("movie.mp4", &["视频"]))
-            .await
-            .unwrap();
-    assert_eq!(outcome.dir_name, "视频");
-    assert!(!outcome.new_dir);
-}
-
-#[tokio::test]
-async fn classify_with_ai_accepts_root_directory() {
-    let server = MockServer::start(|_| Reply::chat(r#"{"dir":"","reason":"放根目录"}"#)).await;
-    let outcome = rdm_ai::classify_with_ai(&ai_config(&server), &classify_input("movie.mp4", &[]))
-        .await
-        .unwrap();
-    assert_eq!(outcome.dir_name, "");
-    assert!(outcome.ai_used);
-}
-
-#[tokio::test]
-async fn classify_with_ai_rejects_invalid_directory() {
-    let server = MockServer::start(|_| {
-        Reply::chat(r#"{"dir":"..\\..\\Windows","create":true,"reason":"evil"}"#)
+async fn list_models_normalizes_models_and_trailing_slash_bases() {
+    let server = MockServer::start(|request| {
+        if request.method == "GET" && request.path == "/v1/models" {
+            Reply::json(r#"{"data":[{"id":"m1"}]}"#)
+        } else {
+            Reply::status(404, "not found")
+        }
     })
     .await;
-    assert!(
-        rdm_ai::classify_with_ai(&ai_config(&server), &classify_input("movie.mp4", &[]))
-            .await
-            .is_none()
-    );
+
+    for base in [
+        server.url("/v1"),
+        server.url("/v1/"),
+        server.url("/v1/models"),
+    ] {
+        let mut config = ai_config(&server);
+        config.base_url = base;
+        let client = AiClient::new(config).expect("client");
+        assert_eq!(
+            client.list_models().await.expect("models"),
+            ["m1".to_owned()]
+        );
+    }
 }
 
 #[tokio::test]
-async fn classify_falls_back_to_local_on_ai_failure() {
-    let server = MockServer::start(|_| Reply::status(503, "down")).await;
-    let outcome = classify(&classify_input("movie.mp4", &[]), &ai_config(&server), true).await;
-    assert_eq!(outcome.dir_name, "视频");
-    assert!(!outcome.ai_used);
-    assert!(outcome.new_dir);
+async fn list_models_reports_status_without_leaking_the_key() {
+    let server = MockServer::start(|_| {
+        Reply::status(
+            401,
+            r#"{"error":"the api key status-secret-key is invalid"}"#,
+        )
+    })
+    .await;
+    let mut config = ai_config(&server);
+    config.api_key = "status-secret-key".to_owned();
+    let client = AiClient::new(config).unwrap();
+
+    let error = client.list_models().await.expect_err("401 must fail");
+    match &error {
+        AiError::Status { status, body } => {
+            assert_eq!(*status, 401);
+            assert!(body.contains("<redacted>"), "{body}");
+        }
+        other => panic!("expected Status error, got {other:?}"),
+    }
+    let rendered = format!("{error:?}") + &error.to_string();
+    assert!(!rendered.contains("status-secret-key"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
 }
 
 #[tokio::test]
-async fn classify_without_ai_is_local() {
-    let outcome = classify(&classify_input("song.mp3", &[]), &local_config(), true).await;
-    assert_eq!(outcome.dir_name, "音频");
-    assert!(!outcome.ai_used);
+async fn list_models_rejects_malformed_json_and_accepts_empty_lists() {
+    let malformed = MockServer::start(|_| Reply::json("this is not json")).await;
+    let client = AiClient::new(ai_config(&malformed)).unwrap();
+    assert!(matches!(client.list_models().await, Err(AiError::Json(_))));
+
+    let empty = MockServer::start(|_| Reply::json(r#"{"object":"list","data":[]}"#)).await;
+    let client = AiClient::new(ai_config(&empty)).unwrap();
+    assert!(client.list_models().await.expect("empty list").is_empty());
 }

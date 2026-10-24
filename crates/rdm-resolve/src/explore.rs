@@ -35,7 +35,7 @@ use crate::prompt::{
 use crate::trace::{digest_args, error_kind_name, redact_excerpt, RunStep};
 use crate::verify::{Verifier, VerifyHints};
 
-use rdm_ai::{AiClient, AiError, ChatMessage};
+use rdm_ai::{AiClient, AiError, ChatMessage, TokenUsage};
 
 /// Tool outcome of one executed action.
 enum Effect {
@@ -223,7 +223,12 @@ pub(crate) async fn explore(
         }
 
         llm_calls += 1;
-        let reply = match client.chat_messages(&messages).await {
+        let reply = client.chat_messages(&messages).await;
+        // Account for this call *before* inspecting the result: a provider error
+        // still billed the request, and every early-return path below must keep
+        // the token usage already spent (see `Diagnostics::llm_*`).
+        record_usage(&mut diagnostics, client.take_usage());
+        let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
                 return fail(
@@ -400,6 +405,26 @@ fn no_progress_error(state: &ExploreState, llm_calls: u32) -> ResolveError {
             state.observations.len()
         ),
     )
+}
+
+/// Fold one drained [`TokenUsage`] into the run diagnostics (saturating).
+///
+/// [`rdm_ai::AiClient`] records the tokens of every model call internally; the
+/// exploration loop drains that ledger right after each `chat_messages` so both
+/// success and failure outcomes report what the provider actually billed. The
+/// `llm_calls` counter is tracked separately (it also covers the final failed
+/// call), so only the token counters and the estimate flag are merged here.
+fn record_usage(diagnostics: &mut Diagnostics, usage: TokenUsage) {
+    diagnostics.llm_prompt_tokens = diagnostics
+        .llm_prompt_tokens
+        .saturating_add(usage.prompt_tokens);
+    diagnostics.llm_completion_tokens = diagnostics
+        .llm_completion_tokens
+        .saturating_add(usage.completion_tokens);
+    diagnostics.llm_total_tokens = diagnostics
+        .llm_total_tokens
+        .saturating_add(usage.total_tokens);
+    diagnostics.llm_estimated |= usage.estimated;
 }
 
 // ---------------------------------------------------------------------------
@@ -817,12 +842,25 @@ fn bind_evidence(state: &ExploreState, url: &str, evidence: &str) -> Result<(), 
 
 fn build_resource_item(candidate: &ManifestCandidate, verification: Verification) -> ResourceItem {
     let final_url = verification.final_url.clone();
-    let name = candidate.name.clone().or_else(|| {
-        final_url
-            .as_deref()
-            .and_then(file_name_from_url)
-            .or_else(|| file_name_from_url(&candidate.url))
-    });
+    let raw_name = candidate
+        .name
+        .clone()
+        .or_else(|| {
+            final_url
+                .as_deref()
+                .and_then(file_name_from_url)
+                .or_else(|| file_name_from_url(&candidate.url))
+        })
+        .unwrap_or_default();
+    // Exploration models frequently emit a page title as `name` (no suffix).
+    // Normalize with verified Content-Type / URL / kind so downstream CLI/MCP/
+    // GUI consumers all receive a real filename (`标题 (720P).mp4`).
+    let name = rdm_ai::ensure_file_extension(
+        &raw_name,
+        verification.content_type.as_deref(),
+        final_url.as_deref().or(Some(candidate.url.as_str())),
+        candidate.kind.as_deref(),
+    );
     let notes = if verification.status.is_downloadable() {
         Vec::new()
     } else {
@@ -832,7 +870,7 @@ fn build_resource_item(candidate: &ManifestCandidate, verification: Verification
         resource_id: new_id("res"),
         url: candidate.url.clone(),
         final_url,
-        name,
+        name: Some(name),
         kind: candidate.kind.clone(),
         content_type: verification.content_type.clone(),
         size_bytes: verification.size_bytes,
@@ -1104,6 +1142,69 @@ fn file_name_from_url(url: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn verified_video(content_type: &str, final_url: &str) -> Verification {
+        Verification {
+            status: crate::contract::VerificationStatus::Verified,
+            method: crate::contract::VerificationMethod::RangedGet,
+            http_status: Some(206),
+            final_url: Some(final_url.to_owned()),
+            content_type: Some(content_type.to_owned()),
+            size_bytes: Some(45_932_387),
+            supports_ranges: Some(true),
+            etag: None,
+            last_modified: None,
+            evidence: vec!["GET range 0-1023 -> 206 video/mp4".to_owned()],
+            checked_ms: 0,
+        }
+    }
+
+    #[test]
+    fn exploration_resource_name_gets_extension_from_verified_content_type() {
+        // Real Bilibili case: the explorer emitted the page title as `name`.
+        let candidate = ManifestCandidate {
+            url: "https://cdn.example.com/upgcxcode/05/11/x/stream?e=sig".to_owned(),
+            evidence: "obs_1#/data/durl/0/url".to_owned(),
+            name: Some("饿急眼了煮两包泡面 (720P)".to_owned()),
+            kind: Some("video".to_owned()),
+            one_time: false,
+            single_stream: false,
+        };
+        let verification = verified_video("video/mp4", &candidate.url);
+        let item = build_resource_item(&candidate, verification);
+        assert_eq!(item.name.as_deref(), Some("饿急眼了煮两包泡面 (720P).mp4"));
+        assert_eq!(item.content_type.as_deref(), Some("video/mp4"));
+    }
+
+    #[test]
+    fn exploration_resource_name_uses_signed_url_suffix_when_no_content_type() {
+        let candidate = ManifestCandidate {
+            url: "https://cdn.example.com/42924311105-1-192.mp4?e=sig".to_owned(),
+            evidence: "obs_1".to_owned(),
+            name: Some("标题 (1080P)".to_owned()),
+            kind: Some("video".to_owned()),
+            one_time: false,
+            single_stream: false,
+        };
+        let mut verification = verified_video("", &candidate.url);
+        verification.content_type = None;
+        let item = build_resource_item(&candidate, verification);
+        assert_eq!(item.name.as_deref(), Some("标题 (1080P).mp4"));
+    }
+
+    #[test]
+    fn exploration_resource_name_keeps_existing_extension() {
+        let candidate = ManifestCandidate {
+            url: "https://cdn.example.com/a.mp4".to_owned(),
+            evidence: "obs_1".to_owned(),
+            name: Some("already.mp4".to_owned()),
+            kind: Some("video".to_owned()),
+            one_time: false,
+            single_stream: false,
+        };
+        let item = build_resource_item(&candidate, verified_video("video/mp4", &candidate.url));
+        assert_eq!(item.name.as_deref(), Some("already.mp4"));
+    }
+
     fn observation(obs_id: &str, request_url: &str, final_url: &str, body: &[u8]) -> Observation {
         Observation {
             obs_id: obs_id.to_owned(),
@@ -1230,5 +1331,30 @@ mod tests {
             ai_error(&AiError::Json("bad".to_owned())).kind,
             ResolveErrorKind::ModelProtocolError
         );
+    }
+
+    #[test]
+    fn token_usage_accumulates_across_model_calls() {
+        let mut diagnostics = Diagnostics::default();
+        record_usage(&mut diagnostics, TokenUsage::single(120, 30));
+        record_usage(
+            &mut diagnostics,
+            TokenUsage {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                total_tokens: 10,
+                calls: 1,
+                estimated: true,
+            },
+        );
+        assert_eq!(diagnostics.llm_prompt_tokens, 127);
+        assert_eq!(diagnostics.llm_completion_tokens, 33);
+        assert_eq!(diagnostics.llm_total_tokens, 160);
+        assert!(diagnostics.llm_estimated);
+
+        // A zero usage (e.g. `NotConfigured` before any HTTP call) changes nothing.
+        record_usage(&mut diagnostics, TokenUsage::ZERO);
+        assert_eq!(diagnostics.llm_total_tokens, 160);
+        assert_eq!(diagnostics.llm_prompt_tokens, 127);
     }
 }

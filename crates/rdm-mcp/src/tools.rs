@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rdm_agent::{
-    capabilities_for, redact_url, AgentErrorInfo, DownloadPlan, ErrorCode, TaskEvent, TaskRecord,
-    TaskState, SCHEMA_VERSION,
+    capabilities_for, redact_url_userinfo, AgentErrorInfo, DownloadPlan, ErrorCode, TaskEvent,
+    TaskRecord, TaskState, SCHEMA_VERSION,
 };
 use rdm_core::{DownloadRequest, RemoteMeta};
 use rdm_resolve::{
@@ -307,7 +307,7 @@ pub fn check_final_url(policy: &rdm_agent::Policy, final_url: &str) -> Result<()
     if !final_url.starts_with("http://") && !final_url.starts_with("https://") {
         return Err(util::policy_denied(
             format!("redirected to a non-http(s) URL: {final_url}"),
-            json!({ "stage": "final_url", "final_url": redact_url(final_url) }),
+            json!({ "stage": "final_url", "final_url": redact_url_userinfo(final_url) }),
         ));
     }
     let Some(host) = util::url_host(final_url) else {
@@ -599,8 +599,8 @@ async fn probe(ctx: &CallContext, args: &Map<String, Value>) -> Result<ToolOk, A
         warnings.push("no_content_length".to_string());
     }
     let data = json!({
-        "url": redact_url(&request.url),
-        "final_url": redact_url(&meta.final_url),
+        "url": redact_url_userinfo(&request.url),
+        "final_url": redact_url_userinfo(&meta.final_url),
         "file_name": util::sanitize_filename(&meta.file_name),
         "total_bytes": meta.total_bytes,
         "range_supported": meta.supports_ranges,
@@ -713,7 +713,7 @@ async fn resolve(ctx: &CallContext, args: &Map<String, Value>) -> Result<ToolOk,
     }
     let summary = format!(
         "resolve {} -> {:?}: {} resource(s), {} step(s), {} request(s)",
-        redact_url(&url),
+        redact_url_userinfo(&url),
         outcome.status,
         outcome
             .manifest

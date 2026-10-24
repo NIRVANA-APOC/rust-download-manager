@@ -22,3 +22,7 @@ Thumbs.db
 
 # Local runtime state
 /run/
+
+# Python caches (design mockup build scripts)
+__pycache__/
+*.pyc

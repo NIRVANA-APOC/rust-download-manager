@@ -1,13 +1,14 @@
 //! Version-level method health (`docs/architecture.md` §11.10 v0.15,
 //! `docs/agent-integration.md` v2.1 §8.11).
 //!
-//! `index.json` is now schema `rdm.recipe-index/v2`: every method id keeps a
+//! `index.json` is now schema `rdm.recipe-index/v4` (v2 added per-version
+//! health; v3/v4 add resolve-experience metadata): every method id keeps a
 //! `versions: {"<version>": RecipeHealth}` map while `entry.health` stays the
 //! mirror of `active_version` (old clients keep their semantics). Recording a
 //! replay writes the *actually replayed* version; inserting a new version keeps
 //! the old version's history but starts the new one `untested`; rolling back
-//! switches the mirror; v1 index files remain readable and are upgraded on the
-//! next write.
+//! switches the mirror; v1/v2 index files remain readable and are upgraded on
+//! the next write.
 
 mod common;
 mod support;
@@ -336,11 +337,11 @@ async fn reinserting_the_same_version_keeps_its_health() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. index.json: schema v2 + versions map + active mirror
+// 5. index.json: schema v4 + versions map + active mirror
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn index_json_uses_schema_v2_and_persists_the_versions_map() {
+async fn index_json_uses_schema_v4_and_persists_the_versions_map() {
     let scratch = ScratchDir::new("vhealth-json");
     let mut registry = registry(&scratch);
     save_and_insert(&mut registry, &simple_recipe("site", 1));
@@ -351,7 +352,7 @@ async fn index_json_uses_schema_v2_and_persists_the_versions_map() {
 
     let index = read_index(&scratch);
     assert_eq!(index["schema"], INDEX_SCHEMA);
-    assert_eq!(index["schema"], "rdm.recipe-index/v2");
+    assert_eq!(index["schema"], "rdm.recipe-index/v4");
     let entry = &index["entries"]["site"];
     assert_eq!(entry["active_version"], 2);
     let versions = entry["versions"]
@@ -420,7 +421,7 @@ async fn v1_index_is_read_as_the_active_versions_health() {
         "the mirror follows the newly active v2"
     );
     let index = read_index(&scratch);
-    assert_eq!(index["schema"], "rdm.recipe-index/v2");
+    assert_eq!(index["schema"], "rdm.recipe-index/v4");
     assert_eq!(
         index["entries"]["site"]["versions"]["1"]["status"],
         "broken"
@@ -568,7 +569,7 @@ async fn service_records_health_for_the_version_it_replayed() {
             .expect("index"),
     )
     .expect("index JSON");
-    assert_eq!(raw["schema"], "rdm.recipe-index/v2");
+    assert_eq!(raw["schema"], "rdm.recipe-index/v4");
     assert!(raw["entries"]["versioned"]["versions"]["1"].is_object());
     assert!(raw["entries"]["versioned"]["versions"]["2"].is_object());
 }

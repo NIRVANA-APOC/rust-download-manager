@@ -61,12 +61,40 @@ fn read_state(dir: &Path, target_name: &str) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("resume state is valid JSON")
 }
 
+/// Base chunk ids that are fully covered by the persisted resume state.
+///
+/// The kernel writes v2 states (`completed_ranges`); states written by older
+/// versions carry `completed_chunks` instead. Both are accepted here so the
+/// resume tests keep asserting the same public semantics.
 fn completed_chunks(state: &serde_json::Value) -> Vec<u64> {
-    state["completed_chunks"]
-        .as_array()
-        .expect("completed_chunks array")
-        .iter()
-        .map(|value| value.as_u64().expect("chunk index"))
+    let chunk_size = state["chunk_size"].as_u64().expect("chunk_size");
+    let total_chunks = state["total_chunks"].as_u64().expect("total_chunks");
+    let total_bytes = state["total_bytes"].as_u64().expect("total_bytes");
+    let ranges: Vec<(u64, u64)> = match state["completed_ranges"].as_array() {
+        Some(ranges) if !ranges.is_empty() => ranges
+            .iter()
+            .map(|pair| {
+                let pair = pair.as_array().expect("range pair");
+                (pair[0].as_u64().unwrap(), pair[1].as_u64().unwrap())
+            })
+            .collect(),
+        _ => state["completed_chunks"]
+            .as_array()
+            .expect("completed_chunks array")
+            .iter()
+            .map(|value| {
+                let index = value.as_u64().expect("chunk index");
+                let start = index * chunk_size;
+                (start, (start + chunk_size).min(total_bytes))
+            })
+            .collect(),
+    };
+    (0..total_chunks)
+        .filter(|index| {
+            let start = index * chunk_size;
+            let end = (start + chunk_size).min(total_bytes);
+            ranges.iter().any(|&(s, e)| s <= start && e >= end)
+        })
         .collect()
 }
 
@@ -224,6 +252,43 @@ async fn range_ignored_falls_back_to_single_stream() {
 }
 
 // ---------------------------------------------------------------------------
+// §3.6.3 — pause keeps verified in-flight prefixes
+// ---------------------------------------------------------------------------
+
+/// Pausing must not throw away megabytes that were already flushed and verified
+/// by their `Content-Range`; with 4 MiB coalesced claims a worker can be deep
+/// into a claim when the pause arrives.
+#[tokio::test]
+async fn pause_persists_verified_prefixes_of_in_flight_claims() {
+    let total = 32 * 1024 * 1024u64;
+    let server = TestServer::start(Config::new(total).with_shared_rate(16 * 1024 * 1024))
+        .await
+        .unwrap();
+    let dir = TempDir::new("pause-prefix");
+    let mut request = request_for(&server, dir.path(), 4);
+    request.file_name = Some("payload.bin".to_string());
+    request.chunk_size = Some(1024 * 1024);
+    request.dynamic_connections = false;
+
+    let (paused, state) = pause_midway(request, total / 4, "payload.bin", dir.path()).await;
+    assert!(paused > 0);
+    let retained = state["downloaded_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        retained > 0,
+        "in-flight verified prefixes must survive a pause: {state}"
+    );
+    let ranges = state["completed_ranges"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !ranges.is_empty(),
+        "pause must persist at least one completed byte range: {state}"
+    );
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // §3.6.3 — resume after pause re-downloads *only* missing chunks
 // ---------------------------------------------------------------------------
 
@@ -367,15 +432,26 @@ async fn etag_change_invalidates_resume() {
 
     assert_eq!(resumed.resumed_chunks, 0, "resume must be discarded");
     assert_eq!(std::fs::read(&resumed.path).unwrap(), server.content());
-    assert_eq!(
-        after.body_bytes_sent - before.body_bytes_sent,
-        total,
-        "a validator mismatch must re-download the whole file"
+    // Probe-free resume discovers the changed validator on the first ranged
+    // request: the server answers 200 and the engine restarts as one stream.
+    // The fixture counts bytes written by handlers whose client aborts (the
+    // extra concurrent 200 bodies), so allow a small bounded overlap.
+    let served = after.body_bytes_sent - before.body_bytes_sent;
+    assert!(
+        served >= total,
+        "a validator mismatch must re-download the whole file ({served}/{total})"
+    );
+    assert!(
+        served < total + 512 * 1024,
+        "validator mismatch wasted too many bytes: {served} vs {total}"
     );
     let new_ranges = &after.range_headers[before.range_headers.len()..];
+    let new_gets = after.get_requests - before.get_requests;
+    // Either the restart's first range starts at 0, or the probe-free resume
+    // discovered the change via a rangeless full GET (which also covers 0).
     assert!(
-        new_ranges.iter().any(|raw| range_start(raw) == 0),
-        "restart must begin at offset 0"
+        new_ranges.iter().any(|raw| range_start(raw) == 0) || new_gets as usize > new_ranges.len(),
+        "restart must cover offset 0 (ranges={new_ranges:?}, gets={new_gets})"
     );
     assert!(
         after.body_bytes_sent - before.body_bytes_sent > paused,

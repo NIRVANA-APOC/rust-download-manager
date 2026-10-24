@@ -7,12 +7,16 @@
 //! - `DownloadItem` 是 GUI 的投影，真正的断点状态由 `rdm-core` 的 `.part.json` 持有；
 //!   因此 GUI 持久化允许每 1s 落一次，丢一点展示数据不会影响正确性。
 //! - `DownloadError::Paused / Cancelled` 是控制流，不是失败；见 `apply_result`。
-//! - 过滤器「失败」包含 `Failed + Cancelled`（取消的任务也需要被看见/清理）。
+//! - 过滤器有两种历史语义，互不混淆：legacy [`Filter::Failed`] 把 `Failed + Cancelled`
+//!   都算失败；新版 `views::app::ViewFilter::Failed` **只含 `Failed`**（取消只出现在「全部」）。
+//!   新代码请使用 `ViewFilter`；`Filter` 仅为旧版 UI 保留（审计 F-07）。
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rdm_ai::{CategoryRule, TokenUsage};
 use rdm_core::{DownloadError, DownloadEvent, DownloadRequest, DownloadSummary};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +63,20 @@ impl ItemState {
 
     pub fn is_active(self) -> bool {
         matches!(self, Self::Downloading)
+    }
+
+    /// 生命周期展示排序（下载中 → 已暂停 → 已完成 → 失败 → 已取消）。
+    ///
+    /// 审计 F-21：排序必须用固定 ordinal，不能按中文文案的字典序（码点序会得到
+    /// 「下载中/已暂停/已完成/失败/已取消」这种看似随机的顺序）。
+    pub fn sort_rank(self) -> u8 {
+        match self {
+            Self::Downloading => 0,
+            Self::Paused => 1,
+            Self::Completed => 2,
+            Self::Failed => 3,
+            Self::Cancelled => 4,
+        }
     }
 
     pub fn is_terminal(self) -> bool {
@@ -185,6 +203,91 @@ impl Theme {
     }
 }
 
+/// 新版 UI 的主题模式（`ui_theme` 字段）。`None` 表示跟随系统；
+/// 旧版 `theme` 字段在首次升级时映射为 `Some(Light/Dark)`（见 `resolved_ui_theme`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiThemeMode {
+    /// 跟随 Windows 应用明暗模式。
+    #[default]
+    FollowSystem,
+    Light,
+    Dark,
+}
+
+impl UiThemeMode {
+    pub const ALL: [UiThemeMode; 3] = [
+        UiThemeMode::FollowSystem,
+        UiThemeMode::Light,
+        UiThemeMode::Dark,
+    ];
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::FollowSystem => "跟随系统",
+            Self::Light => "浅色",
+            Self::Dark => "深色",
+        }
+    }
+}
+
+/// 强调色预设（04 §3，默认蓝）。只影响可交互强调元素，不影响状态色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentPreset {
+    #[default]
+    Blue,
+    Cyan,
+    Violet,
+    Green,
+    Orange,
+}
+
+impl AccentPreset {
+    pub const ALL: [AccentPreset; 5] = [
+        AccentPreset::Blue,
+        AccentPreset::Cyan,
+        AccentPreset::Violet,
+        AccentPreset::Green,
+        AccentPreset::Orange,
+    ];
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Blue => "蓝",
+            Self::Cyan => "青",
+            Self::Violet => "紫",
+            Self::Green => "绿",
+            Self::Orange => "橙",
+        }
+    }
+}
+
+/// 列表密度：舒适 64px / 紧凑 40px（04 §7）。窗口 <1100px 时运行时自动紧凑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Density {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+impl Density {
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Comfortable => "舒适",
+            Self::Compact => "紧凑",
+        }
+    }
+
+    pub fn row_height(self) -> f32 {
+        match self {
+            Self::Comfortable => 64.0,
+            Self::Compact => 40.0,
+        }
+    }
+}
+
 /// `settings.json` 的内容。字段都带 `#[serde(default)]`，旧文件缺字段时用默认值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -201,8 +304,12 @@ pub struct Settings {
     pub dynamic_connections: bool,
     /// 按后缀/内容类型分目录保存（默认开）。
     pub save_by_extension: bool,
-    /// 是否允许 AI 参与分类（仍受 `ai.json` 的 `enabled` + key 约束，默认开）。
-    pub ai_classify: bool,
+    /// 分类规则（后缀 → 目录名，唯一事实来源，见 `rdm_ai::classify`）。
+    ///
+    /// 字段级 `serde(default)` + 结构体级 `default` 保证旧 `settings.json`
+    /// （没有该字段）自动迁移到内置默认规则；空/非法列表由 `normalized()` 修复。
+    #[serde(default = "default_classification")]
+    pub classification: Vec<CategoryRule>,
 
     // ---------------------------------------------------------------
     // 系统集成（桌面端）
@@ -214,6 +321,18 @@ pub struct Settings {
     pub minimize_to_tray: bool,
     /// 静默启动：启动时不显示主窗口，直接驻留托盘（默认关，需托盘）。
     pub silent_start: bool,
+
+    // ---------------------------------------------------------------
+    // 新版 UI（docs/design）；旧版 UI 继续读 `theme` 字段，互不破坏。
+    // ---------------------------------------------------------------
+    /// 新版 UI 主题模式：`None` 时按旧 `theme` 字段迁移（浅色系 → Light，其余 → Dark）。
+    pub ui_theme: Option<UiThemeMode>,
+    /// 强调色预设（默认蓝）。
+    pub accent: AccentPreset,
+    /// 列表密度（默认舒适；窗口过窄时运行时自动紧凑）。
+    pub density: Density,
+    /// 减少动效：关闭过渡动画与循环 spinner（仍保留进度条更新）。
+    pub reduce_motion: bool,
 }
 
 impl Default for Settings {
@@ -227,15 +346,52 @@ impl Default for Settings {
             auto_start: true,
             dynamic_connections: true,
             save_by_extension: true,
-            ai_classify: true,
+            classification: default_classification(),
             launch_at_startup: false,
             minimize_to_tray: false,
             silent_start: false,
+            ui_theme: None,
+            accent: AccentPreset::default(),
+            density: Density::default(),
+            reduce_motion: false,
         }
     }
 }
 
+/// `serde(default)` 入口：旧 settings.json 没有 `classification` 时用内置规则。
+fn default_classification() -> Vec<CategoryRule> {
+    rdm_ai::default_category_rules()
+}
+
 impl Settings {
+    /// 新版 UI 实际使用的主题模式：显式 `ui_theme` 优先；否则从旧 `theme` 迁移。
+    ///
+    /// 迁移规则：浅色系（Light / Catppuccin Latte）→ Light，其余 → Dark。
+    /// 这样从旧版本升级的用户不会在启动时突然从深色/浅色切换。
+    pub fn resolved_ui_theme(&self) -> UiThemeMode {
+        if let Some(mode) = self.ui_theme {
+            return mode;
+        }
+        match self.theme {
+            Theme::Light | Theme::CatppuccinLatte => UiThemeMode::Light,
+            _ => UiThemeMode::Dark,
+        }
+    }
+
+    /// 把新版外观设置同步回旧版 `theme` 字段，保证 `RDM_UI=legacy` 回退时观感一致。
+    pub fn sync_legacy_theme(&mut self, dark: bool) {
+        match self.ui_theme {
+            Some(UiThemeMode::Light) | Some(UiThemeMode::Dark) => {
+                self.theme = if dark { Theme::Dark } else { Theme::Light };
+            }
+            Some(UiThemeMode::FollowSystem) | None => {
+                if self.ui_theme.is_none() {
+                    self.theme = if dark { Theme::Dark } else { Theme::Light };
+                }
+            }
+        }
+    }
+
     /// 是否需要常驻托盘图标：关闭到托盘与静默启动都依赖托盘。
     ///
     /// 单独开启「开机自启动」不强制托盘（正常显示主窗口），只有这两个开关会
@@ -254,6 +410,9 @@ impl Settings {
         let mut out = self.clone();
         out.default_connections = out.default_connections.clamp(1, rdm_core::MAX_CONNECTIONS);
         out.speed_limit_bps = out.speed_limit_bps.filter(|v| *v > 0);
+        // 分类规则唯一事实来源：小写、去点、去重（全局唯一后缀）、限长；
+        // 缺失分类补默认、`other` 兜底永远存在（见 `rdm_ai::sanitize_category_rules`）。
+        out.classification = rdm_ai::sanitize_category_rules(&out.classification);
         out
     }
 
@@ -265,8 +424,11 @@ impl Settings {
         }
     }
 
-    /// 构造新下载的 `DownloadRequest`。`expected_sha256` 留空：见 `verify_sha256` 注释。
-    pub fn build_request(&self, url: impl Into<String>) -> DownloadRequest {
+    /// 用设置填好下载默认参数（连接数/保存目录/限速/动态规划）的请求构造器。
+    ///
+    /// 语义边界（审计 F-24）：**不校验 URL、也不保证请求可下载**；调用方必须再走
+    /// [`prepare_request`]（或自行校验 URL）。逐任务字段（如 `file_name`）可在两步之间设置。
+    pub fn request_with_defaults(&self, url: impl Into<String>) -> DownloadRequest {
         let mut req = DownloadRequest::new(url);
         req.connections = self.default_connections.clamp(1, rdm_core::MAX_CONNECTIONS);
         req.output_dir = self.default_dir.clone();
@@ -274,6 +436,76 @@ impl Settings {
         req.dynamic_connections = self.dynamic_connections;
         req
     }
+}
+
+// ---------------------------------------------------------------------------
+// 分类规则进程内快照（GUI 筛选 / 磁盘分类共用同一份规则）
+// ---------------------------------------------------------------------------
+
+/// 进程内分类规则快照。
+///
+/// `Settings::classification` 保存后通过 [`set_classification_rules`] 写入这里；
+/// 侧栏 `FileCategory` 筛选/计数、图标、资源监控扫描都从快照读取，保证
+/// 「磁盘目录 / 侧栏分类 / 文件图标」三处永远一致（`docs/design/16` §4.1）。
+/// 初始值 = 内置默认规则，因此未加载设置前也有一份可用规则。
+static CLASSIFICATION_RULES: OnceLock<RwLock<Vec<CategoryRule>>> = OnceLock::new();
+
+fn classification_rules_lock() -> &'static RwLock<Vec<CategoryRule>> {
+    CLASSIFICATION_RULES.get_or_init(|| RwLock::new(rdm_ai::default_category_rules()))
+}
+
+/// 用设置里的分类规则刷新全局快照（内部会再清洗一次，永远保留全部 kind）。
+///
+/// 调用点：`RdmApp::new`（启动加载设置后）与 `RdmApp::apply_settings`
+/// （设置页保存后）——见 `docs/design/16` §4.1。
+pub fn set_classification_rules(rules: &[CategoryRule]) {
+    let sanitized = rdm_ai::sanitize_category_rules(rules);
+    let mut snapshot = classification_rules_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *snapshot = sanitized;
+}
+
+/// 当前生效的分类规则（克隆；热路径请用 [`with_classification_rules`]）。
+///
+/// 设置页编辑器与后续自定义分类入口使用；非测试构建目前没有直接调用方。
+#[allow(dead_code)]
+pub fn classification_rules() -> Vec<CategoryRule> {
+    with_classification_rules(|rules| rules.to_vec())
+}
+
+/// 在分类规则快照的读锁下执行 `f`（侧栏计数等热路径，避免每次克隆整表）。
+pub fn with_classification_rules<R>(f: impl FnOnce(&[CategoryRule]) -> R) -> R {
+    let snapshot = classification_rules_lock()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(snapshot.as_slice())
+}
+
+/// 文件名 → 分类 kind（`video`/`audio`/…/`other`），使用当前生效规则。
+///
+/// 未知 kind（例如手工 JSON 里的自定义分类）返回 `""`，由调用方归入「其他」。
+pub fn category_kind_for_file(file_name: &str) -> String {
+    with_classification_rules(|rules| {
+        rdm_ai::category_for_with_rules(file_name, None, rules)
+            .kind
+            .clone()
+    })
+}
+
+/// 文件名 → 分类目录名（`视频`/`文档`/…/`其他`），使用当前生效规则。
+///
+/// 用于「分类编辑器/自定义分类」等展示路径；当前 UI 直连 `CategoryRule.label`。
+#[allow(dead_code)]
+pub fn category_for_file(file_name: &str) -> String {
+    with_classification_rules(|rules| {
+        let rule = rdm_ai::category_for_with_rules(file_name, None, rules);
+        if rule.label.trim().is_empty() {
+            rdm_ai::CATEGORY_OTHER.to_owned()
+        } else {
+            rule.label.clone()
+        }
+    })
 }
 
 /// 校验 URL、补齐设置里的默认目录/限速，并用 GUI 设置收敛下载参数。
@@ -453,6 +685,84 @@ impl std::fmt::Debug for ParseCredential {
     }
 }
 
+/// AI 成本归属到单个下载项（资源监控「哪个文件最贵」的数据来源）。
+///
+/// 解析产生的 token 属于**整次解析**：同一次解析创建了 N 个下载项时，每个项都记录
+/// 同一份 `parse`（`parse_siblings = N`），资源监控的总量以账本（`AiUsageLedger`）为准，
+/// 不会重复累计；UI 用「共享 N 项」徽标解释单个任务的归属。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ItemAiUsage {
+    /// 创建该下载项的 AI 解析所消耗的 token（缓存命中时为 0）。
+    #[serde(default)]
+    pub parse: TokenUsage,
+    /// **历史字段**：旧版本「AI 分类」消耗的 token。
+    ///
+    /// `docs/design/16-reuse-and-simplification.md` §4 起分类完全按后缀确定性完成，
+    /// 不再调用 AI，因此新任务永远为 0；保留字段只为读取旧 `downloads.json`。
+    #[serde(default)]
+    pub classify: TokenUsage,
+    /// 解析部分的估算花费（人民币；无价目为 0）。
+    #[serde(default)]
+    pub parse_cost_cny: f64,
+    /// **历史字段**：旧版本 AI 分类的估算花费（新任务永远为 0）。
+    #[serde(default)]
+    pub classify_cost_cny: f64,
+    /// 实际使用的模型名（解析；历史记录可能来自分类）；未知为 `None`。
+    #[serde(default)]
+    pub model: Option<String>,
+    /// 解析结果是否来自本地解析缓存（命中不代表本次有 token 消耗）。
+    #[serde(default)]
+    pub cache_hit: bool,
+    /// 与该项共享同一次解析的下载项数量（1 = 独占）。
+    #[serde(default = "one_sibling")]
+    pub parse_siblings: u32,
+    /// 最近一次记录时间。
+    #[serde(default)]
+    pub updated_ms: u64,
+}
+
+fn one_sibling() -> u32 {
+    1
+}
+
+impl ItemAiUsage {
+    /// 该项可归属的 token 合计（解析 + 历史分类记录；不因共享而折算）。
+    pub fn total(&self) -> TokenUsage {
+        let mut total = self.parse;
+        total.merge(self.classify);
+        total
+    }
+
+    /// 该项可归属的估算花费合计（人民币；含历史分类记录）。
+    pub fn cost_cny(&self) -> f64 {
+        self.parse_cost_cny + self.classify_cost_cny
+    }
+
+    /// 该项是否有可展示的 AI 消耗：token 总量 **或** 调用次数非零都算。
+    ///
+    /// 审计 F-06：失败/被拒绝的模型调用可能 `total_tokens == 0` 但 `calls > 0`，
+    /// 只看 total_tokens 会把这类记录误判为「无 AI 消耗」。
+    pub fn has_tokens(&self) -> bool {
+        let total = self.total();
+        total.calls > 0 || total.total_tokens > 0
+    }
+
+    pub fn estimated(&self) -> bool {
+        self.parse.estimated || self.classify.estimated
+    }
+}
+
+/// 一次 AI 解析的完成结果（用于把 token/费用归属到随后创建的下载项）。
+#[derive(Debug, Clone, Default)]
+pub struct ParseUsageSnapshot {
+    pub request_id: u64,
+    pub usage: TokenUsage,
+    pub model: Option<String>,
+    pub cache_hit: bool,
+    /// 本次解析的估算花费（有价目时 `Some`）。
+    pub cost_cny: Option<f64>,
+}
+
 /// AI 解析/聊天面板的纯状态机。`app.rs` 只负责把字段画出来。
 #[derive(Debug, Clone, Default)]
 pub struct AiPanelState {
@@ -465,6 +775,8 @@ pub struct AiPanelState {
     pub ai_used: bool,
     pub cache_hit: bool,
     pub model: Option<String>,
+    /// 本次解析消耗的 token（资源监控记账 + 检查器展示）。
+    pub usage: TokenUsage,
     pub error: Option<String>,
     /// P4b-a：本次解析来源的内存凭据（仅下载交接用；Debug 已脱敏）。
     pub credential: Option<ParseCredential>,
@@ -473,6 +785,8 @@ pub struct AiPanelState {
     pub chat_pending: bool,
     /// 是否有 assistant 消息正在流式输出（`app.rs` 据此渲染「正在输出」占位/光标）。
     pub streaming: bool,
+    /// 最近一次 Agent 工作流的确定性汇报（供后续普通问答的 prompt 引用；不持久化）。
+    pub last_plan_summary: Option<String>,
 }
 
 impl AiPanelState {
@@ -489,6 +803,7 @@ impl AiPanelState {
         self.ai_used = false;
         self.cache_hit = false;
         self.model = None;
+        self.usage = TokenUsage::default();
         self.error = None;
         self.credential = None;
         self.request_id = request_id;
@@ -503,6 +818,7 @@ impl AiPanelState {
         self.ai_used = report.ai_used;
         self.cache_hit = report.cache_hit;
         self.model = report.model;
+        self.usage = report.usage;
         self.resources = report
             .resources
             .into_iter()
@@ -522,8 +838,57 @@ impl AiPanelState {
         self.status = AiParseStatus::Failed;
         self.resources.clear();
         self.notes.clear();
+        self.usage = TokenUsage::default();
         self.error = Some(error);
         self.clear_credential();
+    }
+
+    /// 重新解析成功后的「保留最佳结果」合并（design 17 §2.5）：
+    /// 新结果在前，旧结果中 URL 未出现的按原顺序追加（保留原勾选状态）。
+    /// 返回被保留的旧资源数量；去重键 = 资源 URL。
+    pub fn merge_preserved_resources(&mut self, previous: Vec<AiResourceCard>) -> usize {
+        let mut seen: std::collections::BTreeSet<String> = self
+            .resources
+            .iter()
+            .map(|card| card.resource.url.clone())
+            .collect();
+        let mut kept = 0usize;
+        for card in previous {
+            if seen.insert(card.resource.url.clone()) {
+                self.resources.push(card);
+                kept += 1;
+            }
+        }
+        kept
+    }
+
+    /// 追加一条面板 note（保持 `rdm_ai::parse::MAX_NOTES` 上限，新的在最前）。
+    pub fn push_note(&mut self, note: impl Into<String>) {
+        let note = note.into();
+        self.notes.retain(|existing| existing != &note);
+        self.notes.insert(0, note);
+        self.notes.truncate(rdm_ai::parse::MAX_NOTES);
+    }
+
+    /// 重新解析失败但上次已有结果时：保留资源清单，只记录错误 + 说明（design 17 §2.5）。
+    ///
+    /// 返回 `true` 表示保留了上次结果（状态保持 `Ready`）；没有可保留结果时返回
+    /// `false`，调用方应改用 [`Self::apply_parse_error`]。
+    pub fn apply_reparse_error(&mut self, error: String, preserved: usize) -> bool {
+        if self.resources.is_empty() {
+            return false;
+        }
+        self.visible = true;
+        // 状态保持 Ready：资源清单仍然可用，错误以横幅 + note 的形式呈现
+        //（`begin_parse` 把状态置为 Parsing，这里必须显式恢复）。
+        self.status = AiParseStatus::Ready;
+        self.error = Some(error);
+        self.usage = TokenUsage::default();
+        self.clear_credential();
+        self.push_note(format!(
+            "重新解析失败；已保留上次解析的 {preserved} 个资源（可继续下载或稍后重试）"
+        ));
+        true
     }
 
     /// P4b-a：记录本次解析请求携带的**内存**凭据（`app.rs` 在 `begin_parse` 后调用）。
@@ -622,6 +987,16 @@ impl AiPanelState {
         self.chat_pending = true;
     }
 
+    /// 开始一次**只产生 assistant 消息**的流式输出（Agent 执行汇报）。
+    ///
+    /// 与 [`Self::begin_chat_stream`] 的区别：不追加用户消息——用户请求已经作为
+    /// 工作流计划的一部分上屏，汇报是这次工具执行的收尾，不再重复一条「用户问」。
+    pub fn begin_assistant_stream(&mut self) {
+        self.push_message(AiRole::Assistant, String::new());
+        self.streaming = true;
+        self.chat_pending = true;
+    }
+
     /// 追加一段流式增量：空增量直接丢弃；末尾不是 assistant 时新建一条。
     ///
     /// 只追加不重置文本，最终以 [`Self::finish_chat_stream`] 的完整回复为准（防丢字/重复）。
@@ -689,16 +1064,25 @@ impl AiPanelState {
 // ---------------------------------------------------------------------------
 
 /// URL → 归一化 host（小写、去尾点、不含端口）；非 http(s)/无 host → `None`。
-fn normalized_url_host(url: &str) -> Option<String> {
+///
+/// 这是「从 URL 取 host」的**唯一权威实现**（解析凭据归属、AI 账本来源 host 共用），
+/// 避免各视图各写一份大小写/尾点规则导致同一 URL 在不同地方得到不同 host。
+pub fn url_host(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url.trim()).ok()?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return None;
     }
-    parsed.host_str().map(normalize_credential_host)
+    let host = parsed.host_str()?.trim();
+    (!host.is_empty()).then(|| normalize_host(host))
+}
+
+/// 解析凭据归属用的 host 比较键：与 [`url_host`] 同一归一化规则。
+fn normalized_url_host(url: &str) -> Option<String> {
+    url_host(url)
 }
 
 /// host 归一化：trim + 小写 + 去一个尾点（与 `rdm-resolve::HostCredentials` 一致）。
-fn normalize_credential_host(host: &str) -> String {
+fn normalize_host(host: &str) -> String {
     host.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -730,7 +1114,11 @@ fn credential_from_request(request: &rdm_ai::ParseRequest) -> Option<ParseCreden
 // URL / 文件名
 // ---------------------------------------------------------------------------
 
-/// 只接受 http(s)，拒绝 `file://` 与空白字符。
+/// 只接受 http(s)，拒绝 `file://`、空白字符与非法 URL。
+///
+/// 审计 F-04：与 core/native/CLI/MCP 一致，使用 `url::Url::parse` 做真实解析校验
+/// （端口越界、非法 percent-encoding、空 host 都在输入阶段拒绝），而不是只看前缀；
+/// 返回值保持「trim 后的原始文本」（不重写用户 URL 的大小写/路径）。
 pub fn validate_url(input: &str) -> Result<String, String> {
     let url = input.trim();
     if url.is_empty() {
@@ -739,17 +1127,12 @@ pub fn validate_url(input: &str) -> Result<String, String> {
     if url.chars().any(char::is_whitespace) {
         return Err("URL 不能包含空白字符".to_string());
     }
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Err("仅支持 http(s) URL".to_string());
+    let parsed = url::Url::parse(url).map_err(|err| format!("URL 格式无效：{err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("仅支持 http(s) URL".to_string()),
     }
-    let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
-    let rest = &url[scheme_end..];
-    let host_end = rest
-        .find(|c: char| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
-    let host = &rest[..host_end];
-    if host.is_empty() || host.starts_with(':') {
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err("URL 缺少主机名".to_string());
     }
     Ok(url.to_string())
@@ -880,6 +1263,8 @@ pub struct DownloadItem {
     pub run_id: u64,
     /// 已请求、等待引擎确认的停止动作。
     pub stop_request: StopRequest,
+    /// AI 成本归属（解析/分类 token）；从未使用 AI 的任务为 `None`。
+    pub ai: Option<ItemAiUsage>,
 }
 
 impl DownloadItem {
@@ -912,6 +1297,7 @@ impl DownloadItem {
             sha256: None,
             run_id: 0,
             stop_request: StopRequest::None,
+            ai: None,
         }
     }
 
@@ -934,6 +1320,20 @@ impl DownloadItem {
 
     pub fn percent_text(&self) -> String {
         format_percent(self.progress_fraction())
+    }
+
+    /// 已下载/总量（暂停行用；总数未知时只显示已下载）。
+    pub fn downloaded_text(&self) -> String {
+        match self.total {
+            Some(total) if total > 0 => {
+                format!(
+                    "{} / {}",
+                    format_bytes(self.downloaded),
+                    format_bytes(total)
+                )
+            }
+            _ => format_bytes(self.downloaded),
+        }
     }
 
     pub fn speed_text(&self) -> String {
@@ -1191,6 +1591,7 @@ impl DownloadItem {
             peak_connections: self.peak_connections,
             target_connections: self.target_connections,
             save_dir: self.save_dir.clone(),
+            ai: self.ai.clone(),
         }
     }
 
@@ -1239,6 +1640,7 @@ impl DownloadItem {
             sha256: saved.sha256,
             run_id: 0,
             stop_request: StopRequest::None,
+            ai: saved.ai,
         };
         if item.state == ItemState::Paused && item.error.is_none() {
             item.note = Some("启动恢复：已暂停，可继续".to_string());
@@ -1329,6 +1731,9 @@ pub struct PersistedItem {
     /// 分类保存目录（旧文件缺省 = None）。
     #[serde(default)]
     pub save_dir: Option<PathBuf>,
+    /// AI 成本归属（旧文件缺省 = None，表示从未使用 AI）。
+    #[serde(default)]
+    pub ai: Option<ItemAiUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1551,6 +1956,7 @@ mod tests {
             range_supported: true,
             http_version: None,
             peak_connections: 8,
+            controller: None,
         }
     }
 
@@ -1759,10 +2165,14 @@ mod tests {
             auto_start: true,
             dynamic_connections: false,
             save_by_extension: true,
-            ai_classify: true,
+            classification: rdm_ai::default_category_rules(),
             launch_at_startup: false,
             minimize_to_tray: false,
             silent_start: false,
+            ui_theme: None,
+            accent: AccentPreset::default(),
+            density: Density::default(),
+            reduce_motion: false,
         };
 
         // URL 校验 + 连接数/动态规划跟随 GUI 设置 + 默认目录/限速补齐。
@@ -1792,9 +2202,11 @@ mod tests {
     /// （用户报障：GUI 设 16、扩展 popup 显示上限 8）。
     #[test]
     fn prepare_request_uses_gui_connections_over_handoff_value() {
-        let mut settings = Settings::default();
-        settings.default_connections = 16;
-        settings.dynamic_connections = false;
+        let mut settings = Settings {
+            default_connections: 16,
+            dynamic_connections: false,
+            ..Default::default()
+        };
 
         let mut request = DownloadRequest::new("https://example.com/a.bin");
         request.connections = 8; // 旧扩展默认值 / 宿主缺省值
@@ -1947,8 +2359,10 @@ mod tests {
         assert_eq!(parse_speed_limit_mb("1.5").unwrap(), Some(1_572_864));
         assert!(parse_speed_limit_mb("abc").is_err());
         assert!(parse_speed_limit_mb("-1").is_err());
-        let mut settings = Settings::default();
-        settings.speed_limit_bps = Some(2 * 1024 * 1024);
+        let mut settings = Settings {
+            speed_limit_bps: Some(2 * 1024 * 1024),
+            ..Default::default()
+        };
         assert_eq!(settings.speed_limit_mb_text(), "2");
         settings.speed_limit_bps = Some(1_572_864);
         assert_eq!(settings.speed_limit_mb_text(), "1.5");
@@ -1959,11 +2373,13 @@ mod tests {
 
     #[test]
     fn connections_normalization() {
-        let mut settings = Settings::default();
-        settings.default_connections = 999;
+        let mut settings = Settings {
+            default_connections: 999,
+            ..Default::default()
+        };
         let normalized = settings.normalized();
         assert_eq!(normalized.default_connections, rdm_core::MAX_CONNECTIONS);
-        let request = normalized.build_request("https://example.com/a.bin");
+        let request = normalized.request_with_defaults("https://example.com/a.bin");
         assert_eq!(request.connections, rdm_core::MAX_CONNECTIONS);
         settings.default_connections = 0;
         assert_eq!(settings.normalized().default_connections, 1);
@@ -1974,10 +2390,14 @@ mod tests {
         let settings = Settings::default();
         assert!(settings.dynamic_connections);
         assert!(settings.save_by_extension);
-        assert!(settings.ai_classify);
+        assert_eq!(
+            settings.classification,
+            rdm_ai::default_category_rules(),
+            "默认分类规则来自 rdm-ai 唯一事实来源"
+        );
         assert!(
             settings
-                .build_request("https://example.com/a.bin")
+                .request_with_defaults("https://example.com/a.bin")
                 .dynamic_connections
         );
 
@@ -1985,7 +2405,7 @@ mod tests {
         settings.dynamic_connections = false;
         assert!(
             !settings
-                .build_request("https://example.com/a.bin")
+                .request_with_defaults("https://example.com/a.bin")
                 .dynamic_connections
         );
         // normalized 只收敛数值，不重置开关。
@@ -1994,12 +2414,17 @@ mod tests {
 
     #[test]
     fn old_settings_json_uses_new_flag_defaults() {
+        // 旧 JSON 里的 `ai_classify` 字段（已删除）必须被 serde 忽略而不是报错。
         let old = r#"{"default_connections":4,"speed_limit_bps":null,"verify_sha256":true,
-            "theme":"light","auto_start":false}"#;
+            "theme":"light","auto_start":false,"ai_classify":false}"#;
         let settings: Settings = serde_json::from_str(old).unwrap();
         assert!(settings.dynamic_connections);
         assert!(settings.save_by_extension);
-        assert!(settings.ai_classify);
+        assert_eq!(
+            settings.classification,
+            rdm_ai::default_category_rules(),
+            "旧 JSON 没有 classification 时必须回落到内置规则"
+        );
         assert_eq!(settings.theme, Theme::Light);
         assert!(!settings.auto_start);
     }
@@ -2134,6 +2559,8 @@ mod tests {
     #[test]
     fn settings_roundtrip() {
         let dir = temp_dir("settings");
+        let mut classification = rdm_ai::default_category_rules();
+        classification[0].extensions = vec!["zzz".to_owned()];
         let settings = Settings {
             default_connections: 4,
             default_dir: Some(dir.join("dl")),
@@ -2143,10 +2570,14 @@ mod tests {
             auto_start: false,
             dynamic_connections: false,
             save_by_extension: false,
-            ai_classify: false,
+            classification,
             launch_at_startup: true,
             minimize_to_tray: true,
             silent_start: false,
+            ui_theme: None,
+            accent: AccentPreset::default(),
+            density: Density::default(),
+            reduce_motion: false,
         };
         save_settings(&dir, &settings).unwrap();
         let loaded = load_settings(&dir);
@@ -2158,12 +2589,63 @@ mod tests {
         assert!(!loaded.auto_start);
         assert!(!loaded.dynamic_connections);
         assert!(!loaded.save_by_extension);
-        assert!(!loaded.ai_classify);
+        // 自定义分类规则随 settings.json 持久化（保持全部 kind，other 兜底）。
+        assert_eq!(loaded.classification.len(), rdm_ai::CATEGORY_KINDS.len());
+        assert_eq!(loaded.classification[0].kind, "video");
+        assert_eq!(loaded.classification[0].extensions, vec!["zzz".to_owned()]);
+        assert_eq!(
+            loaded.classification.last().map(|rule| rule.kind.as_str()),
+            Some("other")
+        );
         assert!(loaded.launch_at_startup);
         assert!(loaded.minimize_to_tray);
         assert!(!loaded.silent_start);
         assert!(loaded.needs_tray());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn classification_normalization_sanitizes_and_keeps_every_kind() {
+        let settings = Settings {
+            classification: vec![rdm_ai::CategoryRule {
+                kind: "video".to_owned(),
+                label: "视频".to_owned(),
+                extensions: vec![
+                    ".MP4".to_owned(),
+                    " mp4 ".to_owned(),
+                    "bad-char".to_owned(),
+                    String::new(),
+                ],
+            }],
+            ..Settings::default()
+        };
+        let normalized = settings.normalized();
+        assert_eq!(
+            normalized.classification.len(),
+            rdm_ai::CATEGORY_KINDS.len()
+        );
+        assert_eq!(normalized.classification[0].extensions, vec!["mp4"]);
+        // 空/损坏的规则列表整体回落默认，而不是让所有下载都进根目录。
+        let broken = Settings {
+            classification: Vec::new(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            broken.normalized().classification,
+            rdm_ai::default_category_rules()
+        );
+    }
+
+    #[test]
+    fn classification_snapshot_reads_the_active_rules() {
+        // 读取默认快照（测试不修改全局快照，避免与并行测试互相影响）。
+        assert_eq!(category_kind_for_file("movie.mp4"), "video");
+        assert_eq!(category_kind_for_file("song.mp3"), "audio");
+        assert_eq!(category_kind_for_file("data.json"), "document");
+        assert_eq!(category_kind_for_file("unknown.zzz"), "other");
+        assert_eq!(category_for_file("movie.mp4"), "视频");
+        assert_eq!(category_for_file("unknown.zzz"), rdm_ai::CATEGORY_OTHER);
+        assert!(!classification_rules().is_empty());
     }
 
     #[test]
@@ -2276,6 +2758,13 @@ mod tests {
             notes: vec!["整理出 2 个视频资源".to_string()],
             ai_used: true,
             model: Some("gpt-4o-mini".to_string()),
+            usage: rdm_ai::TokenUsage {
+                prompt_tokens: 1200,
+                completion_tokens: 300,
+                total_tokens: 1500,
+                calls: 1,
+                estimated: false,
+            },
             created_ms: 1,
             cache_hit: false,
             failure_kind: None,
@@ -2295,6 +2784,7 @@ mod tests {
         assert_eq!(panel.source_url, "https://example.com/page");
         assert!(panel.resources.is_empty());
         assert!(panel.error.is_none());
+        assert!(panel.usage.is_zero());
 
         panel.apply_report(ai_report());
         assert_eq!(panel.status, AiParseStatus::Ready);
@@ -2304,7 +2794,78 @@ mod tests {
         assert!(panel.ai_used);
         assert!(!panel.cache_hit);
         assert_eq!(panel.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(panel.usage.total_tokens, 1_500);
         assert!(panel.error.is_none());
+    }
+
+    #[test]
+    fn item_ai_usage_totals_parse_and_classify() {
+        let usage = ItemAiUsage {
+            parse: rdm_ai::TokenUsage {
+                prompt_tokens: 900,
+                completion_tokens: 300,
+                total_tokens: 1_200,
+                calls: 1,
+                estimated: false,
+            },
+            classify: rdm_ai::TokenUsage {
+                prompt_tokens: 80,
+                completion_tokens: 20,
+                total_tokens: 100,
+                calls: 1,
+                estimated: true,
+            },
+            parse_cost_cny: 0.012,
+            classify_cost_cny: 0.003,
+            model: Some("mock".to_owned()),
+            cache_hit: false,
+            parse_siblings: 2,
+            updated_ms: 1,
+        };
+        assert_eq!(usage.total().total_tokens, 1_300);
+        assert_eq!(usage.total().calls, 2);
+        assert!(usage.has_tokens());
+        assert!(usage.estimated());
+        assert!((usage.cost_cny() - 0.015).abs() < f64::EPSILON);
+        assert!(!ItemAiUsage::default().has_tokens());
+        assert!(ItemAiUsage::default().total().is_zero());
+        assert_eq!(ItemAiUsage::default().cost_cny(), 0.0);
+    }
+
+    #[test]
+    fn old_persisted_items_default_to_no_ai_usage() {
+        // 旧 downloads.json（没有 ai 字段）必须能反序列化。
+        let json = r#"{
+            "id": "dl_000001",
+            "request": {"url": "https://example.com/a.mp4"},
+            "state": "completed"
+        }"#;
+        let saved: PersistedItem = serde_json::from_str(json).expect("legacy item");
+        assert!(saved.ai.is_none());
+        let item = DownloadItem::from_persisted(saved);
+        assert!(item.ai.is_none());
+    }
+
+    #[test]
+    fn persisted_item_round_trips_ai_usage() {
+        let mut item = item_in_state(1, ItemState::Completed);
+        item.ai = Some(ItemAiUsage {
+            parse: rdm_ai::TokenUsage::single(90, 10),
+            classify: rdm_ai::TokenUsage::single(9, 1),
+            parse_cost_cny: 0.002,
+            classify_cost_cny: 0.0004,
+            model: Some("mock".to_owned()),
+            cache_hit: true,
+            parse_siblings: 3,
+            updated_ms: 42,
+        });
+        let saved = item.to_persisted();
+        let restored = DownloadItem::from_persisted(saved);
+        let ai = restored.ai.expect("ai usage survives persistence");
+        assert_eq!(ai.parse.total_tokens, 100);
+        assert_eq!(ai.classify.total_tokens, 10);
+        assert_eq!(ai.parse_siblings, 3);
+        assert!(ai.cache_hit);
     }
 
     #[test]
@@ -2340,6 +2901,79 @@ mod tests {
         assert!(panel.messages[0].created_ms > 0);
         assert_eq!(panel.messages[1].text, "有 2 个 mp4。");
         assert_eq!(panel.messages[1].role, AiRole::Assistant);
+    }
+
+    #[test]
+    fn ai_panel_reparse_keeps_the_richer_previous_resources() {
+        // Design 17 §2.5：重新解析成功后按 URL 去重合并，旧的更丰富结果不丢。
+        let mut panel = AiPanelState::default();
+        panel.begin_parse("https://example.com/page", 1);
+        panel.apply_report(ai_report());
+        panel.toggle_resource(0); // 旧结果：b.mp4 未选
+        let previous = panel.resources.clone();
+
+        // 新一次 AI 只返回 1 个（与旧结果不同的）资源。
+        let mut next = ai_report();
+        next.resources = vec![ai_resource("c.mp4")];
+        next.notes = vec!["重新解析：已跳过本地解析经验（强制 AI）".to_string()];
+        panel.begin_parse("https://example.com/page", 2);
+        panel.apply_report(next);
+        let kept = panel.merge_preserved_resources(previous.clone());
+
+        assert_eq!(kept, 2, "两个旧资源都未出现在新结果里，应全部保留");
+        assert_eq!(panel.resources.len(), 3);
+        assert_eq!(panel.resources[0].resource.name, "c.mp4");
+        assert_eq!(panel.resources[1].resource.name, "a.mp4");
+        assert_eq!(panel.resources[2].resource.name, "b.mp4");
+        // 旧勾选状态保留：a.mp4 曾取消勾选。
+        assert!(!panel.resources[1].selected);
+
+        // 幂等：再次合并同一批旧资源不会重复追加。
+        assert_eq!(panel.merge_preserved_resources(previous), 0);
+        assert_eq!(panel.resources.len(), 3);
+    }
+
+    #[test]
+    fn ai_panel_reparse_failure_preserves_the_previous_result() {
+        // Design 17 §2.5：重新解析失败不清空已看到的结果。
+        let mut panel = AiPanelState::default();
+        panel.begin_parse("https://example.com/page", 1);
+        panel.apply_report(ai_report());
+        let preserved = panel.resources.len();
+
+        assert!(panel.apply_reparse_error("AI 返回空结果".to_string(), preserved));
+        assert_eq!(
+            panel.status,
+            AiParseStatus::Ready,
+            "资源仍可用，状态不退回 Failed"
+        );
+        assert_eq!(panel.resources.len(), preserved);
+        assert_eq!(panel.error.as_deref(), Some("AI 返回空结果"));
+        assert!(panel
+            .notes
+            .first()
+            .is_some_and(|note| note.contains("已保留上次解析")));
+
+        // 没有可保留结果时返回 false，让调用方走普通失败路径。
+        let mut empty = AiPanelState::default();
+        assert!(!empty.apply_reparse_error("x".to_string(), 0));
+    }
+
+    #[test]
+    fn ai_panel_push_note_is_bounded_and_front_loaded() {
+        let mut panel = AiPanelState::default();
+        for index in 0..20 {
+            panel.push_note(format!("note-{index}"));
+        }
+        assert_eq!(panel.notes.len(), rdm_ai::parse::MAX_NOTES);
+        assert_eq!(panel.notes[0], "note-19");
+        // 重复 note 只保留一份，并移动到最前。
+        panel.push_note("note-15");
+        assert_eq!(
+            panel.notes.iter().filter(|note| *note == "note-15").count(),
+            1
+        );
+        assert_eq!(panel.notes[0], "note-15");
     }
 
     // ------------------------------------------------------------------
@@ -2516,7 +3150,7 @@ mod tests {
             Some("rdm-flow/1.0"),
         ));
 
-        let mut request = settings.build_request("https://example.com/files/a.bin");
+        let mut request = settings.request_with_defaults("https://example.com/files/a.bin");
         panel.apply_credentials("https://example.com/files/a.bin", &mut request);
         let request = prepare_request(&settings, request).expect("valid request");
 
@@ -2599,6 +3233,23 @@ mod tests {
         assert!(panel.credential.is_some());
         panel.clear_credential();
         assert!(panel.credential.is_none());
+    }
+
+    #[test]
+    fn begin_assistant_stream_adds_only_an_assistant_placeholder() {
+        let mut panel = AiPanelState::default();
+        panel.begin_assistant_stream();
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].role, AiRole::Assistant);
+        assert!(panel.messages[0].text.is_empty());
+        assert!(panel.streaming);
+        assert!(panel.chat_pending);
+        panel.push_chat_delta("已创建 2 个下载任务。");
+        panel.finish_chat_stream("已创建 2 个下载任务。");
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].text, "已创建 2 个下载任务。");
+        assert!(!panel.streaming);
+        assert!(!panel.chat_pending);
     }
 
     #[test]

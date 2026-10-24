@@ -488,6 +488,7 @@ pub fn distill(
             expect_no_match: false,
             skip: None,
         }],
+        generalization: None,
     };
     let id = draft_id(&host, &input_url, &final_url);
     let recipe = Recipe {

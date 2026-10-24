@@ -264,7 +264,7 @@ impl AgentErrorInfo {
         if let E::Status { status, url } = error {
             info.details = Some(serde_json::json!({
                 "status": status,
-                "url": redact_url(url),
+                "url": redact_url_userinfo(url),
             }));
         }
         info
@@ -464,9 +464,16 @@ pub const SENSITIVE_KEYS: &[&str] = &[
     "proxy-authorization",
 ];
 
-/// Remove `user:password@` from a URL while keeping it parseable. Unparseable
-/// input is returned unchanged (nothing to leak by accident in that case).
-pub fn redact_url(raw: &str) -> String {
+/// Remove `user:password@` from an **agent-visible** URL while keeping it
+/// parseable. Query/fragment are intentionally preserved: the agent needs the
+/// signed/one-time URL it can actually download.
+///
+/// This is deliberately **not** a log redactor — log lines must also drop the
+/// query/fragment (see `rdm-native::url_util::redact_url_for_log`). The old
+/// same-named helpers in two crates had different semantics; audit
+/// 2026-10-22 F-23 split the names. Unparseable input is returned unchanged
+/// (nothing to leak by accident in that case).
+pub fn redact_url_userinfo(raw: &str) -> String {
     let Ok(mut parsed) = url::Url::parse(raw) else {
         return raw.to_string();
     };
@@ -545,7 +552,7 @@ pub fn redact_value(value: &Value) -> Value {
                 } else if matches!(lowered.as_str(), "url" | "final_url" | "proxy" | "referer") {
                     match child {
                         Value::String(text) => {
-                            out.insert(key.clone(), Value::String(redact_url(text)));
+                            out.insert(key.clone(), Value::String(redact_url_userinfo(text)));
                         }
                         other => {
                             out.insert(key.clone(), redact_value(other));
@@ -566,8 +573,13 @@ pub fn redact_value(value: &Value) -> Value {
 pub fn redact_request(request: &DownloadRequest) -> DownloadRequest {
     let mut out = request.clone();
     out.cookie = None;
-    out.url = redact_url(&request.url);
-    out.proxy = request.proxy.as_deref().map(redact_url);
+    out.url = redact_url_userinfo(&request.url);
+    out.proxy = request.proxy.as_deref().map(redact_url_userinfo);
+    out.mirrors = request
+        .mirrors
+        .iter()
+        .map(|mirror| redact_url_userinfo(mirror))
+        .collect();
     out.headers.retain(|name, _| {
         !SENSITIVE_HEADERS
             .iter()
@@ -649,7 +661,7 @@ impl From<&TaskRecord> for TaskSummary {
         Self {
             id: record.id.clone(),
             state: record.state,
-            url: redact_url(&record.request.url),
+            url: redact_url_userinfo(&record.request.url),
             file_name: record.file_name.clone(),
             dest_dir: record.dest_dir.clone(),
             path: record.path.clone(),
@@ -711,7 +723,7 @@ impl From<&TaskRecord> for TaskView {
             id: record.id.clone(),
             state: record.state,
             source: record.source.clone(),
-            url: redact_url(&record.request.url),
+            url: redact_url_userinfo(&record.request.url),
             file_name: record.file_name.clone(),
             dest_dir: record.dest_dir.clone(),
             path: record.path.clone(),
@@ -1346,15 +1358,28 @@ pub const METADATA_HOSTS: &[&str] = &[
 
 /// True for loopback / RFC1918 / link-local / cloud-metadata / unspecified
 /// hosts. Used to enforce the `allow_private_hosts=false` safe default.
+///
+/// Callers normally pass `Url::host_str()`, which keeps IPv6 literals in
+/// **brackets** (`[::1]`). The brackets are stripped before `IpAddr::parse`;
+/// without that, every IPv6 target looked "public" and bypassed the safe
+/// default (audit 2026-10-22 F-01). Mirrors `rdm_resolve::is_private_host`
+/// without depending on that crate.
 pub fn is_private_host(host: &str) -> bool {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
     if METADATA_HOSTS.contains(&host.as_str()) || host.ends_with(".internal") {
         return true;
     }
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(&host);
+    let Ok(ip) = literal.parse::<std::net::IpAddr>() else {
         // Other hostnames are not classified as private (DNS pinning is out of
         // scope for a local policy; the engine re-checks the final URL host).
         return false;
@@ -1484,12 +1509,18 @@ impl DownloadPlan {
         serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "plan_id": self.plan_id,
-            "url": redact_url(&self.request.url),
+            "url": redact_url_userinfo(&self.request.url),
             "dest_dir": self.request.output_dir,
             "file_name": self.request.file_name,
             "connections": normalized.connections,
             "dynamic_connections": normalized.dynamic_connections,
             "single_stream": normalized.single_stream,
+            "prefer_http2": normalized.prefer_http2,
+            "mirrors": normalized
+                .mirrors
+                .iter()
+                .map(|mirror| redact_url_userinfo(mirror))
+                .collect::<Vec<_>>(),
             "chunk_size": normalized.chunk_size,
             "expected_sha256": self.request.expected_sha256,
             "speed_limit_bps": self.request.speed_limit_bps,
@@ -1681,17 +1712,19 @@ mod tests {
     // -- redaction --------------------------------------------------------
 
     #[test]
-    fn redact_url_strips_userinfo_only() {
+    fn redact_url_userinfo_strips_userinfo_only() {
+        // Query/fragment are preserved on purpose: the agent-visible URL must
+        // remain downloadable (F-23; log redaction is a different function).
         assert_eq!(
-            redact_url("https://user:pass@example.com/a.bin?x=1"),
-            "https://example.com/a.bin?x=1"
+            redact_url_userinfo("https://user:pass@example.com/a.bin?x=1#frag"),
+            "https://example.com/a.bin?x=1#frag"
         );
         assert_eq!(
-            redact_url("https://example.com/a.bin"),
+            redact_url_userinfo("https://example.com/a.bin"),
             "https://example.com/a.bin"
         );
         // Unparseable strings are returned verbatim (no partial leak possible).
-        assert_eq!(redact_url("not a url"), "not a url");
+        assert_eq!(redact_url_userinfo("not a url"), "not a url");
     }
 
     #[test]
@@ -1994,6 +2027,23 @@ mod tests {
             policy.check_url("http://metadata.google.internal/computeMetadata/v1"),
             PolicyDecision::Deny { .. }
         ));
+        // F-01 regression: `Url::host_str()` returns IPv6 literals in brackets.
+        // The safe default must deny loopback/ULA/link-local IPv6 too.
+        for url in [
+            "http://[::1]:8080/file",
+            "http://[fe80::1]/file",
+            "http://[fc00::1]/file",
+            "http://[fd00:ec2::254]/latest/meta-data",
+        ] {
+            assert!(
+                matches!(policy.check_url(url), PolicyDecision::Deny { .. }),
+                "{url} must be denied by the default policy"
+            );
+        }
+        assert!(matches!(
+            policy.check_url("https://[2001:4860:4860::8888]/file"),
+            PolicyDecision::Allow
+        ));
         assert!(matches!(
             policy.check_url("https://example.com/file"),
             PolicyDecision::Allow
@@ -2019,6 +2069,12 @@ mod tests {
             PolicyDecision::Allow
         ));
         assert!(is_private_host("::1"));
+        // IPv6 literals arrive bracketed from `Url::host_str()`; both the raw
+        // and bracketed forms must be classified as private (F-01 regression).
+        for host in ["[::1]", "[fe80::1]", "[fc00::1]", "[fd00:ec2::254]"] {
+            assert!(is_private_host(host), "{host} must be private");
+        }
+        assert!(!is_private_host("[2001:4860:4860::8888]"));
         assert!(is_private_host("10.1.2.3"));
         assert!(is_private_host("169.254.169.254"));
         assert!(is_private_host("fe80::1"));

@@ -52,38 +52,68 @@ impl CommandSpec {
     }
 }
 
-/// 生成「在文件管理器中定位」的命令（不执行）。
-pub fn folder_spec(file: &Path) -> CommandSpec {
+/// 生成「打开目录本身」的命令（不执行）。
+///
+/// **必须与 [`reveal_spec`] 区分**：旧实现把「目录」误当成文件走 `parent()`，导致
+/// 「打开下载目录/状态目录」实际打开的是上一级目录（2026-10-22 用户回归）。
+pub fn directory_spec(dir: &Path) -> CommandSpec {
     #[cfg(target_os = "windows")]
     {
-        if file.is_file() {
+        // Explorer 对普通目录参数接受标准引号；含空格/中文由 Command 自动加引号。
+        CommandSpec::new("explorer", vec![dir.display().to_string()])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        CommandSpec::new("open", vec![dir.display().to_string()])
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        CommandSpec::new("xdg-open", vec![dir.display().to_string()])
+    }
+}
+
+/// 生成「在文件管理器中显示 `path`」的命令（不执行）。
+///
+/// - `path` 是目录（存在）→ 打开该目录本身；
+/// - `path` 是文件 → Explorer `/select,"<path>"` 高亮选中；
+/// - `path` 不存在 → 打开其父目录（父目录存在时），否则打开 `path`。
+///
+/// 下载项「打开文件夹」传入的是已完成文件路径，因此会高亮文件；监控页「打开下载目录」
+/// 应使用 [`directory_spec`]，不要经过这里。
+pub fn reveal_spec(path: &Path) -> CommandSpec {
+    if path.is_dir() {
+        return directory_spec(path);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if path.is_file() {
             // 只给路径加引号：`/select,"C:\dir with space\a.bin"`。
-            CommandSpec::new("explorer", Vec::new()).with_raw_arg(select_arg(file))
-        } else if let Some(parent) = file
+            CommandSpec::new("explorer", Vec::new()).with_raw_arg(select_arg(path))
+        } else if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             CommandSpec::new("explorer", vec![parent.display().to_string()])
         } else {
-            CommandSpec::new("explorer", vec![file.display().to_string()])
+            CommandSpec::new("explorer", vec![path.display().to_string()])
         }
     }
     #[cfg(target_os = "macos")]
     {
-        if file.is_file() {
-            CommandSpec::new("open", vec!["-R".to_string(), file.display().to_string()])
-        } else if let Some(parent) = file.parent() {
+        if path.is_file() {
+            CommandSpec::new("open", vec!["-R".to_string(), path.display().to_string()])
+        } else if let Some(parent) = path.parent() {
             CommandSpec::new("open", vec![parent.display().to_string()])
         } else {
-            CommandSpec::new("open", vec![file.display().to_string()])
+            CommandSpec::new("open", vec![path.display().to_string()])
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let dir = if file.is_dir() {
-            file.to_path_buf()
+        let dir = if path.is_dir() {
+            path.to_path_buf()
         } else {
-            file.parent().unwrap_or(file).to_path_buf()
+            path.parent().unwrap_or(path).to_path_buf()
         };
         CommandSpec::new("xdg-open", vec![dir.display().to_string()])
     }
@@ -126,13 +156,35 @@ pub fn file_spec(file: &Path) -> CommandSpec {
     }
 }
 
-/// 在文件管理器中定位文件（失败只记录日志，不弹错误）。
-pub fn open_folder(path: &Path) -> io::Result<()> {
-    spawn_spec(&folder_spec(path))
+/// 打开一个**目录本身**（监控页「打开下载目录/状态目录」、托盘菜单等）。
+///
+/// 目录不存在时返回 `NotFound`，由调用方 toast 明确告知；绝不静默退回父目录
+/// （旧实现就是这样导致「打开下载目录」跳到上一级）。
+pub fn open_directory(dir: &Path) -> io::Result<()> {
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("目录不存在：{}", dir.display()),
+        ));
+    }
+    spawn_spec(&directory_spec(dir))
 }
 
-/// 用默认程序打开文件。
+/// 在文件管理器中显示文件/目录：文件高亮选中，目录直接打开。
+///
+/// 下载项「打开文件夹」与检查器入口统一走这里；目录会打开自身而不是父目录。
+pub fn reveal_path(path: &Path) -> io::Result<()> {
+    spawn_spec(&reveal_spec(path))
+}
+
+/// 用默认程序打开文件（文件不存在时报错，避免 `cmd start` 静默失败）。
 pub fn open_file(path: &Path) -> io::Result<()> {
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("文件不存在：{}", path.display()),
+        ));
+    }
     spawn_spec(&file_spec(path))
 }
 
@@ -149,8 +201,12 @@ fn spawn_spec(spec: &CommandSpec) -> io::Result<()> {
     command.spawn().map(|_child| ())
 }
 
-/// 打开下载项的目录：优先 `<output_dir>`，其次已完成文件所在目录，最后 `state_dir`。
-pub fn resolve_folder_target(
+/// 「打开文件夹」的定位目标 —— **完成项返回文件路径**（交给 [`reveal_path`] 在
+/// Explorer 里高亮），未完成项返回目录（交给 [`open_directory`] 打开）。
+///
+/// 审计 F-18：旧名 `resolve_folder_target` 容易被误读成「总是返回目录」；这里的返回值
+/// 是「reveal/open 的目标」，调用方必须先判断它是文件还是目录，不能直接当目录打开。
+pub fn reveal_target_for_item(
     completed_path: Option<&Path>,
     output_dir: Option<&Path>,
     state_dir: &Path,
@@ -181,11 +237,11 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn folder_spec_selects_existing_file() {
+    fn reveal_spec_selects_existing_file() {
         let dir = temp_dir("select");
         let file = dir.join("a.bin");
         std::fs::write(&file, b"x").unwrap();
-        let spec = folder_spec(&file);
+        let spec = reveal_spec(&file);
         assert_eq!(spec.program, "explorer");
         assert!(
             spec.args.is_empty(),
@@ -204,11 +260,11 @@ mod tests {
     /// 必须只给路径加引号（`/select,"C:\dir with space\a.bin"`）。
     #[cfg(target_os = "windows")]
     #[test]
-    fn folder_spec_quotes_only_the_path_not_the_whole_select_argument() {
+    fn reveal_spec_quotes_only_the_path_not_the_whole_select_argument() {
         let dir = temp_dir("with space");
         let file = dir.join("sel file (1).bin");
         std::fs::write(&file, b"x").unwrap();
-        let spec = folder_spec(&file);
+        let spec = reveal_spec(&file);
         let raw = spec
             .raw_arg
             .as_ref()
@@ -223,10 +279,10 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn folder_spec_falls_back_to_parent_for_missing_file() {
+    fn reveal_spec_falls_back_to_parent_for_missing_file() {
         let dir = temp_dir("fallback");
         let file = dir.join("missing.bin");
-        let spec = folder_spec(&file);
+        let spec = reveal_spec(&file);
         assert_eq!(spec.program, "explorer");
         // 缺失文件退化为「打开父目录」：普通参数，不带 /select，也不走 raw_arg。
         assert_eq!(spec.args.len(), 1);
@@ -234,6 +290,45 @@ mod tests {
         assert!(spec.args[0].contains(dir.file_name().unwrap().to_str().unwrap()));
         assert!(spec.raw_arg.is_none(), "fallback must not use raw_arg");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 回归测试（2026-10-22 用户反馈）：目录必须打开自身，不能走 `parent()`。
+    #[test]
+    fn directory_spec_targets_the_directory_itself() {
+        let dir = temp_dir("dir-target");
+        let nested = dir.join("RDM").join("Downloads with space");
+        std::fs::create_dir_all(&nested).unwrap();
+        let spec = directory_spec(&nested);
+        assert_eq!(
+            spec.args.last().map(String::as_str),
+            Some(nested.to_string_lossy().as_ref()),
+            "directory_spec must open the directory itself, got {spec:?}"
+        );
+        assert!(spec.raw_arg.is_none(), "directory must not use /select");
+        // 新 API 的语义回归：reveal(existing dir) 也必须打开目录自身。
+        let revealed = reveal_spec(&nested);
+        assert_eq!(
+            revealed.args.last().map(String::as_str),
+            Some(nested.to_string_lossy().as_ref()),
+            "reveal_spec(dir) must open the directory itself, got {revealed:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_directory_reports_missing_directory_without_spawning() {
+        let missing = Path::new(r"C:\definitely-not-exists-rdm\Downloads");
+        let err = open_directory(missing).expect_err("missing directory must fail fast");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("目录不存在"), "{err}");
+    }
+
+    #[test]
+    fn open_file_reports_missing_file_without_spawning() {
+        let missing = Path::new(r"C:\definitely-not-exists-rdm\a.bin");
+        let err = open_file(missing).expect_err("missing file must fail fast");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("文件不存在"), "{err}");
     }
 
     #[cfg(target_os = "windows")]
@@ -248,10 +343,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_folder_target_precedence() {
+    fn reveal_target_precedence_for_completed_and_pending_items() {
         let state_dir = Path::new(r"C:\state");
         assert_eq!(
-            resolve_folder_target(
+            reveal_target_for_item(
                 Some(Path::new(r"C:\downloads\a.bin")),
                 Some(Path::new(r"D:\other")),
                 state_dir
@@ -259,11 +354,11 @@ mod tests {
             PathBuf::from(r"C:\downloads\a.bin")
         );
         assert_eq!(
-            resolve_folder_target(None, Some(Path::new(r"D:\other")), state_dir),
+            reveal_target_for_item(None, Some(Path::new(r"D:\other")), state_dir),
             PathBuf::from(r"D:\other")
         );
         assert_eq!(
-            resolve_folder_target(None, None, state_dir),
+            reveal_target_for_item(None, None, state_dir),
             PathBuf::from(r"C:\state")
         );
     }

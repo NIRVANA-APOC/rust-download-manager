@@ -25,6 +25,22 @@ pub(crate) fn is_tray_alive() -> bool {
     false
 }
 
+pub(crate) fn update_tray_tooltip(_tooltip: &str) {}
+
+pub(crate) fn install_hotkey() -> Result<(), String> {
+    Err(UNSUPPORTED.to_string())
+}
+
+pub(crate) fn shutdown_hotkey() {}
+
+pub(crate) fn is_hotkey_installed() -> bool {
+    false
+}
+
+pub(crate) fn disk_space_for(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
 pub(crate) fn install_window_hook(_hwnd: isize) -> Result<(), String> {
     Err(UNSUPPORTED.to_string())
 }
@@ -36,6 +52,8 @@ pub(crate) fn show_window(_hwnd: isize) {}
 pub(crate) fn raw_hwnd(_window: &gpui::Window) -> Option<isize> {
     None
 }
+
+pub(crate) fn set_window_icon(_hwnd: isize) {}
 
 pub(crate) fn autostart_sync(_enabled: bool) -> Result<(), String> {
     Err(UNSUPPORTED.to_string())

@@ -152,6 +152,10 @@ pub struct ParseReport {
     pub ai_used: bool,
     #[serde(default)]
     pub model: Option<String>,
+    /// Token usage of the model call(s) behind this report. Zero when no model
+    /// was called; `estimated = true` when the provider did not report usage.
+    #[serde(default)]
+    pub usage: crate::usage::TokenUsage,
     pub created_ms: u64,
     #[serde(default)]
     pub cache_hit: bool,
@@ -221,6 +225,7 @@ pub async fn parse_url(
             notes: vec!["链接不是有效的 http(s) 地址".to_owned()],
             ai_used: false,
             model: None,
+            usage: crate::usage::TokenUsage::default(),
             created_ms,
             cache_hit: false,
             failure_kind: Some(FAILURE_INVALID_URL.to_owned()),
@@ -249,6 +254,7 @@ pub async fn parse_url(
                     notes: cached.notes.clone(),
                     ai_used: cached.model.is_some(),
                     model: cached.model.clone(),
+                    usage: crate::usage::TokenUsage::default(),
                     created_ms,
                     cache_hit: true,
                     failure_kind: cached.failure_kind.clone(),
@@ -271,6 +277,9 @@ pub async fn parse_url(
     let mut ai_used = false;
     let mut model = None;
     let mut failure_kind: Option<&'static str> = None;
+    // Token accounting for every model call made by this parse (including calls
+    // that later failed to produce a usable reply: those were still billed).
+    let mut usage = crate::usage::TokenUsage::default();
 
     match fetch(&source_url, request, config, &mut notes).await {
         FetchOutcome::DirectFile {
@@ -315,7 +324,7 @@ pub async fn parse_url(
 
             if config.is_configured() {
                 let hints = cache.host_hints(&source_url);
-                match ask_llm(
+                let (outcome, call_usage) = ask_llm(
                     config,
                     request,
                     &source_url,
@@ -325,8 +334,9 @@ pub async fn parse_url(
                     &hints,
                     max_resources,
                 )
-                .await
-                {
+                .await;
+                usage.merge(call_usage);
+                match outcome {
                     Ok(outcome) if !(outcome.resources.is_empty() && outcome.notes.is_empty()) => {
                         resources = outcome.resources;
                         notes.extend(outcome.notes);
@@ -377,6 +387,18 @@ pub async fn parse_url(
         }
     }
 
+    // Normalize display names once all paths (AI, heuristic, direct file) have
+    // produced resources: a resolved stream without a suffix must not become a
+    // document-looking task name. Uses verified Content-Type first, then the
+    // final URL path, then the resource kind (see `ensure_file_extension`).
+    for resource in &mut resources {
+        resource.name = classify::ensure_file_extension(
+            &resource.name,
+            resource.content_type.as_deref(),
+            Some(&resource.url),
+            Some(&resource.kind),
+        );
+    }
     resources.truncate(max_resources);
     normalize_notes(&mut notes);
     if failure_kind.is_none() && resources.is_empty() {
@@ -391,6 +413,7 @@ pub async fn parse_url(
         notes,
         ai_used,
         model,
+        usage,
         created_ms,
         cache_hit: false,
         failure_kind: failure_kind.map(str::to_owned),
@@ -918,22 +941,29 @@ async fn ask_llm(
     title: Option<&str>,
     host_hints: &[String],
     max_resources: usize,
-) -> Result<LlmOutcome, AiError> {
-    let client = AiClient::new(crate::client::bounded_config(config))?;
+) -> (Result<LlmOutcome, AiError>, crate::usage::TokenUsage) {
+    let client = match AiClient::new(crate::client::bounded_config(config)) {
+        Ok(client) => client,
+        Err(error) => return (Err(error), crate::usage::TokenUsage::default()),
+    };
     let system = llm_system_prompt(max_resources);
     let user = llm_user_prompt(
         request, source_url, candidates, page_text, title, host_hints,
     );
-    let reply = client.chat(&system, &user).await?;
-    parse_llm_reply(&reply, max_resources)
+    let reply = client.chat(&system, &user).await;
+    // Collect usage even when the reply could not be parsed: the provider was
+    // already billed for the call.
+    let usage = client.take_usage();
+    let outcome = reply.and_then(|reply| parse_llm_reply(&reply, max_resources));
+    (outcome, usage)
 }
 
 fn llm_system_prompt(max_resources: usize) -> String {
     format!(
         "你是 RDM 下载管理器的链接解析助手。根据来源页面、候选链接和页面摘要，找出用户最可能想下载的资源。\
 只输出一个 JSON 对象（不要 Markdown、不要解释）：\
-{{\"resources\":[{{\"url\":\"https://...\",\"name\":\"文件名\",\"kind\":\"video|audio|image|archive|document|program|other\",\"size_bytes\":123,\"content_type\":\"video/mp4\",\"note\":\"简短说明\"}}],\"notes\":[\"面向用户的简短解析事项\"]}}。\
-规则：链接必须是 http(s)；最多 {max_resources} 个资源；notes 最多 8 条且每条不超过 80 字；不确定的可选字段直接省略；不要编造不存在的链接。"
+{{\"resources\":[{{\"url\":\"https://...\",\"name\":\"文件名.mp4\",\"kind\":\"video|audio|image|archive|document|program|other\",\"size_bytes\":123,\"content_type\":\"video/mp4\",\"note\":\"简短说明\"}}],\"notes\":[\"面向用户的简短解析事项\"]}}。\
+规则：链接必须是 http(s)；name 必须包含真实文件扩展名（如 .mp4/.m4a/.zip；链接无后缀时按 content_type 或 kind 推断，不要只写标题）；最多 {max_resources} 个资源；notes 最多 8 条且每条不超过 80 字；不确定的可选字段直接省略；不要编造不存在的链接。"
     )
 }
 
@@ -1076,6 +1106,11 @@ fn parse_llm_resource(item: &Value) -> Option<ParsedResource> {
         .map(str::trim)
         .filter(|note| !note.is_empty())
         .map(|note| truncate_chars(note, 200));
+    // Model-provided titles often omit the suffix (e.g. a video page title).
+    // Normalize here too so direct `parse_llm_reply` callers and the legacy
+    // parse path share the same contract.
+    let name =
+        classify::ensure_file_extension(&name, content_type.as_deref(), Some(&url), Some(&kind));
     Some(ParsedResource {
         url,
         name,
@@ -1166,6 +1201,17 @@ mod tests {
         assert_eq!(outcome.resources[0].kind, "program");
         assert_eq!(outcome.resources[1].name, "y.zip");
         assert_eq!(outcome.resources[1].kind, "archive");
+    }
+
+    #[test]
+    fn llm_reply_adds_missing_extension_from_content_type_or_url() {
+        let reply = r#"{"resources":[
+            {"url":"https://cdn.example.com/stream?sign=1","name":"标题 (720P)","content_type":"video/mp4","kind":"video"},
+            {"url":"https://cdn.example.com/42924311105-1-192.mp4?e=sig","name":"另一个标题 (1080P)","kind":"video"}
+        ]}"#;
+        let outcome = parse_llm_reply(reply, 10).unwrap();
+        assert_eq!(outcome.resources[0].name, "标题 (720P).mp4");
+        assert_eq!(outcome.resources[1].name, "另一个标题 (1080P).mp4");
     }
 
     #[test]

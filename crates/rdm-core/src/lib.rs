@@ -24,15 +24,27 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub mod error;
 
+/// Test/benchmark hooks that are not part of the supported API.
+#[doc(hidden)]
+pub mod testing {
+    /// Forget every learned per-origin concurrency budget.
+    ///
+    /// Several benchmarks run against localhost fixture servers whose
+    /// ephemeral ports can be reused; without a reset a cap learned for one
+    /// server could leak into the next one. Not needed by normal applications.
+    pub fn reset_origin_budgets() {
+        crate::engine::origin::reset_budgets();
+    }
+}
+
 mod client;
+mod engine;
 mod event;
 mod filename;
 mod plan;
-mod planner;
 mod probe;
 mod rate;
 mod state;
-mod transfer;
 
 pub use error::DownloadError;
 
@@ -113,6 +125,26 @@ pub struct DownloadRequest {
     /// JSON → `false`.
     #[serde(default)]
     pub single_stream: bool,
+    /// Additional URLs that serve the same bytes (mirrors).
+    ///
+    /// Workers are spread across primary + mirrors, so total throughput can
+    /// exceed one origin's per-client cap; a failing mirror rotates to the next
+    /// source and ultimately back to the primary. Metadata (size, validators)
+    /// still comes from the primary URL; each mirror response is validated
+    /// against the primary's `Content-Range` total (and ETag when present).
+    /// Engine-only for now: no CLI/MCP flag exposes it yet. Missing in old
+    /// JSON → empty.
+    #[serde(default)]
+    pub mirrors: Vec<String>,
+    /// Allow HTTP/2 multiplexing for chunked range requests.
+    ///
+    /// Default `false`: chunked transfers force HTTP/1.1 so every worker owns
+    /// an independent TCP connection/congestion window. Set `true` for servers
+    /// that cap concurrent connections (or prefer h2): all ranged GETs then
+    /// share one multiplexed TLS connection, and the server negotiates h2 via
+    /// ALPN (plain-HTTP fixtures fall back to h1). Missing in old JSON → false.
+    #[serde(default)]
+    pub prefer_http2: bool,
 }
 
 impl DownloadRequest {
@@ -134,6 +166,8 @@ impl DownloadRequest {
             insecure: false,
             dynamic_connections: true,
             single_stream: false,
+            mirrors: Vec::new(),
+            prefer_http2: false,
         }
     }
 
@@ -255,6 +289,30 @@ pub enum DownloadEvent {
     },
 }
 
+/// What the adaptive concurrency controller did during a transfer.
+///
+/// Purely diagnostic: callers can log/show it, but no decision depends on
+/// these values. `min_target`/`final_target` are request-concurrency targets,
+/// not chunk counts. `None` in [`DownloadSummary`] means the transfer used the
+/// single-stream path (or dynamic planning was disabled).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ControllerStats {
+    /// Up-probes started (candidate higher target).
+    pub up_probes: u32,
+    /// Down-probes started (candidate lower target).
+    pub down_probes: u32,
+    /// Probes whose gain/loss survived the A–B–A confirmation and were kept.
+    pub accepted: u32,
+    /// Probes reverted because the A–B–A measurement did not confirm a gain.
+    pub reverted: u32,
+    /// Server pushbacks (429/503) that shortened the plan.
+    pub pushbacks: u32,
+    /// Smallest request-concurrency target used during the transfer.
+    pub min_target: u32,
+    /// Target at the end of the transfer.
+    pub final_target: u32,
+}
+
 /// Final result of a successful (or checksum-verified) download.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadSummary {
@@ -278,6 +336,9 @@ pub struct DownloadSummary {
     /// forced so N range requests really use N TCP connections).
     #[serde(default)]
     pub http_version: Option<String>,
+    /// Adaptive-controller diagnostics (None for single-stream transfers).
+    #[serde(default)]
+    pub controller: Option<ControllerStats>,
 }
 
 /// Controls a running download from another task (UI thread, signal handler…).
@@ -353,7 +414,7 @@ pub async fn download_with_handle(
     handle: DownloadHandle,
 ) -> Result<DownloadSummary, DownloadError> {
     let normalized = request.normalized();
-    transfer::run(normalized, event::EventSink::new(events), handle).await
+    engine::run(normalized, event::EventSink::new(events), handle).await
 }
 
 /// Download using remote metadata that the caller already verified.
@@ -377,7 +438,7 @@ pub async fn download_with_meta(
     handle: DownloadHandle,
 ) -> Result<DownloadSummary, DownloadError> {
     let normalized = request.normalized();
-    transfer::run_with_meta(normalized, meta, event::EventSink::new(events), handle).await
+    engine::run_with_meta(normalized, meta, event::EventSink::new(events), handle).await
 }
 
 #[cfg(test)]

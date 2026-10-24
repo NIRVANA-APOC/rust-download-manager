@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rdm_agent::{
-    iso8601_in_minutes, now_iso8601, redact_url, AgentErrorInfo, ErrorCode, TaskFilter, TaskState,
+    iso8601_in_minutes, now_iso8601, redact_url_userinfo, AgentErrorInfo, ErrorCode, TaskFilter,
+    TaskState,
 };
 use rdm_core::{DownloadEvent, DownloadHandle, DownloadRequest, DownloadSummary};
 use rdm_fixture_server::{Config, TestServer};
@@ -252,8 +253,8 @@ pub(crate) async fn doctor(
                         "ok",
                         format!(
                             "{} -> {} ({} bytes, ranges={}, {})",
-                            redact_url(&url),
-                            redact_url(&meta.final_url),
+                            redact_url_userinfo(&url),
+                            redact_url_userinfo(&meta.final_url),
                             meta.total_bytes
                                 .map(|bytes| bytes.to_string())
                                 .unwrap_or_else(|| "?".to_string()),

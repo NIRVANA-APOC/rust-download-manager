@@ -400,6 +400,9 @@ pub fn ai_config(server: &MockServer) -> rdm_ai::AiConfig {
         model: "mock-model".to_owned(),
         api_key: "test-key-12345".to_owned(),
         timeout_secs: 5,
+        // A loopback mock is not a bundled provider: no preset/no prices.
+        provider: None,
+        ..rdm_ai::AiConfig::default()
     }
 }
 

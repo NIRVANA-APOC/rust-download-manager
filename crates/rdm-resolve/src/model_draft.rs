@@ -99,7 +99,9 @@ pub fn draft_messages(request: &ResolveRequest, actions: &[DraftAction]) -> Vec<
          - `emit.url` must be one of the observed emit URLs (or a {{variable}} derived from a step);\n\
          - `match.hosts` should contain the source host and `match.url_pattern` should narrow the \
            recipe to the source URL shape;\n\
-         - variables are only produced by step `assign`; templates support {{{{var}}}} placeholders.\n\
+         - variables are only produced by step `assign`; templates support {{{{var}}}} placeholders;\n\
+         - `emit.name` MUST include a real file suffix (derive it from Content-Type or the emitted URL;\
+           never a bare page title).\n\
          If unsure, emit a minimal recipe: one http_request step, one assert step, and the observed \
          emit URL."
     );
@@ -194,6 +196,11 @@ pub fn parse_and_validate(
 
 /// Spend one model call to generate a draft. `Err` is reserved for transport /
 /// client failures; unusable model output yields `Ok(None)`.
+///
+/// Kept as the compatibility wrapper for the original signature; callers that
+/// need the token accounting of the attempt (the resolver's own
+/// `service::attach_draft` does, so `Diagnostics::llm_calls` and the token
+/// counters stay in sync) use [`generate_with_usage`] instead.
 pub async fn generate(
     ai: &rdm_ai::AiConfig,
     request: &ResolveRequest,
@@ -202,14 +209,43 @@ pub async fn generate(
     actions: &[DraftAction],
     emitted: &[ResourceItem],
 ) -> Result<Option<RecipeDraft>, String> {
-    let client =
-        AiClient::new(ai.clone()).map_err(|error| format!("cannot create AI client: {error}"))?;
-    let messages = draft_messages(request, actions);
-    let reply = client
-        .chat_messages(&messages)
+    generate_with_usage(ai, request, run_id, created_ms, actions, emitted)
         .await
-        .map_err(|error| format!("model-assisted draft call failed: {error}"))?;
-    parse_and_validate(&reply, request, run_id, created_ms, actions, emitted)
+        .0
+}
+
+/// Like [`generate`], but also returns the token usage of the attempt.
+///
+/// The usage is drained from the client's ledger **before** the reply is
+/// inspected, so it is returned for every path the provider could bill:
+/// success, unusable output and transport/parse errors. A client construction
+/// failure (no request sent) returns [`rdm_ai::TokenUsage::ZERO`].
+pub async fn generate_with_usage(
+    ai: &rdm_ai::AiConfig,
+    request: &ResolveRequest,
+    run_id: &str,
+    created_ms: u64,
+    actions: &[DraftAction],
+    emitted: &[ResourceItem],
+) -> (Result<Option<RecipeDraft>, String>, rdm_ai::TokenUsage) {
+    let client = match AiClient::new(ai.clone()) {
+        Ok(client) => client,
+        Err(error) => {
+            return (
+                Err(format!("cannot create AI client: {error}")),
+                rdm_ai::TokenUsage::ZERO,
+            )
+        }
+    };
+    let messages = draft_messages(request, actions);
+    let reply = client.chat_messages(&messages).await;
+    // A failed call is still billed: drain the ledger before mapping the error.
+    let usage = client.take_usage();
+    let outcome = match reply {
+        Ok(reply) => parse_and_validate(&reply, request, run_id, created_ms, actions, emitted),
+        Err(error) => Err(format!("model-assisted draft call failed: {error}")),
+    };
+    (outcome, usage)
 }
 
 /// Validate a model-generated [`Recipe`] and force it into a sanitized
@@ -810,5 +846,180 @@ mod tests {
         .expect("not a transport error")
         .expect("draft");
         assert_eq!(draft.recipe.id, draft.id);
+    }
+
+    // ------------------------------------------------------------------
+    // Token accounting of the model-assisted draft call (P3b-b)
+    // ------------------------------------------------------------------
+
+    /// Minimal loopback OpenAI-compatible server: answer one drained chat
+    /// request with `body` (HTTP `status`), then close.
+    fn spawn_chat_mock(status: u16, body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind mock AI");
+        let address = listener.local_addr().expect("mock AI address");
+        let base_url = format!("http://{address}/v1");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock AI request");
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                raw.extend_from_slice(&chunk[..read]);
+                let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&raw[..position]).to_ascii_lowercase();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= position + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (base_url, handle)
+    }
+
+    fn mock_ai_config(base_url: &str) -> rdm_ai::AiConfig {
+        rdm_ai::AiConfig {
+            enabled: true,
+            base_url: base_url.to_owned(),
+            model: "mock-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            timeout_secs: 5,
+            // Loopback mock: not a bundled provider (no preset/no prices).
+            provider: None,
+            ..rdm_ai::AiConfig::default()
+        }
+    }
+
+    /// Wrap `content` in an OpenAI-compatible completion, optionally with usage.
+    fn chat_completion(content: &str, usage: Option<Value>) -> String {
+        let mut body = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
+        });
+        if let Some(usage) = usage {
+            body["usage"] = usage;
+        }
+        body.to_string()
+    }
+
+    #[tokio::test]
+    async fn generate_with_usage_returns_provider_usage_on_success() {
+        let source = "https://example.com/page";
+        let file = "https://cdn.example.com/f.bin";
+        let recipe_json = model_recipe_json(
+            source,
+            file,
+            serde_json::json!([http_step(source), assert_step()]),
+        );
+        let reply = chat_completion(
+            &recipe_json,
+            Some(serde_json::json!({
+                "prompt_tokens": 21,
+                "completion_tokens": 9,
+                "total_tokens": 30
+            })),
+        );
+        let (base_url, server) = spawn_chat_mock(200, reply);
+        let ai = mock_ai_config(&base_url);
+        let (outcome, usage) = generate_with_usage(
+            &ai,
+            &request_for(source),
+            "run_model_usage",
+            7,
+            &actions(source, file),
+            &[verified_item(file)],
+        )
+        .await;
+        server.join().expect("mock AI thread");
+
+        let draft = outcome.expect("no transport error").expect("valid draft");
+        assert_eq!(draft.source_run_id, "run_model_usage");
+        assert_eq!(usage.prompt_tokens, 21);
+        assert_eq!(usage.completion_tokens, 9);
+        assert_eq!(usage.total_tokens, 30);
+        assert_eq!(usage.calls, 1);
+        assert!(!usage.estimated, "provider usage must stay exact");
+    }
+
+    #[tokio::test]
+    async fn generate_with_usage_keeps_the_usage_of_an_unusable_reply() {
+        let source = "https://example.com/page";
+        let file = "https://cdn.example.com/f.bin";
+        // The provider answered (and billed) but produced no JSON recipe.
+        let reply = chat_completion(
+            "I cannot help with that",
+            Some(serde_json::json!({
+                "prompt_tokens": 9,
+                "completion_tokens": 3,
+                "total_tokens": 12
+            })),
+        );
+        let (base_url, server) = spawn_chat_mock(200, reply);
+        let ai = mock_ai_config(&base_url);
+        let (outcome, usage) = generate_with_usage(
+            &ai,
+            &request_for(source),
+            "run",
+            1,
+            &actions(source, file),
+            &[verified_item(file)],
+        )
+        .await;
+        server.join().expect("mock AI thread");
+
+        assert!(
+            outcome
+                .expect("unusable output is not a transport error")
+                .is_none(),
+            "an unusable reply yields no draft"
+        );
+        // …but the tokens the provider already charged are still reported.
+        assert_eq!(usage.total_tokens, 12);
+        assert_eq!(usage.calls, 1);
+        assert!(!usage.estimated);
+    }
+
+    #[tokio::test]
+    async fn generate_with_usage_estimates_when_the_provider_omits_usage() {
+        let source = "https://example.com/page";
+        let file = "https://cdn.example.com/f.bin";
+        let reply = chat_completion("not a recipe", None);
+        let (base_url, server) = spawn_chat_mock(200, reply);
+        let ai = mock_ai_config(&base_url);
+        let (outcome, usage) = generate_with_usage(
+            &ai,
+            &request_for(source),
+            "run",
+            1,
+            &actions(source, file),
+            &[verified_item(file)],
+        )
+        .await;
+        server.join().expect("mock AI thread");
+
+        assert!(outcome.expect("no transport error").is_none());
+        assert!(usage.estimated, "missing provider usage must be estimated");
+        assert_eq!(usage.calls, 1);
+        assert!(usage.total_tokens > 0);
     }
 }

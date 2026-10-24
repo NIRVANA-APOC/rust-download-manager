@@ -14,19 +14,25 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_SHIFT, VK_D,
+};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, IsIconic,
-    LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    GWLP_WNDPROC, HICON, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_RESTORE,
-    SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
-    WNDCLASS_STYLES, WNDPROC, WS_EX_TOOLWINDOW,
+    LoadIconW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TrackPopupMenu,
+    TranslateMessage, GWLP_WNDPROC, HICON, HWND_MESSAGE, ICON_BIG, ICON_SMALL, IDI_APPLICATION,
+    IMAGE_FLAGS, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE,
+    SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WM_SETICON, WNDCLASSW, WNDCLASS_STYLES, WNDPROC, WS_EX_TOOLWINDOW,
 };
 
 use super::TrayEvent;
@@ -37,6 +43,9 @@ const TRAY_UID: u32 = 1;
 const WM_RDM_TRAY: u32 = WM_APP + 1;
 const MENU_SHOW: usize = 1;
 const MENU_QUIT: usize = 2;
+const MENU_PAUSE_ALL: usize = 3;
+const MENU_RESUME_ALL: usize = 4;
+const MENU_OPEN_DIR: usize = 5;
 /// `ERROR_FILE_NOT_FOUND` 的 HRESULT 形式（删除不存在的注册表值时视为成功）。
 const HRESULT_FILE_NOT_FOUND: i32 = 0x8007_0002u32 as i32;
 /// 托盘图标首次添加的重试次数/间隔：登录时 explorer 可能还没就绪，
@@ -66,6 +75,10 @@ static TOOLTIP: Mutex<Option<String>> = Mutex::new(None);
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 /// 托盘线程句柄（`shutdown_tray` 时 join）。
 static TRAY_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// 全局热键（`Ctrl+Shift+D` 快速添加）消息窗口（0 = 未安装）。
+static HOTKEY_WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// 全局热键线程句柄（`shutdown_hotkey` 时 join）。
+static HOTKEY_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
 // 事件通道 / 托盘生命周期
@@ -76,6 +89,155 @@ pub(crate) fn init_event_channel() -> tokio::sync::mpsc::UnboundedReceiver<TrayE
     // 只允许初始化一次；重复调用返回的通道永远不会收到事件（调用方是单实例 GUI）。
     let _ = EVENTS.set(sender);
     receiver
+}
+
+/// 全局热键 id（WM_HOTKEY.wParam）。
+const HOTKEY_QUICK_ADD: i32 = 1;
+/// 全局热键消息窗口的自定义消息（保留）。
+const _WM_RDM_HOTKEY: u32 = WM_APP + 2;
+
+/// 安装全局热键 `Ctrl+Shift+D`（快速添加）：独立消息线程 + 消息专用窗口，
+/// 不依赖托盘图标是否安装。
+pub(crate) fn install_hotkey() -> Result<(), String> {
+    if HOTKEY_WINDOW.load(Ordering::SeqCst) != 0 {
+        return Ok(());
+    }
+    if EVENTS.get().is_none() {
+        return Err("全局热键事件通道未初始化（内部错误）".to_string());
+    }
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let thread = std::thread::Builder::new()
+        .name("rdm-hotkey".to_string())
+        .spawn(move || hotkey_thread(ready_tx))
+        .map_err(|err| format!("创建全局热键线程失败: {err}"))?;
+    match ready_rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(())) => {
+            if let Ok(mut slot) = HOTKEY_THREAD.lock() {
+                *slot = Some(thread);
+            }
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            let _ = thread.join();
+            Err(err)
+        }
+        Err(_) => Err("全局热键注册超时（3s）".to_string()),
+    }
+}
+
+/// 全局热键是否已注册。
+pub(crate) fn is_hotkey_installed() -> bool {
+    HOTKEY_WINDOW.load(Ordering::SeqCst) != 0
+}
+
+/// 结束全局热键线程（幂等；未安装时直接返回）。
+pub(crate) fn shutdown_hotkey() {
+    let Ok(mut slot) = HOTKEY_THREAD.lock() else {
+        return;
+    };
+    let Some(thread) = slot.take() else {
+        return;
+    };
+    let raw = HOTKEY_WINDOW.load(Ordering::SeqCst);
+    if raw != 0 {
+        unsafe {
+            let _ = PostMessageW(Some(HWND(raw as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    let _ = thread.join();
+    HOTKEY_WINDOW.store(0, Ordering::SeqCst);
+}
+
+fn hotkey_thread(ready: mpsc::Sender<Result<(), String>>) {
+    match unsafe { create_hotkey_window() } {
+        Ok(hwnd) => {
+            HOTKEY_WINDOW.store(hwnd.0 as isize, Ordering::SeqCst);
+            let _ = ready.send(Ok(()));
+            tracing::info!("全局热键已注册：Ctrl+Shift+D（快速添加）");
+            unsafe { hotkey_message_loop() };
+            HOTKEY_WINDOW.store(0, Ordering::SeqCst);
+            tracing::info!("全局热键线程结束");
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "全局热键注册失败（不影响主功能）");
+            let _ = ready.send(Err(err));
+        }
+    }
+}
+
+unsafe fn create_hotkey_window() -> Result<HWND, String> {
+    let hinstance = GetModuleHandleW(None)
+        .map(|module| HINSTANCE(module.0))
+        .map_err(|err| format!("GetModuleHandleW 失败: {err}"))?;
+    let class = WNDCLASSW {
+        style: WNDCLASS_STYLES(0),
+        lpfnWndProc: Some(hotkey_wndproc),
+        hInstance: hinstance,
+        lpszClassName: w!("RDM.HotkeyWindow"),
+        ..Default::default()
+    };
+    let _atom = RegisterClassW(&class);
+    let hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        w!("RDM.HotkeyWindow"),
+        w!("RDM Hotkey"),
+        WINDOW_STYLE(0),
+        0,
+        0,
+        0,
+        0,
+        Some(HWND_MESSAGE),
+        None,
+        Some(hinstance),
+        None,
+    )
+    .map_err(|err| format!("CreateWindowExW 失败: {err}"))?;
+    RegisterHotKey(
+        Some(hwnd),
+        HOTKEY_QUICK_ADD,
+        MOD_CONTROL | MOD_SHIFT,
+        VK_D.0 as u32,
+    )
+    .map_err(|err| format!("RegisterHotKey(Ctrl+Shift+D) 失败: {err}"))?;
+    Ok(hwnd)
+}
+
+unsafe fn hotkey_message_loop() {
+    let mut message = MSG::default();
+    loop {
+        let result = GetMessageW(&mut message, None, 0, 0);
+        if result.0 <= 0 {
+            break;
+        }
+        let _ = TranslateMessage(&message);
+        let _ = DispatchMessageW(&message);
+    }
+}
+
+unsafe extern "system" fn hotkey_wndproc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_HOTKEY => {
+            if wparam.0 as i32 == HOTKEY_QUICK_ADD {
+                send_event(TrayEvent::QuickAdd);
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_QUICK_ADD);
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
 }
 
 fn send_event(event: TrayEvent) {
@@ -200,6 +362,33 @@ unsafe fn create_tray_window(tooltip: &str) -> Result<HWND, String> {
     Ok(hwnd)
 }
 
+/// 查询某个目录所在卷的总空间/可用空间（字节）。Windows 用 `GetDiskFreeSpaceExW`。
+pub(crate) fn disk_space_for(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free = 0u64;
+    let mut total = 0u64;
+    let mut available = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut available),
+            Some(&mut total),
+            Some(&mut free),
+        )
+    };
+    if ok.is_ok() && total > 0 {
+        // 第三个参数是「可用给调用者」的字节数；第二个是总量。
+        Some((available, total))
+    } else {
+        None
+    }
+}
+
 /// 添加托盘图标，带短暂重试（覆盖开机登录时 explorer 尚未就绪的竞态）。
 unsafe fn add_icon_with_retries(hwnd: HWND, tooltip: &str) -> bool {
     // 测试模式下（环境变量存在）不做重试：直接暴露一次失败并保留托盘消息窗口。
@@ -242,6 +431,58 @@ unsafe fn load_icon(hinstance: HINSTANCE) -> Option<HICON> {
         return Some(icon);
     }
     LoadIconW(None, IDI_APPLICATION).ok()
+}
+
+/// 把 exe 内嵌的 RDM 图标设置到窗口（标题栏左上角 / Alt-Tab / 任务栏）。
+///
+/// GPUI 0.2.2 没有 per-window icon API，`build.rs` 只把图标嵌进 exe 资源；
+/// 不调用 `WM_SETICON` 时 Windows 会给窗口一个通用占位图标（或空白），
+/// 表现就是「左上角 RDM 图标缺失」。资源缺失时静默回退（保持系统默认）。
+pub(crate) fn set_window_icon(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else {
+            return;
+        };
+        let hinstance = HINSTANCE(module.0);
+        // 先按系统大图标尺寸加载（0,0 + LR_DEFAULTSIZE），小图标用 16×16。
+        let big = LoadImageW(
+            Some(hinstance),
+            w!("IDI_RDM_APP"),
+            IMAGE_ICON,
+            0,
+            0,
+            IMAGE_FLAGS(LR_DEFAULTSIZE.0 | LR_SHARED.0),
+        );
+        let small = LoadImageW(
+            Some(hinstance),
+            w!("IDI_RDM_APP"),
+            IMAGE_ICON,
+            16,
+            16,
+            LR_SHARED,
+        );
+        let window = HWND(hwnd as *mut _);
+        if let Ok(icon) = big {
+            let _ = SendMessageW(
+                window,
+                WM_SETICON,
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
+        if let Ok(icon) = small {
+            let _ = SendMessageW(
+                window,
+                WM_SETICON,
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
+        tracing::debug!("已设置主窗口图标（IDI_RDM_APP）");
+    }
 }
 
 unsafe fn message_loop() {
@@ -289,6 +530,9 @@ unsafe extern "system" fn tray_wndproc(
         let id = wparam.0 & 0xFFFF;
         match id {
             MENU_SHOW => send_event(TrayEvent::ShowMain),
+            MENU_PAUSE_ALL => send_event(TrayEvent::PauseAll),
+            MENU_RESUME_ALL => send_event(TrayEvent::ResumeAll),
+            MENU_OPEN_DIR => send_event(TrayEvent::OpenDownloadFolder),
             MENU_QUIT => send_event(TrayEvent::Quit),
             _ => {}
         }
@@ -313,11 +557,37 @@ unsafe extern "system" fn tray_wndproc(
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
+/// 更新提示文本：有窗口时发 `NIM_MODIFY`，没有托盘窗口时只更新缓存（下次添加用）。
+pub(crate) fn update_tray_tooltip(tooltip: &str) {
+    if let Ok(mut slot) = TOOLTIP.lock() {
+        *slot = Some(tooltip.to_string());
+    }
+    let raw = TRAY_WINDOW.load(Ordering::SeqCst);
+    if raw == 0 || !TRAY_ALIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    unsafe {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: HWND(raw as *mut _),
+            uID: TRAY_UID,
+            uFlags: NIF_TIP,
+            ..Default::default()
+        };
+        copy_wide(&mut data.szTip, tooltip);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
+
 unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
     let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("显示主界面"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, MENU_PAUSE_ALL, w!("全部暂停"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_RESUME_ALL, w!("全部继续"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_DIR, w!("打开下载目录"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出 RDM"));
     let mut point = POINT::default();

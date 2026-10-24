@@ -36,11 +36,16 @@ pub fn parse_http_url(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// Redact a URL for logging: drop credentials, query string and fragment.
+/// Redact a URL for **log files**: drop credentials, query string and fragment.
 ///
 /// Download URLs commonly carry expiring signatures (`?token=…`,
 /// `?X-Amz-Signature=…`); those must never end up in a log file.
-pub fn redact_url(raw: &str) -> String {
+///
+/// Named `*_for_log` (audit 2026-10-22 F-23) because `rdm-agent` has an
+/// identically-named helper with the opposite contract: its `redact_url_userinfo`
+/// keeps query/fragment so the agent can still download the URL. Never use this
+/// function for URL handoff, and never use the agent one for log lines.
+pub fn redact_url_for_log(raw: &str) -> String {
     match Url::parse(raw.trim()) {
         Ok(mut url) => {
             let _ = url.set_username("");
@@ -94,12 +99,17 @@ mod tests {
     }
 
     #[test]
-    fn redaction_strips_query_fragment_and_credentials() {
-        let redacted = redact_url("https://user:pass@example.com:8443/a/b.iso?sig=secret#frag");
+    fn log_redaction_strips_query_fragment_and_credentials() {
+        // F-23: this function is log-only; query/fragment must be gone.
+        let redacted =
+            redact_url_for_log("https://user:pass@example.com:8443/a/b.iso?sig=secret#frag");
         assert_eq!(redacted, "https://example.com:8443/a/b.iso");
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("pass"));
-        assert_eq!(redact_url("nonsense"), "<unparsable-url>");
+        assert_eq!(
+            redact_url_for_log("nonsense"),
+            "<unparsable-url>".to_string()
+        );
     }
 
     #[test]

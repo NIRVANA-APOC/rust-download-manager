@@ -17,7 +17,7 @@
 //! lives inside the given root (`<root>/index.json`, convenient for tests and
 //! custom layouts).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -30,10 +30,21 @@ use crate::recipe::Recipe;
 
 /// Schema identifier of `<state>/resolve/index.json`.
 ///
-/// v2 adds the optional per-version `versions` map; v1 files stay loadable
-/// (their `health` field is treated as the health of whatever active version
-/// the entry names) and are rewritten as v2 on the next save.
-pub const INDEX_SCHEMA: &str = "rdm.recipe-index/v2";
+/// v2 added the optional per-version `versions` map; v3 adds the resolve
+/// experience metadata (`created_ms`, `source_url`, usage counters, richness and
+/// per-version creation times); v4 adds reusable experiences: `resource_kinds`,
+/// `bundled` (merged supplementary flows) and `merged_into`. v1/v2/v3 files stay
+/// loadable: the old `health` field is treated as the health of whatever active
+/// version the entry names and the missing fields are migrated in memory (see
+/// [`RecipeRegistry::load`]). The file is rewritten as v4 on the next save.
+pub const INDEX_SCHEMA: &str = "rdm.recipe-index/v4";
+
+/// One supplementary flow merged into an experience (design 18 §2.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BundleRef {
+    pub id: String,
+    pub version: u32,
+}
 
 /// One recipe selected for a URL.
 #[derive(Debug, Clone)]
@@ -43,7 +54,8 @@ pub struct MatchHit<'a> {
     pub specificity: usize,
 }
 
-/// Index entry of one recipe id: matcher pin + per-version health.
+/// Index entry of one recipe id: matcher pin, per-version health and the
+/// resolve-experience metadata (design 17 §1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecipeIndexEntry {
     /// Version the matcher is allowed to pick; `set_active_version` can move it
@@ -61,6 +73,46 @@ pub struct RecipeIndexEntry {
     pub versions: BTreeMap<u32, RecipeHealth>,
     #[serde(default)]
     pub updated_ms: u64,
+    /// When this experience was first published (v3). Migrated from
+    /// `updated_ms` for v1/v2 files when missing.
+    #[serde(default)]
+    pub created_ms: u64,
+    /// First successful source URL (full URL; never headers or bodies).
+    /// Migrated from the recipe's `tests[0].input_url` when available.
+    #[serde(default)]
+    pub source_url: Option<String>,
+    /// Replay hits (`success_count + failure_count`).
+    #[serde(default)]
+    pub use_count: u64,
+    #[serde(default)]
+    pub success_count: u64,
+    #[serde(default)]
+    pub failure_count: u64,
+    /// Most recent replay attempt.
+    #[serde(default)]
+    pub last_used_ms: Option<u64>,
+    /// Downloadable resource count of the most recent successful replay.
+    #[serde(default)]
+    pub last_resources: u32,
+    /// Highest download-resource count ever observed (richness, design 17 §1).
+    #[serde(default)]
+    pub best_resources: u32,
+    /// Highest resource count per recorded recipe version (`0`/missing = unknown).
+    #[serde(default)]
+    pub version_resources: BTreeMap<u32, u32>,
+    /// Publish time per recorded recipe version.
+    #[serde(default)]
+    pub version_created_ms: BTreeMap<u32, u64>,
+    /// Resource kind set of the experience (design 18 §2.3):
+    /// `["image"]`, `["video"]`, `["audio"]`, …
+    #[serde(default)]
+    pub resource_kinds: Vec<String>,
+    /// Supplementary flows merged into this experience (main flow excluded).
+    #[serde(default)]
+    pub bundled: Vec<BundleRef>,
+    /// Experience this one was merged into; hidden from lists/matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 
 /// Persisted `<state>/resolve/index.json`.
@@ -140,7 +192,40 @@ impl RecipeRegistry {
                 }
             }
         }
+        // v1/v2/v3 -> v4 (design 17 §1, design 18 §2.3): normalize the
+        // experience metadata in memory without rewriting the file on load.
+        registry.migrate_index();
         registry
+    }
+
+    /// Normalize missing v4 fields of a loaded v1/v2/v3 index (in memory only):
+    /// `created_ms` falls back to `updated_ms`, `source_url` to the recipe's
+    /// first positive test sample, and the reusable-experience metadata
+    /// (`resource_kinds`/`bundled`/`merged_into`) is cleaned deterministically.
+    fn migrate_index(&mut self) {
+        let recipe_source_urls: BTreeMap<String, String> = self
+            .recipes
+            .iter()
+            .filter_map(|recipe| {
+                let sample = recipe.tests.first()?.input_url.trim();
+                (!sample.is_empty()).then(|| (recipe.id.clone(), sample.to_owned()))
+            })
+            .collect();
+        for (id, entry) in &mut self.index.entries {
+            if entry.created_ms == 0 {
+                entry.created_ms = entry.updated_ms;
+            }
+            if entry.source_url.is_none() {
+                entry.source_url = recipe_source_urls.get(id).cloned();
+            }
+            normalize_kinds(&mut entry.resource_kinds);
+            normalize_bundle(&mut entry.bundled);
+            entry.merged_into = entry
+                .merged_into
+                .take()
+                .map(|target| target.trim().to_owned())
+                .filter(|target| !target.is_empty());
+        }
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -258,6 +343,10 @@ impl RecipeRegistry {
             .get(&entry.active_version)
             .cloned()
             .unwrap_or_default();
+        if entry.created_ms == 0 {
+            entry.created_ms = now;
+        }
+        entry.version_created_ms.entry(version).or_insert(now);
         entry.updated_ms = now;
         self.index.updated_ms = now;
         Ok(())
@@ -281,11 +370,12 @@ impl RecipeRegistry {
 
     /// Best recipe for `url`: priority, then applicability specificity, then
     /// newest version. Only the `active_version` of each recipe id participates
-    /// (no index entry → newest available version).
+    /// (no index entry → newest available version). Experiences merged into
+    /// another one (`merged_into`) are hidden and never match.
     pub fn find_for_url(&self, url: &Url) -> Option<MatchHit<'_>> {
         let mut best: Option<MatchHit<'_>> = None;
         for recipe in &self.recipes {
-            if !self.is_active(recipe) {
+            if !self.is_active(recipe) || self.is_merged(&recipe.id) {
                 continue;
             }
             let Some(vars) = recipe.matches(url) else {
@@ -381,15 +471,27 @@ impl RecipeRegistry {
         Ok(())
     }
 
-    /// Record a successful replay of `id` at one specific recipe version.
+    /// Record one replay of `id` at one specific recipe version.
+    ///
+    /// `kind == None` means the replay succeeded: per-version health, the usage
+    /// counters (`use_count`/`success_count`) and the richness fields
+    /// (`last_resources`, `best_resources`, `version_resources`) are updated.
+    /// `kind == Some(..)` records a kind-aware failure (`use_count`/
+    /// `failure_count`/`last_used_ms` only; richness is never lowered).
+    /// `resources` is the number of downloadable resources produced by a
+    /// successful replay (`0` when unknown or on failure).
     ///
     /// Per-version health is updated and persisted; `entry.health` mirrors it
     /// only when `version` is the active version.
-    pub fn record_success(
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_replay(
         &mut self,
         id: &str,
         version: u32,
         run_id: &str,
+        kind: Option<ResolveErrorKind>,
+        step_id: Option<&str>,
+        resources: u32,
         now: u64,
     ) -> io::Result<()> {
         let entry = self.index_entry_mut(id, version, now);
@@ -402,7 +504,28 @@ impl RecipeRegistry {
         };
         let mirrored = {
             let health = entry.versions.entry(version).or_insert(seed);
-            health.record_success(run_id, now);
+            match kind {
+                None => {
+                    health.record_success(run_id, now);
+                    entry.use_count = entry.use_count.saturating_add(1);
+                    entry.success_count = entry.success_count.saturating_add(1);
+                    entry.last_used_ms = Some(now);
+                    entry.last_resources = resources;
+                    if resources > 0 {
+                        let best = entry.version_resources.entry(version).or_insert(0);
+                        if resources > *best {
+                            *best = resources;
+                        }
+                        entry.best_resources = entry.best_resources.max(resources);
+                    }
+                }
+                Some(kind) => {
+                    health.record_failure(run_id, &kind, step_id, now);
+                    entry.use_count = entry.use_count.saturating_add(1);
+                    entry.failure_count = entry.failure_count.saturating_add(1);
+                    entry.last_used_ms = Some(now);
+                }
+            }
             health.clone()
         };
         if entry.active_version == version {
@@ -413,8 +536,20 @@ impl RecipeRegistry {
         self.save_index()
     }
 
-    /// Record a failed replay of `id` at one specific recipe version
-    /// (kind-aware, see [`RecipeHealth`]).
+    /// Record a successful replay (compatibility wrapper around
+    /// [`Self::record_replay`]; resource richness is unknown here).
+    pub fn record_success(
+        &mut self,
+        id: &str,
+        version: u32,
+        run_id: &str,
+        now: u64,
+    ) -> io::Result<()> {
+        self.record_replay(id, version, run_id, None, None, 0, now)
+    }
+
+    /// Record a failed replay (compatibility wrapper around
+    /// [`Self::record_replay`], kind-aware via [`RecipeHealth`]).
     pub fn record_failure(
         &mut self,
         id: &str,
@@ -424,23 +559,237 @@ impl RecipeRegistry {
         step_id: Option<&str>,
         now: u64,
     ) -> io::Result<()> {
+        self.record_replay(id, version, run_id, Some(kind), step_id, 0, now)
+    }
+
+    /// Fill the publish/richness metadata after a recipe version was activated
+    /// (design 17 §1): first creation time, first source URL, per-version
+    /// creation/resource maps and — unless `reset_best` — `max` richness.
+    ///
+    /// `reset_best` is used by the repair path: the old flow is structurally
+    /// invalid, so its historical richness must not shield it any more.
+    pub fn note_publish(
+        &mut self,
+        id: &str,
+        version: u32,
+        resources: u32,
+        source_url: Option<&str>,
+        now: u64,
+        reset_best: bool,
+    ) -> io::Result<()> {
         let entry = self.index_entry_mut(id, version, now);
-        let seed = if entry.active_version == version {
-            entry.health.clone()
-        } else {
-            RecipeHealth::default()
-        };
-        let mirrored = {
-            let health = entry.versions.entry(version).or_insert(seed);
-            health.record_failure(run_id, &kind, step_id, now);
-            health.clone()
-        };
-        if entry.active_version == version {
-            entry.health = mirrored;
+        if entry.created_ms == 0 {
+            entry.created_ms = now;
         }
+        if entry.source_url.is_none() {
+            entry.source_url = source_url
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned);
+        }
+        entry.version_created_ms.entry(version).or_insert(now);
+        if resources > 0 {
+            entry.last_resources = resources;
+            let best = entry.version_resources.entry(version).or_insert(0);
+            if resources > *best {
+                *best = resources;
+            }
+        }
+        entry.best_resources = if reset_best {
+            resources
+        } else {
+            entry.best_resources.max(resources)
+        };
         entry.updated_ms = now;
         self.index.updated_ms = now;
         self.save_index()
+    }
+
+    /// Delete every recipe file of `id` plus its index entry (atomic index
+    /// rewrite). Returns `false` when neither a file nor an entry existed.
+    ///
+    /// On an index write failure the previous in-memory state is restored. The
+    /// delete is used by the experience library; a missing file is tolerated.
+    pub fn remove(&mut self, id: &str) -> io::Result<bool> {
+        let Some(root) = self.root.clone() else {
+            return Err(io::Error::other("recipe registry has no root directory"));
+        };
+        let versions: Vec<u32> = self
+            .recipes
+            .iter()
+            .filter(|recipe| recipe.id == id)
+            .map(|recipe| recipe.version)
+            .collect();
+        let had_entry = self.index.entries.contains_key(id);
+        if versions.is_empty() && !had_entry {
+            return Ok(false);
+        }
+        let previous_recipes = self.recipes.clone();
+        let previous_index = self.index.clone();
+        self.recipes.retain(|recipe| recipe.id != id);
+        self.index.entries.remove(id);
+        for version in versions {
+            let path = root.join(recipe_file_name_for(id, version));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    self.recipes = previous_recipes;
+                    self.index = previous_index;
+                    return Err(error);
+                }
+            }
+        }
+        self.index.updated_ms = now_ms();
+        if let Err(error) = self.save_index() {
+            self.recipes = previous_recipes;
+            self.index = previous_index;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Active recipe whose matcher scope is exactly `hosts` + `url_pattern`
+    /// (host sets compare case-insensitively and order-insensitively).
+    ///
+    /// Used by the experience pipeline to recognize that a URL already has a
+    /// library entry ("one address, one experience", design 17 §2.3). Matching
+    /// is deterministic (first id in registry order); by design the scope is
+    /// unique, but duplicates are not treated as an error.
+    pub fn find_experience_by_scope(
+        &self,
+        hosts: &[String],
+        url_pattern: Option<&str>,
+    ) -> Option<&Recipe> {
+        let wanted_hosts = normalized_hosts(hosts);
+        self.recipes
+            .iter()
+            .filter(|recipe| self.is_active(recipe) && !self.is_merged(&recipe.id))
+            .find(|recipe| {
+                normalized_hosts(&recipe.matcher.hosts) == wanted_hosts
+                    && recipe.matcher.url_pattern.as_deref() == url_pattern
+            })
+    }
+
+    // ------------------------------------------------------------------
+    // Reusable experiences (design 18 §2.3, index v4)
+    // ------------------------------------------------------------------
+
+    /// Index entry of one recipe id, when the index knows it.
+    pub fn entry(&self, id: &str) -> Option<&RecipeIndexEntry> {
+        self.index.entries.get(id)
+    }
+
+    /// Whether `id` was merged into another experience (hidden from users).
+    pub fn is_merged(&self, id: &str) -> bool {
+        self.index
+            .entries
+            .get(id)
+            .is_some_and(|entry| entry.merged_into.is_some())
+    }
+
+    /// Replace the normalized resource-kind set of one experience.
+    pub fn set_resource_kinds(&mut self, id: &str, kinds: &[String]) -> io::Result<()> {
+        let mut normalized: Vec<String> = kinds.to_vec();
+        normalize_kinds(&mut normalized);
+        self.update_entry(id, |entry| entry.resource_kinds = normalized)
+    }
+
+    /// Replace the supplementary-flow bundle of one experience.
+    pub fn set_bundle(&mut self, id: &str, bundled: &[BundleRef]) -> io::Result<()> {
+        let mut normalized = bundled.to_vec();
+        normalize_bundle(&mut normalized);
+        self.update_entry(id, |entry| entry.bundled = normalized)
+    }
+
+    /// Mark (or unmark, with `None`) one experience as merged into `target`.
+    pub fn set_merged_into(&mut self, id: &str, target: Option<&str>) -> io::Result<()> {
+        let target = target
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(str::to_owned);
+        self.update_entry(id, |entry| entry.merged_into = target)
+    }
+
+    /// Overwrite the richness counters without touching per-version history.
+    ///
+    /// Used by experience bundles: `best_resources` becomes the main flow plus
+    /// the sum of every supplementary flow's best count, while the per-flow
+    /// `version_resources` stay untouched (each flow keeps its own count).
+    pub fn set_richness(&mut self, id: &str, best: u32, last: Option<u32>) -> io::Result<()> {
+        self.update_entry(id, |entry| {
+            entry.best_resources = best;
+            if let Some(last) = last {
+                entry.last_resources = last;
+            }
+        })
+    }
+
+    /// Copies of the main flow plus every bundled supplementary flow
+    /// (`entry.bundled`); missing members are skipped and results are
+    /// de-duplicated by `(id, version)` with the main flow first.
+    pub fn bundle_recipes(&self, id: &str) -> Vec<Recipe> {
+        let mut recipes = Vec::new();
+        let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
+        let main_version = self.active_version(id).filter(|version| *version != 0);
+        if let Some(recipe) = self.get(id, main_version) {
+            seen.insert((recipe.id.clone(), recipe.version));
+            recipes.push(recipe.clone());
+        }
+        if let Some(entry) = self.index.entries.get(id) {
+            for bundled in &entry.bundled {
+                let Some(recipe) = self.get(&bundled.id, Some(bundled.version)) else {
+                    continue;
+                };
+                if seen.insert((recipe.id.clone(), recipe.version)) {
+                    recipes.push(recipe.clone());
+                }
+            }
+        }
+        recipes
+    }
+
+    /// Visible experience ids: every known recipe/index id that was not merged
+    /// into another one, in deterministic (sorted) order.
+    pub fn visible_ids(&self) -> Vec<String> {
+        let mut ids: BTreeSet<String> = self
+            .recipes
+            .iter()
+            .map(|recipe| recipe.id.clone())
+            .collect();
+        ids.extend(self.index.entries.keys().cloned());
+        ids.retain(|id| !self.is_merged(id));
+        ids.into_iter().collect()
+    }
+
+    /// Mutate one index entry and persist it atomically; the previous in-memory
+    /// index is restored when the write fails. A missing entry is created with
+    /// `active_version = newest available version`.
+    fn update_entry(
+        &mut self,
+        id: &str,
+        update: impl FnOnce(&mut RecipeIndexEntry),
+    ) -> io::Result<()> {
+        let previous = self.index.clone();
+        let now = now_ms();
+        let newest = self.latest_version(id).unwrap_or(0);
+        let entry = self
+            .index
+            .entries
+            .entry(id.to_owned())
+            .or_insert_with(|| RecipeIndexEntry {
+                active_version: newest,
+                updated_ms: now,
+                ..RecipeIndexEntry::default()
+            });
+        update(entry);
+        entry.updated_ms = now;
+        self.index.updated_ms = now;
+        if let Err(error) = self.save_index() {
+            self.index = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Fetch (or lazily create) the index entry used by `record_*`; a missing
@@ -473,7 +822,8 @@ impl RecipeRegistry {
         write_atomic(&path, &text)
     }
 
-    fn latest_version(&self, id: &str) -> Option<u32> {
+    /// Newest registered version of one recipe id (recipe files, not the index).
+    pub fn latest_version(&self, id: &str) -> Option<u32> {
         self.recipes
             .iter()
             .filter(|recipe| recipe.id == id)
@@ -520,7 +870,7 @@ fn load_index(root: &Path) -> RecipeIndex {
         Ok(mut index) => {
             // Always expose the current schema in memory: a loaded v1 file keeps
             // its old `health` (treated as the active version's health) and is
-            // upgraded to v2 on the next save, without rewriting it on load.
+            // upgraded to v4 on the next save, without rewriting it on load.
             index.schema = INDEX_SCHEMA.to_owned();
             index
         }
@@ -537,9 +887,17 @@ fn load_index(root: &Path) -> RecipeIndex {
 
 /// `<safe-id>@<version>.json`
 pub fn recipe_file_name(recipe: &Recipe) -> String {
-    let safe: String = recipe
-        .id
-        .chars()
+    recipe_file_name_for(&recipe.id, recipe.version)
+}
+
+/// `<safe-id>@<version>.json` from an id/version pair.
+fn recipe_file_name_for(id: &str, version: u32) -> String {
+    format!("{}@{version}.json", safe_recipe_id(id))
+}
+
+/// Sanitized recipe-id file component (same mapping as [`recipe_file_name`]).
+fn safe_recipe_id(id: &str) -> String {
+    id.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
                 ch
@@ -547,8 +905,39 @@ pub fn recipe_file_name(recipe: &Recipe) -> String {
                 '_'
             }
         })
+        .collect()
+}
+
+/// Case-insensitive, duplicate-free host set used for scope comparison.
+fn normalized_hosts(hosts: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = hosts
+        .iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
         .collect();
-    format!("{safe}@{}.json", recipe.version)
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+/// Lowercase, trimmed, sorted and de-duplicated resource kinds.
+fn normalize_kinds(kinds: &mut Vec<String>) {
+    for kind in kinds.iter_mut() {
+        *kind = kind.trim().to_ascii_lowercase();
+    }
+    kinds.retain(|kind| !kind.is_empty());
+    kinds.sort();
+    kinds.dedup();
+}
+
+/// Sorted, de-duplicated bundle references (`(id, version)` identity).
+fn normalize_bundle(bundled: &mut Vec<BundleRef>) {
+    bundled.retain(|reference| !reference.id.trim().is_empty() && reference.version > 0);
+    for reference in bundled.iter_mut() {
+        reference.id = reference.id.trim().to_owned();
+    }
+    bundled.sort();
+    bundled.dedup();
 }
 
 fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
@@ -1043,7 +1432,7 @@ mod tests {
             crate::health::MethodStatus::Broken
         );
 
-        // …the next save upgrades it to v2 and keeps per-version history.
+        // …the next save upgrades it to v4 and keeps per-version history.
         registry.record_success("a", 2, "run_ok", 100).unwrap();
         let after = std::fs::read_to_string(index_path(dir.path())).unwrap();
         let json: serde_json::Value = serde_json::from_str(&after).unwrap();
@@ -1082,15 +1471,227 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v2_and_versions_json_keys_are_strings() {
+    fn schema_is_v4_and_versions_json_keys_are_strings() {
         let dir = TempDir::new("registry-version-schema");
         let mut registry = RecipeRegistry::with_root(dir.path());
         registry.insert(indexed_recipe("a", 1)).unwrap();
         registry.record_success("a", 1, "run_ok", 100).unwrap();
         let raw = std::fs::read_to_string(index_path(dir.path())).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(json["schema"], "rdm.recipe-index/v2");
+        assert_eq!(json["schema"], INDEX_SCHEMA);
+        assert_eq!(json["schema"], "rdm.recipe-index/v4");
         assert_eq!(json["entries"]["a"]["versions"]["1"]["status"], "ok");
         assert_eq!(json["entries"]["a"]["health"]["status"], "ok");
+        // v3/v4 experience metadata is persisted alongside the health fields.
+        assert!(json["entries"]["a"]["created_ms"].as_u64().unwrap() > 0);
+        assert_eq!(json["entries"]["a"]["use_count"], 1);
+        assert_eq!(json["entries"]["a"]["success_count"], 1);
+        assert_eq!(json["entries"]["a"]["best_resources"], 0);
+        assert!(json["entries"]["a"]["version_created_ms"]["1"].is_u64());
+    }
+
+    // ------------------------------------------------------------------
+    // Resolve-experience metadata (design 17 §1)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn record_replay_tracks_usage_richness_and_never_lowers_the_best() {
+        let dir = TempDir::new("registry-record-replay");
+        let mut registry = RecipeRegistry::with_root(dir.path());
+        registry.insert(indexed_recipe("a", 1)).unwrap();
+
+        registry
+            .record_replay("a", 1, "run_ok", None, None, 3, 100)
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.use_count, 1);
+        assert_eq!(entry.success_count, 1);
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.last_used_ms, Some(100));
+        assert_eq!(entry.last_resources, 3);
+        assert_eq!(entry.best_resources, 3);
+        assert_eq!(entry.version_resources.get(&1), Some(&3));
+        assert_eq!(registry.health("a").last_ok_ms, Some(100));
+
+        // A poorer success updates `last_resources` but keeps the best.
+        registry
+            .record_replay("a", 1, "run_ok_2", None, None, 1, 150)
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.last_resources, 1);
+        assert_eq!(entry.best_resources, 3);
+        assert_eq!(entry.version_resources.get(&1), Some(&3));
+        assert_eq!(entry.use_count, 2);
+
+        // A failure only counts usage; richness and the last success survive.
+        registry
+            .record_replay(
+                "a",
+                1,
+                "run_bad",
+                Some(ResolveErrorKind::RecipeStale),
+                Some("url"),
+                0,
+                200,
+            )
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.use_count, 3);
+        assert_eq!(entry.success_count, 2);
+        assert_eq!(entry.failure_count, 1);
+        assert_eq!(entry.last_used_ms, Some(200));
+        assert_eq!(entry.last_resources, 1);
+        assert_eq!(entry.best_resources, 3);
+        assert_eq!(entry.version_resources.get(&1), Some(&3));
+        assert_eq!(registry.health("a").consecutive_failures, 1);
+
+        // Persisted for the next process.
+        let reloaded = RecipeRegistry::load(dir.path());
+        let reloaded_entry = &reloaded.index().entries["a"];
+        assert_eq!(reloaded_entry.use_count, 3);
+        assert_eq!(reloaded_entry.best_resources, 3);
+        assert_eq!(reloaded_entry.last_resources, 1);
+    }
+
+    #[test]
+    fn wrappers_share_the_record_replay_update_path() {
+        let dir = TempDir::new("registry-record-wrappers");
+        let mut registry = RecipeRegistry::with_root(dir.path());
+        registry.insert(indexed_recipe("a", 1)).unwrap();
+        registry.record_success("a", 1, "run_ok", 100).unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.use_count, 1);
+        assert_eq!(entry.success_count, 1);
+        assert_eq!(entry.last_used_ms, Some(100));
+        assert_eq!(entry.last_resources, 0, "wrapper has no resource count");
+        registry
+            .record_failure("a", 1, "run_bad", ResolveErrorKind::NetworkError, None, 200)
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.use_count, 2);
+        assert_eq!(entry.failure_count, 1);
+        assert_eq!(entry.last_used_ms, Some(200));
+    }
+
+    #[test]
+    fn note_publish_fills_metadata_and_resets_best_on_repair() {
+        let dir = TempDir::new("registry-note-publish");
+        let mut registry = RecipeRegistry::with_root(dir.path());
+        registry.insert(indexed_recipe("a", 1)).unwrap();
+        let created_by_insert = registry.index().entries["a"].created_ms;
+        let v1_created_by_insert = registry.index().entries["a"].version_created_ms[&1];
+
+        registry
+            .note_publish("a", 1, 4, Some("https://example.com/page"), 100, false)
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(
+            entry.created_ms, created_by_insert,
+            "an existing creation time is never overwritten"
+        );
+        assert_eq!(
+            entry.source_url.as_deref(),
+            Some("https://example.com/page")
+        );
+        assert_eq!(entry.best_resources, 4);
+        assert_eq!(entry.last_resources, 4);
+        assert_eq!(entry.version_resources.get(&1), Some(&4));
+        assert_eq!(
+            entry.version_created_ms.get(&1),
+            Some(&v1_created_by_insert),
+            "an existing version creation time is never overwritten"
+        );
+
+        // A richer normal publish keeps growing the best baseline.
+        registry
+            .note_publish("a", 1, 6, Some("https://ignored.example/"), 150, false)
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.best_resources, 6);
+        assert_eq!(
+            entry.source_url.as_deref(),
+            Some("https://example.com/page")
+        );
+        assert_eq!(entry.version_resources.get(&1), Some(&6));
+
+        // A repair (version 2) resets the baseline to the new flow's count.
+        registry
+            .note_publish("a", 2, 2, Some("https://example.com/page"), 200, true)
+            .unwrap();
+        let entry = registry.index().entries["a"].clone();
+        assert_eq!(entry.best_resources, 2);
+        assert_eq!(entry.version_resources.get(&2), Some(&2));
+        assert_eq!(entry.version_created_ms.get(&2), Some(&200));
+    }
+
+    #[test]
+    fn remove_deletes_every_version_file_and_the_index_entry() {
+        let dir = TempDir::new("registry-remove");
+        let mut registry = RecipeRegistry::with_root(dir.path());
+        for version in 1..=2 {
+            let recipe = indexed_recipe("a", version);
+            registry.save(&recipe).unwrap();
+            registry.insert(recipe).unwrap();
+        }
+        registry.save_index().unwrap();
+        let v1 = dir.path().join("a@1.json");
+        let v2 = dir.path().join("a@2.json");
+        assert!(v1.is_file() && v2.is_file());
+
+        assert!(registry.remove("a").unwrap());
+        assert!(!v1.exists());
+        assert!(!v2.exists());
+        assert!(!registry.index().entries.contains_key("a"));
+        assert_eq!(registry.len(), 0);
+        let reloaded = RecipeRegistry::load(dir.path());
+        assert_eq!(reloaded.len(), 0);
+        assert!(reloaded.index().entries.is_empty());
+
+        // Idempotent: a second delete reports "did not exist".
+        assert!(!registry.remove("a").unwrap());
+    }
+
+    #[test]
+    fn find_experience_by_scope_compares_host_sets_and_patterns() {
+        let mut registry = RecipeRegistry::empty();
+        registry
+            .insert(recipe("exact", 1, "^https://example\\.com/a$", 0))
+            .unwrap();
+        registry
+            .insert(recipe("exact", 2, "^https://example\\.com/a$", 0))
+            .unwrap();
+        let other: Recipe = serde_json::from_value(serde_json::json!({
+            "schema": "rdm.recipe/v1",
+            "id": "other-host",
+            "version": 1,
+            "match": { "hosts": ["other.example"] },
+            "steps": [{ "id": "s", "op": "assert", "args": { "kind": "contains", "value": "x", "needle": "x" } }],
+            "emit": { "url": "https://cdn.example.com/f.bin" }
+        }))
+        .unwrap();
+        registry.insert(other).unwrap();
+
+        let found = registry
+            .find_experience_by_scope(
+                &["EXAMPLE.com".to_owned()],
+                Some("^https://example\\.com/a$"),
+            )
+            .expect("active exact-scope recipe");
+        assert_eq!(found.id, "exact");
+        assert_eq!(found.version, 2, "only the active version participates");
+
+        assert!(registry
+            .find_experience_by_scope(&["example.com".to_owned()], None)
+            .is_none());
+        assert!(registry
+            .find_experience_by_scope(
+                &["example.com".to_owned()],
+                Some("^https://example\\.com/b$")
+            )
+            .is_none());
+        let any_pattern = registry
+            .find_experience_by_scope(&["other.example".to_owned()], None)
+            .expect("host-only recipe matches a None pattern");
+        assert_eq!(any_pattern.id, "other-host");
     }
 }

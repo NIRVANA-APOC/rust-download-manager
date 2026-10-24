@@ -10,7 +10,7 @@
 //! 转发到 `EngineMsg::Ipc` 并等待 `oneshot` 回包，不直接触碰 `Entity`。
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rdm_ipc::{Envelope, IpcInfo, Request, Response};
@@ -93,23 +93,57 @@ pub fn publish(info: &IpcInfo) -> Result<PathBuf, rdm_ipc::IpcError> {
 
 /// 退出时删除 `ipc.json`（尽力而为；token 已随进程失效，残留也连不上）。
 ///
-/// **只删除本进程发布的文件**：用户快速关闭旧实例再开新实例时，旧实例的清理不能把
-/// 新实例刚写入的 `ipc.json` 删掉，否则浏览器扩展会一直显示"GUI 未运行"。
+/// **保守语义（审计 2026-10-22 F-17）**：只有读到**合法**的 `ipc.json` 且其
+/// `pid == 当前进程` 时才删除；文件不存在静默；读失败/JSON 损坏时**保留文件**并
+/// `tracing::warn`。旧实现把「读失败」也当成「可以删」，旧实例退出时可能误删新实例
+/// 刚发布的 endpoint，导致浏览器扩展一直显示 "GUI 未运行"。
 pub fn cleanup_info_file() {
-    let path = rdm_ipc::info_path();
-    match rdm_ipc::read_info() {
-        Ok(info) if info.pid != std::process::id() => {
-            tracing::debug!(
+    let _ = cleanup_info_file_at(&rdm_ipc::info_path(), std::process::id());
+}
+
+/// [`cleanup_info_file`] 的可测试实现：返回是否真的删除了文件。
+fn cleanup_info_file_at(path: &Path, current_pid: u32) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            tracing::warn!(
                 path = %path.display(),
-                pid = info.pid,
-                "ipc.json 属于其他 RDM 实例，跳过删除"
+                error = %err,
+                "读取 ipc.json 失败，保留文件（避免误删其他实例的 endpoint）"
             );
+            return false;
         }
-        _ => match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(path = %path.display(), "已删除 ipc.json"),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => tracing::warn!(path = %path.display(), error = %err, "删除 ipc.json 失败"),
-        },
+    };
+    let info: IpcInfo = match serde_json::from_str(&text) {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "ipc.json 解析失败，保留文件（可能是其他实例正在写入）"
+            );
+            return false;
+        }
+    };
+    if info.pid != current_pid {
+        tracing::debug!(
+            path = %path.display(),
+            pid = info.pid,
+            "ipc.json 属于其他 RDM 实例，跳过删除"
+        );
+        return false;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "已删除 ipc.json");
+            true
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "删除 ipc.json 失败");
+            false
+        }
     }
 }
 
@@ -544,5 +578,71 @@ mod tests {
         let line = serde_json::to_string(&response).unwrap();
         assert!(line.contains("\"ok\":true"));
         assert!(line.contains("dl_000003"));
+    }
+
+    // -- ipc.json cleanup semantics (audit 2026-10-22 F-17) ----------------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rdm-gui-ipc-cleanup-{tag}-{}-{}",
+            std::process::id(),
+            crate::model::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_info_file(dir: &Path, pid: u32) -> PathBuf {
+        let path = dir.join("ipc.json");
+        let info = IpcInfo {
+            protocol: rdm_ipc::PROTOCOL_VERSION,
+            port: 1234,
+            token: "test-token".to_string(),
+            pid,
+            app_version: "test".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&info).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn cleanup_deletes_only_own_valid_endpoint() {
+        let dir = temp_dir("own");
+        let path = write_info_file(&dir, std::process::id());
+        assert!(cleanup_info_file_at(&path, std::process::id()));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_endpoint_of_other_instance() {
+        let dir = temp_dir("other");
+        let my_pid = std::process::id();
+        let other_pid = my_pid.wrapping_add(1).max(1);
+        let path = write_info_file(&dir, other_pid);
+        assert!(!cleanup_info_file_at(&path, my_pid));
+        assert!(path.exists(), "other instance's ipc.json must be kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_corrupt_endpoint() {
+        // A corrupt/partial file may belong to another instance that is writing;
+        // deleting it would break the browser integration (F-17 regression).
+        let dir = temp_dir("corrupt");
+        let path = dir.join("ipc.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(!cleanup_info_file_at(&path, std::process::id()));
+        assert!(path.exists(), "corrupt ipc.json must be kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_missing_file_is_a_silent_noop() {
+        let dir = temp_dir("missing");
+        let path = dir.join("ipc.json");
+        assert!(!cleanup_info_file_at(&path, std::process::id()));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

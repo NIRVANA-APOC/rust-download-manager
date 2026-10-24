@@ -106,6 +106,7 @@ fn handle_message(frame: &[u8], logger: &Logger, state_dir: &Path) -> Outgoing {
     match incoming {
         Incoming::Ping { id } => handle_ping(id.unwrap_or(fallback_id), logger),
         Incoming::Status { id } => handle_status(id.unwrap_or(fallback_id), logger),
+        Incoming::Activate { id } => handle_activate(id.unwrap_or(fallback_id), logger, state_dir),
         Incoming::Enqueue {
             id,
             request,
@@ -199,6 +200,33 @@ fn status_frame(
     match result {
         Ok(snapshot) => Outgoing::status(id, true, snapshot),
         Err(_) => Outgoing::status(id, false, ipc_client::StatusSnapshot::default()),
+    }
+}
+
+/// Handle `activate`: show/activate the running GUI window; if the GUI is not
+/// running, try to launch it (the extension button is an explicit user action,
+/// so auto-launch is expected here, unlike the read-only `status` poll).
+///
+/// Failures use the structured `gui_unavailable` error code so the extension
+/// can show 「请在桌面端任务栏打开 RDM」instead of hanging.
+fn handle_activate(id: u64, logger: &Logger, state_dir: &Path) -> Outgoing {
+    let gui_status = gui::ensure_gui(true, logger, state_dir);
+    if !gui_status.running {
+        let reason = gui_status
+            .reason
+            .unwrap_or_else(|| "gui_unavailable".to_string());
+        logger.warn(&format!("activate: RDM GUI unavailable ({reason})"));
+        return Outgoing::error(id, codes::GUI_UNAVAILABLE, reason);
+    }
+    match ipc_client::activate() {
+        Ok(()) => {
+            logger.info("activate: RDM main window shown");
+            Outgoing::activated(id, true)
+        }
+        Err(err) => {
+            logger.warn(&format!("activate: IPC failed ({err})"));
+            Outgoing::error(id, codes::GUI_UNAVAILABLE, err.to_string())
+        }
     }
 }
 

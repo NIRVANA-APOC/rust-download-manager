@@ -81,6 +81,16 @@ pub fn enqueue(item: EnqueueItem) -> Result<String, IpcCallError> {
     Ok(download_id)
 }
 
+/// Ask the running GUI to show/activate its main window (`Request::Activate`).
+///
+/// The GUI replies `{activated:true}`; a rejection means the request was
+/// authenticated but refused (unexpected for activate) and is surfaced as an
+/// error so the extension can degrade to "请在任务栏打开 RDM".
+pub fn activate() -> Result<(), IpcCallError> {
+    rdm_ipc::send(Request::Activate, IPC_TIMEOUT)?;
+    Ok(())
+}
+
 /// Ask the GUI to run the AI link parser and return the GUI-side request id.
 ///
 /// Like the download id, the request id is treated as optional (`0` when the
@@ -99,6 +109,9 @@ pub fn ai_parse(request: &crate::protocol::AiParseRequest) -> Result<u64, IpcCal
             page_url: request.page_url.clone(),
             page_title: request.page_title.clone(),
             page_links: request.page_links.clone(),
+            // Native/extension path always uses the normal resolve semantics
+            // (experience reuse allowed); forcing AI is a GUI-only action.
+            force_ai: false,
         },
         IPC_TIMEOUT,
     )?;

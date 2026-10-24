@@ -5,8 +5,11 @@
 //! 把「至少 1 个可下载资源」的 resolver 结果投影成既有 ParseReport，保证
 //! app/model/native 完全不需要改动。
 //!
-//! 解析不了（无 verified 资源、失败、`model_unavailable`）或带 Cookie 时由
-//! [`crate::engine::EngineRuntime::start_ai_parse`] 降级到 legacy `rdm_ai::parse_url`。
+//! 解析不了（无 verified 资源、失败、`model_unavailable`）**或**需要凭据时，由
+//! [`crate::engine::EngineRuntime::start_ai_parse`] 走 resolver/legacy 降级链：
+//! 带 Cookie 的请求会先构造仅内存的 `HostCredentials` 交给 resolver 验证/方法回放，
+//! 仍没有 verified 资源才降级到 legacy `rdm_ai::parse_url`（P4a 后的真实语义，
+//! 旧注释「带 Cookie 时直接降级 legacy」已过时——审计 F-22）。
 
 use rdm_ai::{ParseReport, ParsedResource};
 
@@ -58,6 +61,15 @@ pub fn report_from_outcome(
                     ))
                     .to_owned()
                 });
+            // Defense in depth: resolver manifests are normalized already, but
+            // older cached manifests / legacy reports may still carry a bare
+            // page title. Never hand the GUI a task name without a suffix.
+            let name = rdm_ai::ensure_file_extension(
+                &name,
+                item.content_type.as_deref(),
+                Some(&item.url),
+                Some(&kind),
+            );
             ParsedResource {
                 url: item.url.clone(),
                 name,
@@ -119,10 +131,24 @@ pub fn report_from_outcome(
         notes,
         ai_used,
         model,
+        usage: crate::ai_resolve::token_usage_from_diagnostics(&outcome.diagnostics),
         created_ms: crate::model::now_ms(),
         cache_hit: false,
         failure_kind: None,
     })
+}
+
+/// Resolver 诊断里的 LLM 用量 → `ParseReport.usage`（资源监控记账用）。
+///
+/// 字段由 `rdm-resolve` 的 `Diagnostics` 提供；旧版本诊断为 0 时保持零值。
+fn token_usage_from_diagnostics(diagnostics: &rdm_resolve::Diagnostics) -> rdm_ai::TokenUsage {
+    rdm_ai::TokenUsage {
+        prompt_tokens: diagnostics.llm_prompt_tokens,
+        completion_tokens: diagnostics.llm_completion_tokens,
+        total_tokens: diagnostics.llm_total_tokens,
+        calls: diagnostics.llm_calls,
+        estimated: diagnostics.llm_estimated,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +396,28 @@ mod tests {
             0,
             None,
         )
+    }
+
+    #[test]
+    fn maps_extensionless_title_to_mp4_using_content_type() {
+        let outcome = outcome(
+            RunStatus::Succeeded,
+            vec![item(
+                "https://cdn.example.com/upgcxcode/05/11/42924311105/stream?e=sig",
+                Some("饿急眼了煮两包泡面 (720P)"),
+                Some("video"),
+                VerificationStatus::Verified,
+                Some("video/mp4"),
+                Some(45_932_387),
+            )],
+            vec![],
+            1,
+            None,
+        );
+        let report =
+            report_from_outcome(REQUEST_URL, None, Some("mock"), &outcome).expect("must map");
+        assert_eq!(report.resources[0].name, "饿急眼了煮两包泡面 (720P).mp4");
+        assert_eq!(report.resources[0].kind, "video");
     }
 
     #[test]

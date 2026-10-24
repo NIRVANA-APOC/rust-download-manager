@@ -89,6 +89,11 @@ pub enum Request {
         /// bounded by the native host before they reach this layer).
         #[serde(default)]
         page_links: Vec<String>,
+        /// User explicitly asked to re-resolve: skip the local experience
+        /// library, prefer AI exploration and ignore the GUI parse cache.
+        /// Additive (`serde(default)`); old hosts/extensions omit it.
+        #[serde(default)]
+        force_ai: bool,
     },
 }
 
@@ -303,12 +308,14 @@ mod tests {
                     "https://cdn.example.com/a.mp4".into(),
                     "https://cdn.example.com/b.zip".into(),
                 ],
+                force_ai: true,
             },
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains("\"method\":\"ai_parse\""));
         assert!(json.contains("\"include_credentials\":true"));
         assert!(json.contains("\"page_links\""));
+        assert!(json.contains("\"force_ai\":true"));
         let back: Envelope = serde_json::from_str(&json).unwrap();
         match back.request {
             Request::AiParse {
@@ -322,6 +329,7 @@ mod tests {
                 page_url,
                 page_title,
                 page_links,
+                force_ai,
             } => {
                 assert_eq!(url, "https://example.com/watch?v=1");
                 assert_eq!(source_page.as_deref(), Some("https://example.com/"));
@@ -339,6 +347,7 @@ mod tests {
                         "https://cdn.example.com/b.zip".to_string()
                     ]
                 );
+                assert!(force_ai);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -362,6 +371,7 @@ mod tests {
                 page_url,
                 page_title,
                 page_links,
+                force_ai,
             } => {
                 assert_eq!(url, "https://example.com/files");
                 assert!(source_page.is_none());
@@ -374,6 +384,8 @@ mod tests {
                 assert!(page_url.is_none());
                 assert!(page_title.is_none());
                 assert!(page_links.is_empty());
+                // 新增字段向后兼容：旧帧默认「正常解析」（复用经验）。
+                assert!(!force_ai);
             }
             other => panic!("unexpected request: {other:?}"),
         }

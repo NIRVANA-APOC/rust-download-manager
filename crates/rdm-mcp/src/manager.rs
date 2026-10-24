@@ -307,7 +307,7 @@ impl TaskManager {
             1,
             "created",
             json!({
-                "url": rdm_agent::redact_url(&record.request.url),
+                "url": rdm_agent::redact_url_userinfo(&record.request.url),
                 "dest_dir": record.dest_dir.display().to_string(),
                 "file_name": record.file_name,
                 "connections": record.connections,
@@ -810,7 +810,7 @@ fn apply_engine_event(
                     next_seq,
                     "metadata",
                     json!({
-                        "final_url": rdm_agent::redact_url(&meta.final_url),
+                        "final_url": rdm_agent::redact_url_userinfo(&meta.final_url),
                         "file_name": meta.file_name,
                         "total_bytes": meta.total_bytes,
                         "range_supported": meta.supports_ranges,
@@ -1294,6 +1294,7 @@ mod tests {
             resumed_chunks: 0,
             range_supported: true,
             http_version: Some("HTTP/1.1".to_string()),
+            controller: None,
         };
         apply_summary(&mut record, &summary);
         assert_eq!(record.state, TaskState::Completed);

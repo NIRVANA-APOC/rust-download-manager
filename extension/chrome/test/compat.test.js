@@ -43,7 +43,7 @@ function createChromeStub() {
     onClicked: createEvent(),
     onAlarm: createEvent(),
   };
-  const calls = { setBadgeText: [], menuCreate: [], executeScript: [] };
+  const calls = { setBadgeText: [], setBadgeTextColor: [], menuCreate: [], executeScript: [], tabsCreate: [] };
   const chromeApi = {
     runtime: {
       id: "abcdefghijklmnopabcdefghijklmnop",
@@ -70,6 +70,10 @@ function createChromeStub() {
     },
     tabs: {
       query: (query, callback) => callback([{ id: 1, url: "https://example.com/" }]),
+      create: (options, callback) => {
+        calls.tabsCreate.push(options);
+        callback({ id: 99 });
+      },
     },
     scripting: {
       executeScript: (details, callback) => {
@@ -108,6 +112,10 @@ function createChromeStub() {
         if (callback) callback();
       },
       setBadgeBackgroundColor: (details, callback) => {
+        if (callback) callback();
+      },
+      setBadgeTextColor: (details, callback) => {
+        calls.setBadgeTextColor.push(details);
         if (callback) callback();
       },
       setTitle: (details, callback) => {
@@ -320,4 +328,24 @@ test("非扩展环境（没有 chrome API）不定义 browser", () => {
   globalThis.chrome = {};
   require(COMPAT_PATH);
   assert.equal(globalThis.browser, undefined);
+});
+
+test("tabs.create 与 action.setBadgeTextColor 回调包装为 Promise（M4 popup/options 新增）", async () => {
+  const { chromeApi, calls } = createChromeStub();
+  const browser = loadCompat(chromeApi);
+
+  const created = await browser.tabs.create({ url: "moz-extension://test/options.html#help" });
+  assert.deepEqual(created, { id: 99 });
+  assert.equal(calls.tabsCreate.length, 1);
+  assert.equal(calls.tabsCreate[0].url, "moz-extension://test/options.html#help");
+
+  await browser.action.setBadgeTextColor({ color: "#FFFFFF" });
+  assert.deepEqual(calls.setBadgeTextColor, [{ color: "#FFFFFF" }]);
+});
+
+test("旧 Chrome 没有 action.setBadgeTextColor 时降级为 resolved Promise", async () => {
+  const { chromeApi } = createChromeStub();
+  delete chromeApi.action.setBadgeTextColor;
+  const browser = loadCompat(chromeApi);
+  await browser.action.setBadgeTextColor({ color: "#FFFFFF" });
 });

@@ -820,6 +820,7 @@ fn ai_parse_end_to_end_through_mock_gui() {
                 page_url,
                 page_title,
                 page_links,
+                ..
             } => Some((
                 url.clone(),
                 source_page.clone(),

@@ -72,7 +72,8 @@ RULES:
 3. emit_manifest is only a claim: every URL is re-verified locally; only real files reach the user. A rejected emit_manifest comes back as untrusted_content with the reasons — correct it and try again.
 4. No credentials exist for this run: never request cookies/authorization; those headers are forbidden. http(s) only; hosts outside the local policy (and private/loopback addresses) are denied.
 5. Budget for this run: {max_llm_calls} model call(s) (this reply is one), {http_requests} HTTP request(s), {bytes_read} bytes, {redirects} redirect(s), {wall_ms} ms wall-clock, at most {max_resources} emitted resource(s). Up to {max_observations} observations are kept; older ones are evicted.
-6. Be economical: read the page or API, then emit_manifest. If nothing downloadable exists, call finish with a reason."#,
+6. Be economical: read the page or API, then emit_manifest. If nothing downloadable exists, call finish with a reason.
+7. Every emit_manifest `name` MUST end with a real file suffix. A page/video title alone is not enough: derive it from the observed Content-Type (video/mp4 → ".mp4", audio/mp4 → ".m4a", image/jpeg → ".jpg") or from the emitted URL's path; if neither is available use the resource kind's default. Never emit a bare title."#,
         goal = goal,
         max_llm_calls = max_llm_calls,
         http_requests = budget.http_requests,

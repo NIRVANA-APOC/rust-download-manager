@@ -215,6 +215,10 @@
   const action = {
     setBadgeText: callbackDone(chromeApi.action, "setBadgeText"),
     setBadgeBackgroundColor: callbackDone(chromeApi.action, "setBadgeBackgroundColor"),
+    setBadgeTextColor:
+      typeof chromeApi.action.setBadgeTextColor === "function"
+        ? callbackDone(chromeApi.action, "setBadgeTextColor")
+        : () => Promise.resolve(),
     setTitle: callbackDone(chromeApi.action, "setTitle"),
   };
 
@@ -236,7 +240,10 @@
     runtime,
     storage,
     cookies: { getAll: callbackResult(chromeApi.cookies, "getAll") },
-    tabs: { query: callbackResult(chromeApi.tabs, "query") },
+    tabs: {
+      query: callbackResult(chromeApi.tabs, "query"),
+      create: callbackResult(chromeApi.tabs, "create"),
+    },
     scripting,
     downloads,
     contextMenus,

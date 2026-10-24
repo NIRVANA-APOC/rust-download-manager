@@ -1,136 +1,149 @@
 /*!
- * RDM 下载接管 — popup 逻辑。
- * 只负责渲染后台 getState/testConnection/status 返回的快照；所有决策在 background.js。
+ * RDM 下载接管 — popup 逻辑（M4 重做）。
  *
- * 进度展示：状态卡之后新增「正在下载」区（最多 3 条，含线程数、溢出与不可用提示），
- * 每 1s 轮询 status 并做增量 DOM 更新；「最近转交」只保留状态徽章，不再重复进度条。
+ * 信息架构（docs/design/07-browser-extension.md §3–§7）：
+ *   头部：品牌 + 弱化「已就绪」+ 接管开关 + 设置
+ *   状态条：只在异常（宿主未安装 / GUI 未运行 / 协议错误 / 接管关闭）时出现
+ *   主操作：唯一蓝色主按钮，文案随当前 tab 上下文变化
+ *   正在下载：最多 3 条活动任务 + 进度/速度，头部「打开 RDM」
+ *   最近活动：最多 5 条，清空后 toast 可撤销
+ *   设置入口：仅头部齿轮（打开 options 页；版本与帮助只在 options 页展示）
+ *
+ * 所有决策（主按钮文案、状态条、badge 语义、最近活动模型）都在
+ * lib/pure.js 的纯函数里，本文件只负责 DOM 与消息收发。
  */
 "use strict";
 
 /* global RDMPure */
 const {
-  formatAge,
+  normalizeSettings,
   normalizeDownloads,
-  progressPercent,
-  formatSpeed,
-  formatActiveText,
   pickActiveDownloads,
+  popupActiveRow,
+  formatActiveHeadline,
+  readyStateLabel,
+  describeBanner,
+  choosePrimaryAction,
+  formatTabSubtitle,
+  buildRecentItems,
+  formatAge,
+  formatHandoffResult,
+  describeActivityFailure,
+  connectionCommands,
 } = RDMPure;
 
-const STATUS_LABELS = {
-  handed: "已转交",
-  queued: "已排队",
-  fallback: "已回退",
-  ai: "AI 解析",
-  error: "失败",
-};
-
-/** popup 打开期间每 1000ms 查询一次下载进度（冻结契约）。 */
+/** popup 打开期间活动下载轮询间隔（07 §6：现有 1s 保留）。 */
 const STATUS_POLL_MS = 1000;
-
-/** status 失败 code → 可操作提示（单行/两行小字）。 */
-const STATUS_HINTS = {
-  host_outdated:
-    "进度不可用：原生宿主版本过旧，请重新运行 scripts/install-firefox-host.ps1 并重启浏览器",
-  timeout: "进度不可用：原生宿主无响应，请重启浏览器后重试",
-  host_unavailable: "进度不可用：原生宿主无响应，请重启浏览器后重试",
-  error: "进度不可用：读取下载状态失败，请重启浏览器后重试",
-};
-
-/** GUI 离线是"ok 响应但不是错误"的降级路径。 */
-const GUI_OFFLINE_HINT = "RDM GUI 未运行：下载会先排队，启动后这里显示进度";
+/** 连接检测上限（07 §5：3s 超时）。 */
+const DETECT_TIMEOUT_MS = 3200;
+/** 转交中的兜底超时（07 §4.3：16s）。 */
+const HANDOFF_TIMEOUT_MS = 16000;
+/** 主按钮成功后短暂反馈时长（1.5–2.5s）。 */
+const RESULT_TTL_MS = 2500;
+/** 清空撤销窗口（07 §7：5s）。 */
+const UNDO_TTL_MS = 5000;
 
 const els = {
   enabled: document.getElementById("enabled"),
-  version: document.getElementById("version"),
-  hostDot: document.getElementById("host-dot"),
-  hostText: document.getElementById("host-text"),
-  guiDot: document.getElementById("gui-dot"),
-  guiText: document.getElementById("gui-text"),
-  detail: document.getElementById("detail"),
-  refresh: document.getElementById("refresh"),
-  options: document.getElementById("options"),
-  clear: document.getElementById("clear"),
-  recentList: document.getElementById("recent-list"),
-  hostName: document.getElementById("host-name"),
-  aiParse: document.getElementById("ai-parse"),
-  aiCredentials: document.getElementById("ai-credentials"),
-  aiResult: document.getElementById("ai-result"),
+  settings: document.getElementById("settings"),
+  ready: document.getElementById("ready"),
+  readyDot: document.getElementById("ready-dot"),
+  readyText: document.getElementById("ready-text"),
+  chromeBadge: document.getElementById("chrome-badge"),
+  banner: document.getElementById("banner"),
+  bannerIcon: document.getElementById("banner-icon"),
+  bannerText: document.getElementById("banner-text"),
+  bannerAction: document.getElementById("banner-action"),
+  primary: document.getElementById("primary"),
+  primaryText: document.getElementById("primary-text"),
+  primaryInfo: document.getElementById("primary-info"),
+  primaryResult: document.getElementById("primary-result"),
   activeSection: document.getElementById("active-section"),
   activeHead: document.getElementById("active-head"),
   activeTitle: document.getElementById("active-title"),
-  activeSummary: document.getElementById("active-summary"),
+  activeSpeed: document.getElementById("active-speed"),
+  activeOpen: document.getElementById("active-open"),
   activeList: document.getElementById("active-list"),
   activeMore: document.getElementById("active-more"),
   activeHint: document.getElementById("active-hint"),
+  recentList: document.getElementById("recent-list"),
+  recentEmpty: document.getElementById("recent-empty"),
+  recentClear: document.getElementById("recent-clear"),
+  undoToast: document.getElementById("undo-toast"),
+  undoText: document.getElementById("undo-text"),
+  undoAction: document.getElementById("undo-action"),
 };
 
-let currentState = null;
-let ageTimer = null;
-let statusTimer = null;
-let statusInFlight = false;
+/** getState / setSettings 返回的最近一次快照。 */
+let state = null;
+/** 当前 tab 上下文（background.getTabContext 返回）。 */
+let tabContext = null;
+/** 当前主按钮决策（choosePrimaryAction 的输出）。 */
+let currentAction = null;
+/** 最近一次活动快照（getActivity 返回）。 */
+let lastActivity = null;
+/** 主按钮提交中（防重复点击）。 */
+let busy = false;
 let closed = false;
-let lastStatus = null;
-/** 「正在下载」区复用的行节点（增量更新，不重建 section）。 */
-let activeRows = [];
+
+let pollTimer = null;
+let ageTimer = null;
+let pollInFlight = false;
+let resultTimer = null;
+let undo = null;
+
+/** 「正在下载」行节点（最多 3 条，增量复用避免闪烁）。 */
+const activeRows = [];
+/** 最近活动的时间节点，用于每秒刷新相对时间。 */
+let recentAgeRefs = [];
+/** 最近活动渲染签名：内容不变时不重建 DOM（避免 1s 轮询导致闪变）。 */
+let recentSignature = "";
+
+// ---------------------------------------------------------------------------
+// 消息与工具
+// ---------------------------------------------------------------------------
 
 function send(message) {
-  return browser.runtime.sendMessage(message).catch((err) => ({
-    ok: false,
-    error: String(err),
-  }));
+  try {
+    return browser.runtime.sendMessage(message).catch((err) => ({
+      ok: false,
+      error: String(err),
+    }));
+  } catch (err) {
+    return Promise.resolve({ ok: false, error: String(err) });
+  }
 }
 
-function setDot(element, kind) {
-  element.className = "dot " + kind;
+/** 带超时的消息（连接/转交失败时也要落地成可读状态，不无限等待）。 */
+function sendWithTimeout(message, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      finish({ ok: false, code: "timeout", error: "请求超时" });
+    }, timeoutMs);
+    send(message).then((value) => {
+      if (settled) return;
+      clearTimeout(timer);
+      finish(value);
+    });
+  });
 }
 
-function renderStatus(state) {
-  const status = (state && state.status) || { host: "unknown", gui: false, detail: "" };
-  const settings = state && state.settings ? state.settings : { enabled: true };
+function settingsSnapshot() {
+  return state && state.settings ? state.settings : {};
+}
 
-  if (settings.enabled === false) {
-    els.hostText.textContent = "下载接管已关闭";
-    setDot(els.hostDot, "unknown");
-    els.guiText.textContent = "开启后生效";
-    setDot(els.guiDot, "unknown");
-    els.detail.textContent = "";
-    return;
+function statusSnapshot() {
+  if (state && state.status) return state.status;
+  if (lastActivity && lastActivity.ok === true) {
+    return { host: "ok", gui: lastActivity.guiRunning === true, detail: "" };
   }
-
-  let hostText = "原生宿主：检测中…";
-  let hostKind = "unknown";
-  if (status.host === "ok") {
-    hostText = "原生宿主：已连接";
-    if (status.hostVersion) hostText += "（v" + status.hostVersion + "）";
-    hostKind = "ok";
-  } else if (status.host === "missing") {
-    hostText = "原生宿主：未安装";
-    hostKind = "bad";
-  } else if (status.host === "error") {
-    hostText = "原生宿主：连接异常";
-    hostKind = "bad";
-  }
-  els.hostText.textContent = hostText;
-  setDot(els.hostDot, hostKind);
-
-  let guiText = "RDM GUI：未知";
-  let guiKind = "unknown";
-  if (status.host === "ok") {
-    if (status.gui) {
-      guiText = "RDM GUI：运行中";
-      guiKind = "ok";
-    } else {
-      guiText = "RDM GUI：未运行（下载会先排队）";
-      guiKind = "warn";
-    }
-  } else if (status.host === "missing") {
-    guiText = "RDM GUI：不可用";
-  }
-  els.guiText.textContent = guiText;
-  setDot(els.guiDot, guiKind);
-
-  els.detail.textContent = status.detail || "";
+  return { host: "unknown", gui: false, detail: "" };
 }
 
 function createElement(tag, className, text) {
@@ -140,52 +153,113 @@ function createElement(tag, className, text) {
   return element;
 }
 
-// ---------------------------------------------------------------------------
-// 「最近转交」（只保留状态徽章，不再重复进度条）
-// ---------------------------------------------------------------------------
+function setHidden(element, hidden) {
+  if (element) element.hidden = hidden === true;
+}
 
-function renderRecent(state) {
-  const list = (state && state.recent) || [];
-  els.recentList.textContent = "";
-  if (!Array.isArray(list) || list.length === 0) {
-    els.recentList.appendChild(createElement("li", "empty", "暂无记录"));
-    return;
+/** 统一应用一份 getState 快照（getState / testConnection / setSettings 等）。 */
+function applyState(next) {
+  if (!next || next.ok !== true) return false;
+  state = {
+    ok: true,
+    settings: next.settings,
+    status: next.status,
+    recent: Array.isArray(next.recent) ? next.recent : [],
+    extensionVersion: next.extensionVersion,
+    nativeHost: next.nativeHost,
+    browser: next.browser,
+    activity: next.activity || null,
+  };
+  if (els.chromeBadge) els.chromeBadge.hidden = next.browser !== "chrome";
+  if (state.activity) {
+    lastActivity = state.activity;
   }
-  for (const entry of list) {
-    if (!entry || typeof entry !== "object") continue;
-    const item = createElement("li", "item");
-
-    const top = createElement("div", "item-top");
-    const name = createElement("span", "item-name", entry.fileName || "（未知文件）");
-    name.title = entry.url || "";
-    const statusKey = STATUS_LABELS[entry.status] ? entry.status : "error";
-    const badge = createElement("span", "badge " + statusKey, STATUS_LABELS[statusKey]);
-    top.appendChild(name);
-    top.appendChild(badge);
-
-    const meta = createElement("div", "item-meta");
-    const url = createElement("span", "item-url", entry.url || "");
-    url.title = entry.url || "";
-    const age = createElement("span", "item-age", formatAge(entry.at));
-    age.dataset.at = String(entry.at || 0);
-    meta.appendChild(url);
-    meta.appendChild(age);
-
-    item.appendChild(top);
-    item.appendChild(meta);
-    if (entry.detail) {
-      item.appendChild(createElement("div", "item-detail", entry.detail));
-    }
-    els.recentList.appendChild(item);
-  }
+  renderAll();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
-// 「正在下载」进度区（状态卡之后、AI 卡之前）
+// 渲染：头部 / 状态条 / 主按钮
+// ---------------------------------------------------------------------------
+
+function renderConnection() {
+  const settings = normalizeSettings(settingsSnapshot());
+  const status = statusSnapshot();
+  if (els.enabled) els.enabled.checked = settings.enabled !== false;
+
+  const ready = readyStateLabel({ settings, status });
+  if (els.readyText) els.readyText.textContent = ready.text;
+  if (els.readyDot) els.readyDot.className = "dot " + ready.tone;
+
+  const banner = describeBanner({ settings, status });
+  if (!banner) {
+    setHidden(els.banner, true);
+    if (els.bannerAction) els.bannerAction.hidden = true;
+    return;
+  }
+  if (els.banner) {
+    els.banner.hidden = false;
+    els.banner.className = "banner " + banner.kind;
+  }
+  if (els.bannerIcon) {
+    els.bannerIcon.textContent = banner.kind === "info" ? "i" : "!";
+  }
+  if (els.bannerText) els.bannerText.textContent = banner.text;
+  if (els.bannerAction) {
+    els.bannerAction.hidden = false;
+    els.bannerAction.textContent = banner.action.label;
+    els.bannerAction.dataset.action = banner.action.id;
+  }
+}
+
+function busyLabel(action) {
+  if (!action) return "正在处理…";
+  return action.kind === "parse-page" ? "解析中…" : "正在转交…";
+}
+
+function renderPrimary() {
+  const action = choosePrimaryAction({
+    settings: settingsSnapshot(),
+    status: statusSnapshot(),
+    tabContext: tabContext || {},
+  });
+  currentAction = action;
+  if (els.primaryText) {
+    els.primaryText.textContent = busy ? busyLabel(action) : action.label;
+  }
+  if (els.primary) {
+    els.primary.disabled = busy || action.disabled === true;
+    if (els.primary.classList && els.primary.classList.toggle) {
+      els.primary.classList.toggle("busy", busy);
+    }
+  }
+  if (els.primaryInfo) {
+    els.primaryInfo.textContent = tabContext ? formatTabSubtitle(tabContext) : "";
+  }
+}
+
+function showResult(text, tone, ttlMs) {
+  if (!els.primaryResult) return;
+  els.primaryResult.textContent = text || "";
+  els.primaryResult.className = "primary-result" + (tone ? " " + tone : "");
+  if (resultTimer) clearTimeout(resultTimer);
+  resultTimer = null;
+  if (!text) return;
+  resultTimer = setTimeout(() => {
+    resultTimer = null;
+    if (els.primaryResult) {
+      els.primaryResult.textContent = "";
+      els.primaryResult.className = "primary-result";
+    }
+  }, typeof ttlMs === "number" ? ttlMs : RESULT_TTL_MS);
+}
+
+// ---------------------------------------------------------------------------
+// 渲染：「正在下载」
 // ---------------------------------------------------------------------------
 
 function createActiveRow() {
-  const li = createElement("li", "active-item");
+  const item = createElement("li", "active-item");
   const top = createElement("div", "active-top");
   const name = createElement("span", "active-name");
   const badge = createElement("span", "active-badge");
@@ -201,11 +275,11 @@ function createActiveRow() {
   bar.appendChild(fill);
 
   const text = createElement("span", "active-text");
-  li.appendChild(top);
-  li.appendChild(bar);
-  li.appendChild(text);
-  els.activeList.appendChild(li);
-  return { li, name, badge, bar, fill, text, lastState: "", lastText: null };
+  item.appendChild(top);
+  item.appendChild(bar);
+  item.appendChild(text);
+  els.activeList.appendChild(item);
+  return { item, name, badge, bar, fill, text, lastState: "", lastText: "", lastPercent: null };
 }
 
 function ensureActiveRow(index) {
@@ -214,273 +288,501 @@ function ensureActiveRow(index) {
 }
 
 function hideActiveRow(row) {
-  if (!row.li.hidden) row.li.hidden = true;
-  row.lastText = null;
+  if (!row) return;
+  if (!row.item.hidden) row.item.hidden = true;
+  row.lastText = "";
 }
 
-/** 只更新单条 active 行的节点（不重建列表）。 */
 function renderActiveRow(row, download) {
-  const state = download.state === "paused" ? "paused" : "downloading";
-  if (row.lastState !== state) {
-    row.li.className = "active-item state-" + state;
-    row.badge.className = "active-badge " + state;
-    row.badge.textContent = state === "paused" ? "已暂停" : "下载中";
-    row.bar.className = "progress state-" + state;
-    row.lastState = state;
+  const model = popupActiveRow(download);
+  if (!model) {
+    hideActiveRow(row);
+    return;
   }
-  row.name.textContent = download.fileName || "（未知文件）";
-  row.name.title = download.fileName || "";
+  if (row.lastState !== model.state) {
+    row.item.className = "active-item state-" + model.state;
+    row.badge.className = "active-badge " + model.state;
+    row.badge.textContent = model.stateLabel;
+    row.bar.className = "progress state-" + model.state;
+    row.lastState = model.state;
+  }
+  const name = download.fileName || "（未知文件）";
+  if (row.name.textContent !== name) row.name.textContent = name;
+  row.name.title = name;
 
-  const percent = progressPercent(download);
-  // 总大小未知（total=null）→ 不确定态条纹，不显示百分比。
-  const indeterminate = percent === null;
-  if (row.bar.classList.contains("indeterminate") !== indeterminate) {
-    row.bar.classList.toggle("indeterminate", indeterminate);
+  if (row.bar.classList.contains("indeterminate") !== model.indeterminate) {
+    row.bar.classList.toggle("indeterminate", model.indeterminate);
   }
-  const width = indeterminate ? "" : percent + "%";
-  if (row.fill.style.width !== width) row.fill.style.width = width;
-  if (indeterminate) {
+  if (model.indeterminate) {
     if (row.bar.hasAttribute("aria-valuenow")) row.bar.removeAttribute("aria-valuenow");
+    if (row.fill.style.width !== "") row.fill.style.width = "";
   } else {
-    row.bar.setAttribute("aria-valuenow", String(percent));
+    row.bar.setAttribute("aria-valuenow", String(model.percent));
+    const width = model.percent + "%";
+    if (row.fill.style.width !== width) row.fill.style.width = width;
   }
-
-  const text = formatActiveText(download);
-  if (row.lastText !== text) {
-    row.text.textContent = text;
-    row.bar.setAttribute("aria-valuetext", text);
-    row.lastText = text;
+  if (row.lastText !== model.detail) {
+    row.text.textContent = model.detail;
+    row.bar.setAttribute("aria-valuetext", model.detail);
+    row.lastText = model.detail;
   }
-  if (row.li.hidden) row.li.hidden = false;
+  if (row.item.hidden) row.item.hidden = false;
 }
 
-/** 活跃下载（含被截断的隐藏条目）的速度总和，用于 header「总速度」。 */
-function totalActiveSpeed(downloads) {
-  let speed = 0;
-  for (const download of downloads) {
-    if (download.state === "downloading" || download.state === "paused") {
-      speed += download.speedBps || 0;
-    }
-  }
-  return speed;
-}
-
-/** status 结果 → 可操作提示（失败 / GUI 未运行）；正常且有进度时返回 "". */
-function statusHintFor(result) {
-  if (!result || typeof result !== "object") return "";
-  if (result.ok !== true) {
-    const code = typeof result.code === "string" ? result.code : "error";
-    return STATUS_HINTS[code] || STATUS_HINTS.error;
-  }
-  if (result.guiRunning !== true) return GUI_OFFLINE_HINT;
-  return "";
-}
-
-/** status 快照 → 「正在下载」区（无 active 时整段隐藏；失败时显示提示）。 */
-function renderActiveStatus(result) {
-  lastStatus = result && typeof result === "object" ? result : null;
-  const ok = !!lastStatus && lastStatus.ok === true;
-  const downloads = ok ? normalizeDownloads(lastStatus.downloads) : [];
+function renderActive(activity) {
+  if (!els.activeSection) return;
+  const result = activity && typeof activity === "object" ? activity : null;
+  const ok = !!result && result.ok === true;
+  const downloads = ok ? normalizeDownloads(result.downloads) : [];
   const picked = pickActiveDownloads(downloads);
-  const hint = statusHintFor(lastStatus);
-
-  const showSection = picked.total > 0 || hint !== "";
-  els.activeSection.hidden = !showSection;
-  els.activeHead.hidden = picked.total === 0;
-  els.activeList.hidden = picked.total === 0;
-  els.activeMore.hidden = picked.overflow <= 0;
-  els.activeMore.textContent = picked.overflow > 0 ? "还有 " + picked.overflow + " 个…" : "";
-
-  if (hint) {
-    els.activeHint.textContent = hint;
-    els.activeHint.hidden = false;
-    els.activeHint.dataset.code =
-      typeof lastStatus.code === "string" ? lastStatus.code : ok ? "gui" : "error";
-  } else {
-    els.activeHint.textContent = "";
-    els.activeHint.hidden = true;
-    if (els.activeHint.dataset) delete els.activeHint.dataset.code;
+  const headline = formatActiveHeadline(downloads, ok ? result.globalSpeedBps : 0);
+  // 宿主缺失/连接异常时状态条已经说明问题，活动区不再重复报错（07 §5）。
+  const hostReady = statusSnapshot().host === "ok";
+  const failureText = ok || !hostReady ? "" : describeActivityFailure(result);
+  const showSection = picked.total > 0 || failureText !== "";
+  setHidden(els.activeSection, !showSection);
+  if (!showSection) {
+    setHidden(els.activeHead, true);
+    setHidden(els.activeMore, true);
+    setHidden(els.activeHint, true);
+    return;
   }
-
-  if (picked.total > 0) {
-    els.activeTitle.textContent = "正在下载 " + picked.total;
-    const speed =
-      lastStatus.globalSpeedBps > 0 ? lastStatus.globalSpeedBps : totalActiveSpeed(downloads);
-    const speedText = formatSpeed(speed);
-    els.activeSummary.textContent = speedText ? "总速度 " + speedText : "";
-  } else {
-    els.activeTitle.textContent = "正在下载";
-    els.activeSummary.textContent = "";
+  setHidden(els.activeHead, picked.total === 0);
+  if (els.activeTitle) els.activeTitle.textContent = headline.title;
+  if (els.activeSpeed) els.activeSpeed.textContent = headline.speedText;
+  if (els.activeMore) {
+    els.activeMore.textContent = headline.overflowText;
+    els.activeMore.hidden = picked.overflow <= 0;
   }
-
-  // 行节点复用：先补齐，再逐行更新/隐藏（不重建列表）。
-  while (activeRows.length < picked.visible.length) {
-    ensureActiveRow(activeRows.length);
-  }
-  for (let index = 0; index < activeRows.length; index += 1) {
-    const row = activeRows[index];
-    if (index < picked.visible.length) {
-      renderActiveRow(row, picked.visible[index]);
+  if (els.activeHint) {
+    if (failureText) {
+      els.activeHint.textContent = failureText;
+      els.activeHint.hidden = false;
+      els.activeHint.dataset.code = (result && result.code) || "error";
     } else {
-      hideActiveRow(row);
+      els.activeHint.textContent = "";
+      els.activeHint.hidden = true;
+      if (els.activeHint.dataset) delete els.activeHint.dataset.code;
     }
   }
-}
-
-async function pollStatus() {
-  if (closed || statusInFlight) return; // 已在进行的请求不重复发
-  statusInFlight = true;
-  try {
-    const result = await send({ type: "status" });
-    if (closed) return;
-    renderActiveStatus(result);
-  } finally {
-    statusInFlight = false;
+  setHidden(els.activeList, picked.total === 0);
+  const visible = picked.visible;
+  while (activeRows.length < visible.length) ensureActiveRow(activeRows.length);
+  for (let index = 0; index < activeRows.length; index += 1) {
+    if (index < visible.length) renderActiveRow(activeRows[index], visible[index]);
+    else hideActiveRow(activeRows[index]);
   }
 }
 
-function startStatusPolling() {
-  if (closed || statusTimer) return;
-  statusTimer = setInterval(() => {
-    pollStatus().catch(() => {});
+// ---------------------------------------------------------------------------
+// 渲染：最近活动（最多 5 条）
+// ---------------------------------------------------------------------------
+
+function renderRecent(force) {
+  if (!els.recentList) return;
+  const list = state && Array.isArray(state.recent) ? state.recent : [];
+  const items = buildRecentItems(list, { limit: 5 });
+  if (els.recentClear) els.recentClear.disabled = items.length === 0;
+  setHidden(els.recentEmpty, items.length > 0);
+  const signature = items.map((item) => item.key + "|" + item.status).join("~");
+  if (!force && signature === recentSignature) return;
+  recentSignature = signature;
+  els.recentList.textContent = "";
+  recentAgeRefs = [];
+  for (const item of items) {
+    const row = createElement("li", "recent-item type-" + item.type);
+    row.setAttribute("role", "button");
+    row.setAttribute("tabindex", "0");
+    row.title = item.detail || item.url || item.name;
+    row.dataset.at = String(item.at || 0);
+    row.appendChild(
+      createElement("span", "recent-icon", item.type === "parse" ? "⚡" : "⬇")
+    );
+    row.appendChild(createElement("span", "recent-name", item.name));
+    row.appendChild(createElement("span", "recent-status " + item.status, item.statusLabel));
+    const age = createElement("span", "recent-age", item.ageText);
+    age.dataset.at = String(item.at || 0);
+    row.appendChild(age);
+    recentAgeRefs.push({ element: age, at: item.at });
+    const activate = () => {
+      openRdm().catch(() => {});
+    };
+    row.addEventListener("click", activate);
+    row.addEventListener("keydown", (event) => {
+      if (!event || event.key === "Enter" || event.key === " ") activate();
+    });
+    els.recentList.appendChild(row);
+  }
+}
+
+function refreshAges() {
+  if (!recentAgeRefs.length) return;
+  for (const ref of recentAgeRefs) {
+    const text = formatAge(ref.at);
+    if (ref.element.textContent !== text) ref.element.textContent = text;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 状态快照应用 + 轮询
+// ---------------------------------------------------------------------------
+
+function renderAll() {
+  renderConnection();
+  renderPrimary();
+  renderRecent(true);
+  renderActive(lastActivity);
+}
+
+function applyActivity(result) {
+  lastActivity = result && typeof result === "object" ? result : { ok: false, code: "error" };
+  if (lastActivity.ok === true && state && state.status && state.status.host === "ok") {
+    state.status = Object.assign({}, state.status, { gui: lastActivity.guiRunning === true });
+    renderConnection();
+    renderPrimary();
+  }
+  if (Array.isArray(lastActivity.recent)) {
+    state = state || { ok: true, settings: {}, status: { host: "unknown" }, recent: [] };
+    state.recent = lastActivity.recent;
+    renderRecent();
+  }
+  renderActive(lastActivity);
+}
+
+async function pollActivity() {
+  if (closed || pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const result = await send({ type: "getActivity" });
+    if (closed) return;
+    applyActivity(result);
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+function startPolling() {
+  if (closed || pollTimer) return;
+  pollTimer = setInterval(() => {
+    pollActivity().catch(() => {});
   }, STATUS_POLL_MS);
-  pollStatus().catch(() => {});
+  if (!ageTimer) {
+    ageTimer = setInterval(refreshAges, STATUS_POLL_MS);
+  }
+  pollActivity().catch(() => {});
 }
 
 function cleanup() {
   closed = true;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
   if (ageTimer) {
     clearInterval(ageTimer);
     ageTimer = null;
   }
-  if (statusTimer) {
-    clearInterval(statusTimer);
-    statusTimer = null;
+  if (resultTimer) {
+    clearTimeout(resultTimer);
+    resultTimer = null;
   }
-  activeRows = [];
-  lastStatus = null;
+  if (undo && undo.timer) {
+    clearTimeout(undo.timer);
+    undo = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// 状态卡 / 设置 / AI 解析
+// 动作
 // ---------------------------------------------------------------------------
 
-function render(state) {
-  if (!state || !state.ok) {
-    renderStatus({ status: { host: "error", detail: (state && state.error) || "后台无响应" } });
-    return;
-  }
-  currentState = state;
-  if (state.settings) {
-    els.enabled.checked = state.settings.enabled !== false;
-    els.aiCredentials.checked = state.settings.aiIncludeCredentials === true;
-  }
-  if (state.extensionVersion) {
-    els.version.textContent = "扩展 v" + state.extensionVersion;
-  }
-  if (state.nativeHost) {
-    els.hostName.textContent = state.nativeHost;
-  }
-  renderStatus(state);
-  renderRecent(state);
-}
-
-function refreshAges() {
-  for (const element of els.recentList.querySelectorAll("[data-at]")) {
-    const at = Number(element.dataset.at);
-    element.textContent = formatAge(at);
+/** 旧式复制兜底：没有 navigator.clipboard 或写入被拒时使用。 */
+function legacyCopy(text) {
+  try {
+    if (!document.body || typeof document.execCommand !== "function") return false;
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy") === true;
+    document.body.removeChild(area);
+    return copied;
+  } catch (_err) {
+    return false;
   }
 }
 
-async function loadState() {
-  const state = await send({ type: "getState" });
-  if (state && state.ok) render(state);
+function copyText(text) {
+  if (typeof text !== "string" || !text) return Promise.resolve(false);
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      return navigator.clipboard.writeText(text).then(
+        () => true,
+        () => legacyCopy(text)
+      );
+    }
+  } catch (_err) {
+    /* 降级 */
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+async function copyInstallCommand() {
+  const commands = connectionCommands(state && state.browser);
+  const copied = await copyText(commands.installCommand);
+  if (copied) {
+    showResult("已复制安装命令", "ok");
+  } else {
+    showResult("复制失败，请在设置 → 连接诊断中手动复制", "danger");
+  }
+}
+
+async function openRdm() {
+  const result = await send({ type: "openRdm" });
+  if (result && result.ok) {
+    showResult("已在桌面端打开 RDM", "ok");
+  } else {
+    showResult(
+      (result && result.message) || "请在桌面端任务栏打开 RDM",
+      "warn"
+    );
+  }
+}
+
+function openOptions() {
+  try {
+    browser.runtime.openOptionsPage().catch(() => {});
+  } catch (_err) {
+    /* 无 options 页 */
+  }
+}
+
+async function setEnabled(next) {
+  const previous = normalizeSettings(settingsSnapshot()).enabled;
+  state = state || { ok: true, settings: {}, status: { host: "unknown" }, recent: [] };
+  state.settings = Object.assign({}, settingsSnapshot(), { enabled: next === true });
+  renderAll();
+  const result = await send({ type: "setSettings", settings: { enabled: next === true } });
+  if (result && result.ok) {
+    applyState(result);
+  } else {
+    state.settings = Object.assign({}, settingsSnapshot(), { enabled: previous });
+    renderAll();
+    showResult("开关未保存，请重试", "danger");
+  }
 }
 
 async function detect() {
-  els.refresh.disabled = true;
-  els.refresh.textContent = "检测中…";
-  try {
-    const state = await send({ type: "testConnection" });
-    render(state);
-  } finally {
-    els.refresh.disabled = false;
-    els.refresh.textContent = "重新检测";
+  const result = await sendWithTimeout({ type: "testConnection" }, DETECT_TIMEOUT_MS);
+  if (closed) return;
+  if (result && result.ok === true) {
+    applyState(result);
+    return;
   }
+  const code = (result && (result.code || result.error)) || "error";
+  state = state || { ok: true, settings: {}, status: { host: "unknown" }, recent: [] };
+  state.status = {
+    host: /missing|not found|未安装/i.test(String(code)) ? "missing" : "error",
+    gui: false,
+    detail: typeof code === "string" ? code : "error",
+    checkedAt: Date.now(),
+  };
+  renderConnection();
+  renderPrimary();
 }
 
-function setAiResult(text, kind) {
-  els.aiResult.textContent = text || "";
-  els.aiResult.className = "ai-result" + (kind ? " " + kind : "");
-}
+async function runPrimary(options) {
+  const action = currentAction;
+  if (!action || busy) return;
+  if (action.kind === "install-host") {
+    await copyInstallCommand();
+    return;
+  }
+  if (action.kind === "retry-detect" || action.kind === "detect") {
+    await detect();
+    return;
+  }
+  if (action.kind === "enable") {
+    await setEnabled(true);
+    return;
+  }
+  if (action.kind === "unsupported" || action.disabled) return;
 
-async function runAiParse() {
-  const includeCredentials = els.aiCredentials.checked === true;
-  els.aiParse.disabled = true;
-  els.aiParse.textContent = "解析中…";
-  setAiResult("正在发送到 RDM…", "busy");
+  const forceLaunch = (options && options.forceLaunch === true) || action.forceLaunch === true;
+  busy = true;
+  renderPrimary();
+  showResult("");
   try {
-    const result = await send({ type: "aiParse", includeCredentials });
-    if (result && result.ok) {
-      setAiResult(result.message || "已发送到 RDM，解析结果在桌面端 AI 栏查看", "ok");
-    } else {
-      setAiResult((result && result.message) || "AI 解析未发送", "bad");
+    if (action.kind === "parse-page") {
+      const result = await sendWithTimeout(
+        { type: "aiParse", forceLaunch },
+        HANDOFF_TIMEOUT_MS
+      );
+      if (result && result.ok === true) {
+        showResult(result.message || "已发送到 RDM，解析结果在桌面端打开", "ok");
+        await pollActivity();
+      } else {
+        showResult(
+          (result && result.message) || "解析未发送：RDM 没有响应",
+          "danger"
+        );
+      }
+      return;
+    }
+
+    const urls =
+      action.kind === "download-selection"
+        ? (tabContext && tabContext.selectedUrls) || []
+        : tabContext && tabContext.url
+          ? [tabContext.url]
+          : [];
+    const result = await sendWithTimeout(
+      {
+        type: "handoff",
+        urls,
+        fileName:
+          action.kind === "download-file" && tabContext ? tabContext.fileName || "" : "",
+        forceLaunch,
+      },
+      HANDOFF_TIMEOUT_MS
+    );
+    const feedback = formatHandoffResult(result);
+    showResult(feedback.text, feedback.tone);
+    if (result && result.ok === true) {
+      await pollActivity();
     }
   } finally {
-    els.aiParse.disabled = false;
-    els.aiParse.textContent = "解析此页";
+    busy = false;
+    renderPrimary();
   }
 }
 
-function bindEvents() {
-  els.enabled.addEventListener("change", async () => {
-    const enabled = els.enabled.checked;
-    const state = await send({ type: "setSettings", settings: { enabled } });
-    render(state);
-  });
+// ---------------------------------------------------------------------------
+// 清空最近活动 + 撤销
+// ---------------------------------------------------------------------------
 
-  els.refresh.addEventListener("click", () => {
-    detect().catch(() => {});
-  });
-
-  els.options.addEventListener("click", () => {
-    browser.runtime.openOptionsPage().catch(() => {});
-  });
-
-  els.clear.addEventListener("click", async () => {
-    const state = await send({ type: "clearRecent" });
-    render(state);
-  });
-
-  els.aiCredentials.addEventListener("change", async () => {
-    const state = await send({
-      type: "setSettings",
-      settings: { aiIncludeCredentials: els.aiCredentials.checked === true },
-    });
-    render(state);
-  });
-
-  els.aiParse.addEventListener("click", () => {
-    runAiParse().catch((err) => setAiResult("AI 解析失败：" + err, "bad"));
-  });
+function hideUndo() {
+  if (undo && undo.timer) clearTimeout(undo.timer);
+  undo = null;
+  setHidden(els.undoToast, true);
 }
 
+function showUndo() {
+  setHidden(els.undoToast, false);
+  if (els.undoText) els.undoText.textContent = "已清空最近活动";
+  const timer = setTimeout(() => {
+    if (undo && undo.timer === timer) hideUndo();
+  }, UNDO_TTL_MS);
+  undo = { timer };
+}
+
+async function clearRecent() {
+  const result = await send({ type: "clearRecent" });
+  if (!(result && result.ok === true)) {
+    showResult("清空失败，请重试", "danger");
+    return;
+  }
+  applyState(result);
+  showUndo();
+}
+
+async function undoClear() {
+  if (!undo) return;
+  const result = await send({ type: "restoreRecent" });
+  hideUndo();
+  if (result && result.ok === true) {
+    applyState(result);
+  } else {
+    showResult("撤销失败，请重试", "danger");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 事件绑定
+// ---------------------------------------------------------------------------
+
+function bindEvents() {
+  if (els.enabled) {
+    els.enabled.addEventListener("change", () => {
+      setEnabled(els.enabled.checked === true).catch(() => {});
+    });
+  }
+  if (els.primary) {
+    els.primary.addEventListener("click", () => {
+      runPrimary().catch((err) => showResult("操作失败：" + err, "danger"));
+    });
+  }
+  if (els.bannerAction) {
+    els.bannerAction.addEventListener("click", () => {
+      const id = els.bannerAction.dataset.action;
+      if (id === "start-gui") {
+        runPrimary({ forceLaunch: true }).catch(() => {});
+      } else if (id === "retry-detect") {
+        detect().catch(() => {});
+      } else if (id === "copy-install-command") {
+        copyInstallCommand().catch(() => {});
+      } else if (id === "enable") {
+        setEnabled(true).catch(() => {});
+      }
+    });
+  }
+  if (els.settings) {
+    // 唯一设置入口：头部齿轮（页脚已移除，版本/帮助只在 options 页）。
+    els.settings.addEventListener("click", () => openOptions());
+  }
+  if (els.recentClear) {
+    els.recentClear.addEventListener("click", () => {
+      clearRecent().catch(() => {});
+    });
+  }
+  if (els.undoAction) {
+    els.undoAction.addEventListener("click", () => {
+      undoClear().catch(() => {});
+    });
+  }
+  if (els.activeOpen) {
+    els.activeOpen.addEventListener("click", () => {
+      openRdm().catch(() => {});
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 启动
+// ---------------------------------------------------------------------------
+
 async function init() {
-  els.activeSection.hidden = true;
-  els.activeHead.hidden = true;
-  els.activeList.hidden = true;
-  els.activeMore.hidden = true;
-  els.activeHint.hidden = true;
   bindEvents();
-  await loadState();
-  await detect();
-  ageTimer = setInterval(refreshAges, 1000);
-  startStatusPolling();
+  setHidden(els.banner, true);
+  setHidden(els.undoToast, true);
+  setHidden(els.activeSection, true);
+  renderPrimary();
+
+  const initial = await send({ type: "getState" });
+  if (initial && initial.ok === true) {
+    applyState(initial);
+  } else {
+    showResult("后台无响应，请在设置中重新检测", "danger");
+  }
+
+  const context = await send({ type: "getTabContext" });
+  if (context && context.ok === true) {
+    tabContext = context;
+  } else {
+    tabContext = { url: "", title: "", selectedUrls: [] };
+  }
+  renderPrimary();
+
+  await detect().catch(() => {});
+  startPolling();
 }
 
 window.addEventListener("unload", cleanup);
 window.addEventListener("pagehide", cleanup);
 
 init().catch((err) => {
-  renderStatus({ status: { host: "error", detail: "popup 初始化失败：" + err } });
+  showResult("popup 初始化失败：" + err, "danger");
 });

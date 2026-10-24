@@ -27,7 +27,8 @@ function createEvent() {
   };
 }
 
-function createPortStub(mode, aiMode, statusMode) {
+function createPortStub(mode, aiMode, statusMode, options) {
+  const opts = options && typeof options === "object" ? options : {};
   const messageListeners = [];
   const disconnectListeners = [];
   const port = {
@@ -50,8 +51,27 @@ function createPortStub(mode, aiMode, statusMode) {
         for (const fn of messageListeners) {
           if (message.type === "ping") {
             fn({ type: "pong", id: message.id, version: "0.1.0", gui_running: true, protocol: 1 });
+          } else if (message.type === "activate") {
+            // 当前原生宿主没有 activate 消息；默认返回结构化 error（07 §17 #9）。
+            if (opts.activateMode === "ok") {
+              fn({ type: "activated", id: message.id });
+            } else {
+              fn({
+                type: "error",
+                id: message.id,
+                code: "invalid_request",
+                message: "unknown message type",
+              });
+            }
           } else if (message.type === "enqueue") {
-            if (mode === "queued") {
+            if (opts.enqueueMode === "duplicate") {
+              fn({
+                type: "error",
+                id: message.id,
+                code: "duplicate",
+                message: "same url already downloading",
+              });
+            } else if (mode === "queued") {
               fn({
                 type: "queued",
                 id: message.id,
@@ -202,13 +222,21 @@ function createBrowserStub(options) {
   };
   const menus = [];
   const ports = [];
-  const calls = { downloadsDownload: [], storageSet: [], executeScript: [] };
+  const calls = {
+    downloadsDownload: [],
+    storageSet: [],
+    executeScript: [],
+    tabsCreate: [],
+    badgeText: [],
+    badgeTitles: [],
+  };
 
   const browser = {
     runtime: {
       id: "rdm@rdm.download",
       lastError: null,
       getManifest: () => ({ version: "0.1.0", manifest_version: 3 }),
+      getURL: (relative) => "moz-extension://test/" + relative,
       onMessage: events.onMessage,
       onInstalled: events.onInstalled,
       onStartup: events.onStartup,
@@ -216,7 +244,8 @@ function createBrowserStub(options) {
         const port = createPortStub(
           options && options.nativeMode ? options.nativeMode : "ok",
           options && options.aiMode ? options.aiMode : "ok",
-          options && options.statusMode ? options.statusMode : "ok"
+          options && options.statusMode ? options.statusMode : "ok",
+          options
         );
         ports.push(port);
         return port;
@@ -267,9 +296,15 @@ function createBrowserStub(options) {
       create: () => Promise.resolve(),
     },
     action: {
-      setBadgeText: () => Promise.resolve(),
+      setBadgeText: (details) => {
+        calls.badgeText.push(details.text);
+        return Promise.resolve();
+      },
       setBadgeBackgroundColor: () => Promise.resolve(),
-      setTitle: () => Promise.resolve(),
+      setTitle: (details) => {
+        calls.badgeTitles.push(details.title);
+        return Promise.resolve();
+      },
     },
     cookies: {
       getAll: () => Promise.resolve([{ name: "sid", value: "secret" }]),
@@ -277,8 +312,16 @@ function createBrowserStub(options) {
     tabs: {
       query: () =>
         Promise.resolve([
-          { id: 7, url: "https://example.com/page", title: "Example Page" },
+          {
+            id: 7,
+            url: options && options.tabUrl ? options.tabUrl : "https://example.com/page",
+            title: options && options.tabTitle ? options.tabTitle : "Example Page",
+          },
         ]),
+      create: (createOptions) => {
+        calls.tabsCreate.push(createOptions);
+        return Promise.resolve({ id: 99 });
+      },
     },
     scripting: {
       executeScript: (details) => {
@@ -288,6 +331,17 @@ function createBrowserStub(options) {
         }
         if (options && options.scriptingMode === "empty") {
           return Promise.resolve([]);
+        }
+        // 选中文本读取（getSelection）与页面链接快照/AI 解析使用不同 func。
+        const source = typeof details.func === "function" ? details.func.toString() : "";
+        if (source.indexOf("getSelection") >= 0) {
+          return Promise.resolve([
+            { frameId: 0, result: options && options.selectionText ? options.selectionText : "" },
+          ]);
+        }
+        if (Array.isArray(details.args) && details.args.length > 0) {
+          // 页面内接管提示（07 §10）：只记录注入参数。
+          return Promise.resolve([{ frameId: 0, result: null }]);
         }
         const snapshotUrl =
           options && options.snapshotUrl
@@ -383,7 +437,7 @@ test("setSettings 归一化并持久化，同时更新菜单", async () => {
   assert.ok(persisted, "设置必须写入 storage");
   // setSettings 会重建右键菜单（默认 contextMenu=true，所以 create 必须被调用）。
   assert.ok(menus.length >= 1, "保存设置后应重建右键菜单");
-  assert.equal(menus[0].title, "使用 RDM 下载");
+  assert.equal(menus[0].title, "使用 RDM 下载链接");
 });
 
 test("未知消息类型返回结构化错误", async () => {
@@ -499,7 +553,7 @@ test("AI 解析：取当前标签页、按勾选附带 Cookie，返回「已发�
   const result = await handler({ type: "aiParse", includeCredentials: true });
   assert.equal(result.ok, true);
   assert.match(result.message, /已发送到 RDM/);
-  assert.match(result.message, /AI 栏/);
+  assert.match(result.message, /桌面端打开/);
 
   const sent = findAiParse(stub);
   assert.ok(sent, "必须通过 native port 发送 ai_parse");
@@ -514,7 +568,7 @@ test("AI 解析：取当前标签页、按勾选附带 Cookie，返回「已发�
   // 隐私：调试日志只允许出现脱敏 URL，绝不能出现 Cookie 值。
   const state = await handler({ type: "getState" });
   const debugText = (state.debug || []).join("\n");
-  assert.match(debugText, /AI 解析请求/);
+  assert.match(debugText, /解析请求/);
   assert.equal(debugText.includes("secret"), false, "日志不得包含 Cookie 值");
 });
 
@@ -639,12 +693,12 @@ test("AI 解析：右键菜单路径带标签页 id 采集快照", async () => {
   });
   stub.events.onInstalled.listeners[0]();
   const aiMenu = await waitFor(() =>
-    stub.menus.find((menu) => menu.title === "用 RDM AI 解析此页")
+    stub.menus.find((menu) => menu.title === "解析页面资源…")
   );
   assert.ok(aiMenu);
   const onClicked = stub.events.onClicked.listeners[0];
   onClicked(
-    { menuItemId: "rdm-ai-parse-page" },
+    { menuItemId: "rdm-parse-page" },
     { id: 7, url: "https://example.com/page", title: "Example Page" }
   );
   const sent = await waitFor(() => findAiParse(stub));
@@ -654,21 +708,21 @@ test("AI 解析：右键菜单路径带标签页 id 采集快照", async () => {
   assert.deepEqual(stub.calls.executeScript[0].target.tabId, 7);
 });
 
-test("右键菜单包含「用 RDM AI 解析此页」，点击后发送 ai_parse 并记录最近条目", async () => {
+test("右键菜单包含「解析页面资源…」，点击后发送 ai_parse 并记录最近活动", async () => {
   const stub = await loadBackground();
   // onInstalled 会重建右键菜单；等它注册完成再断言。
   stub.events.onInstalled.listeners[0]();
   const aiMenu = await waitFor(() =>
-    stub.menus.find((menu) => menu.title === "用 RDM AI 解析此页")
+    stub.menus.find((menu) => menu.title === "解析页面资源…")
   );
-  assert.ok(aiMenu, "必须创建 AI 解析右键菜单");
+  assert.ok(aiMenu, "必须创建「解析页面资源…」右键菜单");
   assert.ok(
-    stub.menus.some((menu) => menu.title === "使用 RDM 下载"),
+    stub.menus.some((menu) => menu.title === "使用 RDM 下载链接"),
     "原有下载右键菜单不能丢"
   );
   const onClicked = stub.events.onClicked.listeners[0];
   onClicked(
-    { menuItemId: "rdm-ai-parse-page" },
+    { menuItemId: "rdm-parse-page" },
     { url: "https://example.com/page", title: "Example Page" }
   );
 
@@ -882,4 +936,267 @@ test("旧 storage 里没有 downloadId 的最近记录：getState 补空串而�
   assert.equal(state.recent.length, 1);
   assert.equal(state.recent[0].fileName, "old.iso");
   assert.equal(state.recent[0].downloadId, "");
+});
+
+// ---------------------------------------------------------------------------
+// M4：popup 上下文 / 活动查询 / 主按钮交接 / badge / 菜单
+// ---------------------------------------------------------------------------
+
+test("getState 增加浏览器类型与活动汇总（badge 启动即用缓存）", async () => {
+  const stub = await loadBackground();
+  const handler = stub.events.onMessage.listeners[0];
+  const state = await handler({ type: "getState" });
+  assert.equal(state.ok, true);
+  assert.equal(state.browser, "firefox");
+  assert.equal(typeof state.activity, "object");
+  assert.equal(state.activity.active, 0);
+  assert.equal(typeof state.activity.updatedAt, "number");
+});
+
+test("getTabContext：文件链接 + Content-Disposition + 选中链接", async () => {
+  const tabUrl = "https://example.com/files/a.iso";
+  const stub = await loadBackground({
+    tabUrl,
+    selectionText: "下载 https://cdn.example.com/b.zip 和 https://cdn.example.com/c.bin",
+  });
+  const onBeforeRequest = stub.events.onBeforeRequest.listeners[0];
+  const onHeadersReceived = stub.events.onHeadersReceived.listeners[0];
+  onBeforeRequest({ url: tabUrl, method: "GET" });
+  onHeadersReceived({
+    url: tabUrl,
+    responseHeaders: [
+      { name: "Content-Length", value: "1048576" },
+      { name: "Content-Disposition", value: 'attachment; filename="big.iso"' },
+    ],
+  });
+
+  const handler = stub.events.onMessage.listeners[0];
+  const context = await handler({ type: "getTabContext" });
+  assert.equal(context.ok, true);
+  assert.equal(context.url, tabUrl);
+  assert.equal(context.tabId, 7);
+  assert.equal(context.fileName, "big.iso");
+  assert.equal(context.sizeBytes, 1048576);
+  assert.deepEqual(Array.from(context.selectedUrls), [
+    "https://cdn.example.com/b.zip",
+    "https://cdn.example.com/c.bin",
+  ]);
+  assert.ok(
+    stub.calls.executeScript.some((details) => String(details.func).includes("getSelection")),
+    "必须读取当前选中文本（仅本地解析）"
+  );
+});
+
+test("getActivity：返回 status + 最近活动，并同步 badge", async () => {
+  const stub = await loadBackground();
+  const handler = stub.events.onMessage.listeners[0];
+  const activity = await handler({ type: "getActivity" });
+  assert.equal(activity.ok, true);
+  assert.equal(activity.guiRunning, true);
+  assert.equal(activity.downloads.length, 2);
+  assert.equal(activity.active, 1);
+  assert.ok(Array.isArray(activity.recent));
+  assert.equal(
+    stub.calls.badgeText[stub.calls.badgeText.length - 1],
+    "1",
+    "有 1 个下载中时 badge 应显示数字"
+  );
+});
+
+test("handoff：把 popup 主按钮 URL 转交 RDM，成功写入最近活动", async () => {
+  const stub = await loadBackground();
+  const handler = stub.events.onMessage.listeners[0];
+  const result = await handler({
+    type: "handoff",
+    urls: ["https://example.com/a.iso"],
+    fileName: "a.iso",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.message, "已交给 RDM");
+  const enqueue = stub.ports
+    .flatMap((port) => port.posted)
+    .find((message) => message.type === "enqueue");
+  assert.ok(enqueue, "必须发送 enqueue");
+  assert.equal(enqueue.request.url, "https://example.com/a.iso");
+  assert.equal(enqueue.request.file_name, "a.iso");
+  assert.equal(enqueue.launch_gui, true);
+  const recent = stub.storage["rdm.recent"] || [];
+  assert.equal(recent[0].status, "handed");
+});
+
+test("handoff：duplicate 不回退、不重复创建，返回「该下载已在 RDM 中」", async () => {
+  const stub = await loadBackground({ enqueueMode: "duplicate" });
+  const handler = stub.events.onMessage.listeners[0];
+  const result = await handler({
+    type: "handoff",
+    urls: ["https://example.com/a.iso"],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.duplicate, true);
+  assert.equal(result.message, "该下载已在 RDM 中");
+  assert.equal(stub.calls.downloadsDownload.length, 0, "duplicate 不得回退浏览器下载");
+  const recent = stub.storage["rdm.recent"] || [];
+  assert.equal(recent[0].status, "duplicate");
+});
+
+test("handoff：forceLaunch 覆盖「自动启动 RDM」设置", async () => {
+  const stub = await loadBackground({
+    settings: { "rdm.settings": { autoStartGui: false } },
+  });
+  const handler = stub.events.onMessage.listeners[0];
+  await handler({
+    type: "handoff",
+    urls: ["https://example.com/a.iso"],
+    forceLaunch: true,
+  });
+  const enqueue = stub.ports
+    .flatMap((port) => port.posted)
+    .find((message) => message.type === "enqueue");
+  assert.equal(enqueue.launch_gui, true, "显式「启动 RDM」必须覆盖设置");
+
+  const normal = await loadBackground({
+    settings: { "rdm.settings": { autoStartGui: false } },
+  });
+  const normalHandler = normal.events.onMessage.listeners[0];
+  await normalHandler({ type: "handoff", urls: ["https://example.com/b.iso"] });
+  const normalEnqueue = normal.ports
+    .flatMap((port) => port.posted)
+    .find((message) => message.type === "enqueue");
+  assert.equal(normalEnqueue.launch_gui, false);
+});
+
+test("handoff：GUI 未运行（queued）时提示「已排队，启动 RDM 后自动开始」", async () => {
+  const stub = await loadBackground({ nativeMode: "queued" });
+  const handler = stub.events.onMessage.listeners[0];
+  const result = await handler({ type: "handoff", urls: ["https://example.com/a.iso"] });
+  assert.equal(result.ok, true);
+  assert.equal(result.queued, true);
+  assert.equal(result.message, "已排队，启动 RDM 后自动开始");
+});
+
+test("clearRecent / restoreRecent：清空可撤销（07 §7）", async () => {
+  const seeded = {
+    at: Date.now(),
+    fileName: "old.iso",
+    url: "https://example.com/old.iso",
+    status: "handed",
+    detail: "已交给 RDM",
+    downloadId: "dl_old",
+  };
+  const stub = await loadBackground({ settings: { "rdm.recent": [seeded] } });
+  const handler = stub.events.onMessage.listeners[0];
+  const before = await handler({ type: "getState" });
+  assert.equal(before.recent.length, 1);
+
+  const cleared = await handler({ type: "clearRecent" });
+  assert.equal(cleared.ok, true);
+  assert.deepEqual(cleared.recent, []);
+  assert.equal(cleared.undone, false);
+
+  const restored = await handler({ type: "restoreRecent" });
+  assert.equal(restored.ok, true);
+  assert.equal(restored.undone, true);
+  assert.equal(restored.recent.length, 1);
+  assert.equal(restored.recent[0].fileName, "old.iso");
+});
+
+test("openRdm：宿主不支持 activate 时优雅降级；支持时返回 ok", async () => {
+  const unsupported = await loadBackground();
+  const first = await unsupported.events.onMessage.listeners[0]({ type: "openRdm" });
+  assert.equal(first.ok, false);
+  assert.equal(first.code, "activate_unsupported");
+  assert.match(first.message, /桌面端任务栏打开/);
+
+  const supported = await loadBackground({ activateMode: "ok" });
+  const second = await supported.events.onMessage.listeners[0]({ type: "openRdm" });
+  assert.equal(second.ok, true);
+});
+
+test("右键菜单结构：链接/图像/媒体 + 解析页面资源 + 选中链接 + 设置", async () => {
+  const stub = await loadBackground();
+  stub.events.onInstalled.listeners[0]();
+  await waitFor(() => stub.menus.find((menu) => menu.title === "使用 RDM 下载链接"));
+  const titles = stub.menus.map((menu) => menu.title).filter(Boolean);
+  assert.deepEqual(titles, [
+    "使用 RDM 下载链接",
+    "用 RDM 下载图像",
+    "用 RDM 下载媒体",
+    "解析页面资源…",
+    "用 RDM 下载选中的链接",
+    "RDM 设置…",
+  ]);
+  assert.ok(stub.menus.some((menu) => menu.type === "separator"));
+  assert.ok(stub.menus.some((menu) => menu.id === "rdm-options"));
+});
+
+test("页面内接管提示：默认关闭；开启后右键交接成功才注入", async () => {
+  const off = await loadBackground();
+  const offClicked = off.events.onClicked.listeners[0];
+  offClicked(
+    { menuItemId: "rdm-download-with", linkUrl: "https://example.com/big.iso" },
+    { id: 7, url: "https://example.com/page" }
+  );
+  await waitFor(() => (off.storage["rdm.recent"] || []).length > 0);
+  assert.equal(
+    off.calls.executeScript.filter((details) => Array.isArray(details.args) && details.args.length > 0)
+      .length,
+    0,
+    "默认关闭时不得注入页面 toast"
+  );
+
+  const on = await loadBackground({ settings: { "rdm.settings": { pageToast: true } } });
+  const onClicked = on.events.onClicked.listeners[0];
+  onClicked(
+    { menuItemId: "rdm-download-with", linkUrl: "https://example.com/big.iso" },
+    { id: 7, url: "https://example.com/page" }
+  );
+  const injected = await waitFor(() =>
+    on.calls.executeScript.find((details) => Array.isArray(details.args) && details.args.length > 0)
+  );
+  assert.ok(injected, "开启后必须注入一条提示");
+  assert.equal(injected.target.tabId, 7);
+  assert.match(injected.args[0], /已交给 RDM/);
+});
+
+test("downloads.onCreated + duplicate：不回退浏览器下载，最近活动记为 duplicate", async () => {
+  const stub = await loadBackground({ enqueueMode: "duplicate" });
+  const onCreated = stub.events.onCreated.listeners[0];
+  await onCreated({
+    id: 42,
+    url: "https://example.com/big.iso",
+    filename: "C:\\Users\\me\\Downloads\\big.iso",
+    totalBytes: 8 * 1024 * 1024,
+  });
+  const recent = await waitFor(() => {
+    const list = stub.storage["rdm.recent"] || [];
+    return list.length > 0 ? list : null;
+  });
+  assert.ok(recent);
+  assert.equal(recent[0].status, "duplicate");
+  assert.equal(stub.calls.downloadsDownload.length, 0, "duplicate 不得回退");
+});
+
+test("aiParse：forceLaunch 覆盖「自动启动 RDM」设置", async () => {
+  const stub = await loadBackground({
+    settings: { "rdm.settings": { autoStartGui: false } },
+  });
+  const handler = stub.events.onMessage.listeners[0];
+  const result = await handler({ type: "aiParse", forceLaunch: true });
+  assert.equal(result.ok, true);
+  const sent = findAiParse(stub);
+  assert.ok(sent);
+  assert.equal(sent.launch_gui, true);
+});
+
+test("活动轮询 alarm 会查询 status 以刷新 badge 活动数", async () => {
+  const stub = await loadBackground();
+  stub.calls.executeScript.length = 0;
+  const onAlarm = stub.events.onAlarm.listeners[0];
+  onAlarm({ name: "rdm.activity.poll" });
+  const statusRequest = await waitFor(() =>
+    stub.ports
+      .flatMap((port) => port.posted)
+      .find((message) => message.type === "status")
+  );
+  assert.ok(statusRequest, "alarm 触发后必须查询 status");
 });

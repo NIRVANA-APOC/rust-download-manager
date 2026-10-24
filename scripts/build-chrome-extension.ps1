@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     从 extension/firefox 生成 Chrome MV3 扩展（dist/rdm-chrome/ + zip）。
@@ -164,7 +164,7 @@ try {
     Write-Step "校验产物"
     $requiredFiles = @(
         "manifest.json", "service-worker.js", "background.js",
-        "lib\compat.js", "lib\pure.js",
+        "lib\compat.js", "lib\pure.js", "lib\tokens.css",
         "popup.html", "popup.js", "popup.css",
         "options.html", "options.js", "options.css",
         "icons\rdm-16.png", "icons\rdm-32.png", "icons\rdm-48.png",

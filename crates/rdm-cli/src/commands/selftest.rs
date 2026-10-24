@@ -208,6 +208,48 @@ async fn case_range_fallback(_id: &'static str, keep: bool) -> Result<Value, Str
 // Case 3: pause → resume re-downloads exactly the missing bytes
 // ---------------------------------------------------------------------------
 
+/// Number of base chunks fully covered by the persisted resume state.
+///
+/// v2 state stores arbitrary byte ranges (`completed_ranges`) and leaves the v1
+/// `completed_chunks` bitmap empty; older state files still carry the bitmap.
+/// A partial prefix (pause keeps verified in-flight bytes) does not count as a
+/// completed chunk, matching `DownloadSummary::resumed_chunks`.
+fn completed_chunk_count(state: &Value, chunk_size: u64) -> u64 {
+    if chunk_size == 0 {
+        return 0;
+    }
+    if let Some(legacy) = state["completed_chunks"].as_array() {
+        if !legacy.is_empty() {
+            return legacy.len() as u64;
+        }
+    }
+    let Some(ranges) = state["completed_ranges"].as_array() else {
+        return 0;
+    };
+    let mut count = 0u64;
+    for range in ranges {
+        let Some(start) = range.get(0).and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(end) = range.get(1).and_then(Value::as_u64) else {
+            continue;
+        };
+        if end <= start {
+            continue;
+        }
+        let mut index = start / chunk_size;
+        while index * chunk_size < end {
+            let chunk_start = index * chunk_size;
+            let chunk_end = chunk_start + chunk_size;
+            if start <= chunk_start && end >= chunk_end {
+                count += 1;
+            }
+            index += 1;
+        }
+    }
+    count
+}
+
 async fn case_resume(_id: &'static str, keep: bool) -> Result<Value, String> {
     let total = 4 * 1024 * 1024u64;
     let chunk_size = 1024 * 1024u64;
@@ -270,10 +312,7 @@ async fn case_resume(_id: &'static str, keep: bool) -> Result<Value, String> {
                 .map_err(|error| format!("cannot read resume state: {error}"))?,
         )
         .map_err(|error| format!("resume state is not valid JSON: {error}"))?;
-        let completed = state["completed_chunks"]
-            .as_array()
-            .map(|array| array.len())
-            .unwrap_or(0);
+        let completed = completed_chunk_count(&state, chunk_size);
         if completed == 0 {
             return Err("resume state contains no completed chunks".to_string());
         }
@@ -495,6 +534,25 @@ fn print_recipe_report(report: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_chunks_come_from_v2_ranges_or_legacy_bitmap() {
+        let legacy = serde_json::json!({
+            "completed_chunks": [0, 1],
+        });
+        assert_eq!(completed_chunk_count(&legacy, 1024), 2);
+
+        // v2 state: one full chunk + one partial prefix (pause keeps verified
+        // in-flight bytes); only the full chunk counts as completed.
+        let v2 = serde_json::json!({
+            "completed_chunks": [],
+            "completed_ranges": [[0, 1024], [2048, 2560]],
+        });
+        assert_eq!(completed_chunk_count(&v2, 1024), 1);
+
+        assert_eq!(completed_chunk_count(&serde_json::json!({}), 1024), 0);
+        assert_eq!(completed_chunk_count(&v2, 0), 0);
+    }
 
     #[test]
     fn case_status_serializes_snake_case() {

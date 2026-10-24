@@ -3,134 +3,271 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RDM 下载接管 — 设置</title>
+    <title>RDM 浏览器接管设置</title>
+    <link rel="stylesheet" href="lib/tokens.css" />
     <link rel="stylesheet" href="options.css" />
   </head>
   <body>
     <main class="page">
       <header class="page-head">
         <img class="logo" src="icons/rdm-48.png" alt="RDM" width="48" height="48" />
-        <div>
-          <h1>RDM 下载接管 — 设置</h1>
+        <div class="head-text">
+          <h1>RDM 浏览器接管设置</h1>
           <p class="subtle">
-            设置保存在本机 Firefox 中；转交下载时通过原生消息发送给 RDM。
+            设置保存在本机浏览器中；转交下载时通过原生消息发送给 RDM。
             <span id="version"></span>
+            <span id="chrome-badge" class="chrome-badge" hidden>Chrome 支持为实验性</span>
           </p>
         </div>
+        <span id="save-status" class="save-status" role="status" aria-live="polite"></span>
       </header>
 
-      <form id="settings-form" class="grid" autocomplete="off">
-        <section class="card">
-          <h2>基础</h2>
-          <label class="row">
-            <span class="label">启用下载接管</span>
-            <input id="enabled" type="checkbox" class="checkbox" />
-            <span class="hint">关闭后 Firefox 下载完全保持原生行为。</span>
-          </label>
-
-          <label class="row">
-            <span class="label">自动启动 RDM GUI</span>
-            <input id="auto-start-gui" type="checkbox" class="checkbox" />
-            <span class="hint">转交时若 RDM 未运行，允许原生宿主启动 <code>rdm-gui.exe</code>。</span>
-          </label>
-
-          <label class="row">
-            <span class="label">右键菜单「使用 RDM 下载」</span>
-            <input id="context-menu" type="checkbox" class="checkbox" />
-            <span class="hint">在链接 / 图片 / 音视频 / 选中文本的右键菜单中显示。</span>
-          </label>
-
-          <label class="row">
-            <span class="label">转发 Cookie</span>
-            <input id="forward-cookies" type="checkbox" class="checkbox" />
-            <span class="hint">
-              需要登录态的下载（网盘、论坛附件等）通常必须开启。Cookie 只在浏览器 →
-              原生宿主 → RDM 进程内存中传递，不会写入日志。
-            </span>
-          </label>
-
-          <label class="row">
-            <span class="label">AI 解析附带 Cookie 凭证</span>
-            <input id="ai-credentials" type="checkbox" class="checkbox" />
-            <span class="hint">
-              点击弹窗「AI 解析当前页」时是否把当前页面 Cookie 一并交给本机 RDM。
-              默认关闭；只有勾选后才会发送，且 RDM 不会把它写入日志或磁盘。
-              与上面的「转发 Cookie」相互独立（那只影响下载接管）。
-            </span>
-          </label>
-        </section>
-
-        <section class="card">
-          <h2>过滤</h2>
-          <label class="row">
-            <span class="label">最小文件大小</span>
-            <input id="min-size-mb" type="number" min="0" step="0.1" placeholder="0（不限制）" />
-            <span class="hint">单位 MiB。小于该值的下载不接管，避免抢走小文件。</span>
-          </label>
-
-          <label class="row">
-            <span class="label">仅接管扩展名</span>
-            <input id="allow-extensions" type="text" placeholder="iso, zip, 7z（留空表示全部）" />
-            <span class="hint">逗号 / 空格分隔，不带点。非空时只接管列表内的扩展名。</span>
-          </label>
-
-          <label class="row">
-            <span class="label">永不接管扩展名</span>
-            <input id="block-extensions" type="text" placeholder="例如 htm, html" />
-            <span class="hint">优先级高于「仅接管扩展名」。对无扩展名或未知类型不生效。</span>
-          </label>
-        </section>
-
-        <section class="card">
-          <h2>RDM 下载参数</h2>
-          <div class="row">
-            <span class="label">连接数</span>
-            <span class="hint">
-              由 RDM 桌面端「设置 → 下载 → 默认连接数」统一决定（扩展不再单独设置）。
-            </span>
+      <!-- 顶部状态卡：宿主 / GUI / 浏览器 / 最近检测 -->
+      <section id="status-card" class="card status-card">
+        <div class="status-main">
+          <span id="status-dot" class="dot muted" aria-hidden="true"></span>
+          <div class="status-text">
+            <p id="status-headline" class="status-headline">正在检测连接…</p>
+            <p id="status-detail" class="status-detail"></p>
           </div>
-
-          <label class="row">
-            <span class="label">保存目录</span>
-            <input id="output-dir" type="text" placeholder="留空使用 RDM 默认目录；或填绝对路径，如 D:\Downloads" />
-            <span class="hint">必须是绝对路径；相对路径会被忽略。</span>
-          </label>
-
-          <label class="row">
-            <span class="label">限速</span>
-            <input id="speed-limit" type="number" min="0" step="1" placeholder="0（不限速）" />
-            <span class="hint">单位 KiB/s，0 表示不限速。由 RDM 全局令牌桶执行。</span>
-          </label>
-        </section>
-
-        <div class="actions">
-          <button id="save" type="submit" class="btn primary">保存设置</button>
-          <button id="reset" type="button" class="btn">恢复默认</button>
-          <button id="test" type="button" class="btn">测试连接</button>
-          <span id="toast" class="toast" role="status" aria-live="polite"></span>
         </div>
-      </form>
-
-      <section class="card note">
-        <h2>关于原生宿主</h2>
-        <p>
-          扩展依赖原生消息宿主 <code>com.rdm.download</code>。首次使用请先构建 RDM 并运行
-          <code>scripts/install-firefox-host.ps1</code>，然后在
-          <code>about:debugging → 此 Firefox → 临时载入附加组件</code> 中加载本扩展。
-          安装完成建议重启 Firefox，让原生宿主注册表项生效。
-        </p>
-        <p>
-          权限说明：<code>downloads</code>（取消/清理被接管的下载）、<code>webRequest</code>
-          （只读观察请求/响应头，MV3 下无法阻塞请求）、<code>cookies</code>（透传登录态）、
-          <code>nativeMessaging</code>（与本机 RDM 通信）、<code>storage</code>（保存设置与最近记录）、
-          <code>contextMenus</code> / <code>alarms</code>（右键菜单与状态轮询）。
-        </p>
-        <p class="subtle">
-          已知限制：极小的文件可能在 <code>downloads.onCreated</code> 之前就已完成，此时扩展会删除
-          浏览器下载文件并改由 RDM 重新下载；被接管的下载在 RDM 中不会显示 Firefox 的来源标签。
-        </p>
-        <p id="debug-line" class="subtle"></p>
+        <div class="status-meta">
+          <span id="status-browser" class="meta-chip">当前浏览器</span>
+          <span id="status-time" class="meta-chip">尚未检测</span>
+        </div>
+        <div class="status-actions">
+          <button id="test" class="btn primary" type="button">测试连接</button>
+          <button id="copy-diagnostics" class="btn" type="button">复制诊断信息</button>
+        </div>
       </section>
+
+      <!-- 首次安装引导（3 步；完成后或用户收起后隐藏） -->
+      <section id="onboarding" class="card onboarding" aria-labelledby="onboarding-title" hidden>
+        <div class="card-head">
+          <h2 id="onboarding-title">首次使用 · 完成浏览器接管</h2>
+          <button id="onboarding-dismiss" class="link-btn" type="button">收起</button>
+        </div>
+        <ol id="onboarding-steps" class="steps"></ol>
+      </section>
+
+      <!-- 基础 -->
+      <section class="card" aria-labelledby="group-basic">
+        <div class="card-head">
+          <h2 id="group-basic" class="group-title">基础</h2>
+          <button id="reset-basic" class="link-btn reset-group" type="button" data-group="basic">恢复本组默认</button>
+        </div>
+        <label class="row">
+          <span class="label">启用下载接管</span>
+          <span class="control">
+            <input id="enabled" type="checkbox" class="checkbox" />
+          </span>
+          <span class="hint">关闭后浏览器恢复原生下载；右键菜单与 popup 状态同步。</span>
+        </label>
+        <label class="row">
+          <span class="label">自动启动 RDM</span>
+          <span class="control">
+            <input id="auto-start-gui" type="checkbox" class="checkbox" />
+          </span>
+          <span class="hint">转交时若 RDM 未运行，允许原生宿主启动 rdm-gui.exe。</span>
+        </label>
+        <label class="row">
+          <span class="label">右键菜单</span>
+          <span class="control">
+            <input id="context-menu" type="checkbox" class="checkbox" />
+          </span>
+          <span class="hint">在链接 / 图片 / 音视频 / 页面 / 选中文本的右键菜单中显示 RDM 动作。</span>
+        </label>
+        <label class="row">
+          <span class="label">页面内接管提示</span>
+          <span class="control">
+            <input id="page-toast" type="checkbox" class="checkbox" />
+          </span>
+          <span class="hint">
+            默认关闭。仅在用户主动右键接管成功后，在页面右下角显示一条提示；不读取页面内容。
+          </span>
+        </label>
+      </section>
+
+      <!-- 接管规则 -->
+      <section class="card" aria-labelledby="group-rules">
+        <div class="card-head">
+          <h2 id="group-rules" class="group-title">接管规则</h2>
+          <button id="reset-rules" class="link-btn reset-group" type="button" data-group="rules">恢复本组默认</button>
+        </div>
+        <label class="row">
+          <span class="label">最小文件大小</span>
+          <span class="control control-inline">
+            <input id="min-size-mb" type="number" min="0" step="0.1" placeholder="0（不限制）" />
+            <span class="unit">MiB</span>
+          </span>
+          <span class="hint">小于该值的下载不接管，避免抢走小文件。</span>
+          <span id="err-min-size" class="field-error" hidden></span>
+        </label>
+        <label class="row">
+          <span class="label">仅接管扩展名</span>
+          <span class="control">
+            <input id="allow-extensions" type="text" placeholder="iso, zip, 7z（留空表示全部）" />
+          </span>
+          <span class="hint">逗号 / 空格分隔，不带点。非空时只接管列表内的扩展名。</span>
+          <span id="err-allow-extensions" class="field-error" hidden></span>
+        </label>
+        <label class="row">
+          <span class="label">永不接管扩展名</span>
+          <span class="control">
+            <input id="block-extensions" type="text" placeholder="例如 htm, html" />
+          </span>
+          <span class="hint">优先级高于「仅接管扩展名」。对无扩展名或未知类型不生效。</span>
+          <span id="err-block-extensions" class="field-error" hidden></span>
+        </label>
+      </section>
+
+      <!-- 下载行为 -->
+      <section class="card" aria-labelledby="group-behavior">
+        <div class="card-head">
+          <h2 id="group-behavior" class="group-title">下载行为</h2>
+          <button id="reset-behavior" class="link-btn reset-group" type="button" data-group="behavior">恢复本组默认</button>
+        </div>
+        <label class="row">
+          <span class="label">保存目录</span>
+          <span class="control">
+            <input
+              id="output-dir"
+              type="text"
+              placeholder="留空使用 RDM 默认目录；或填绝对路径，如 D:\Downloads"
+            />
+          </span>
+          <span class="hint">留空由 RDM 统一管理；相对路径不会被保存。</span>
+          <span id="err-output-dir" class="field-error" hidden></span>
+        </label>
+        <label class="row">
+          <span class="label">限速覆盖</span>
+          <span class="control control-inline">
+            <input id="speed-limit" type="number" min="0" step="1" placeholder="0（使用 RDM 全局限速）" />
+            <span class="unit">KiB/s</span>
+          </span>
+          <span class="hint">
+            0 = 使用 RDM 桌面端「全局限速」。连接数、动态线程规划与分类由桌面端统一管理。
+          </span>
+          <span id="err-speed-limit" class="field-error" hidden></span>
+        </label>
+      </section>
+
+      <!-- 隐私与权限 -->
+      <section class="card" aria-labelledby="group-privacy">
+        <div class="card-head">
+          <h2 id="group-privacy" class="group-title">隐私与权限</h2>
+          <button id="reset-privacy" class="link-btn reset-group" type="button" data-group="privacy">恢复本组默认</button>
+        </div>
+        <label class="row">
+          <span class="label">转发 Cookie（仅下载时）</span>
+          <span class="control">
+            <input id="forward-cookies" type="checkbox" class="checkbox" />
+          </span>
+          <span class="hint">
+            登录态下载通常需要。Cookie 只在浏览器 → RDM 进程内存中传递，不写日志、不上传；仅在你开启时使用。
+          </span>
+        </label>
+        <label class="row">
+          <span class="label">解析时附带 Cookie</span>
+          <span class="control">
+            <input id="ai-credentials" type="checkbox" class="checkbox" />
+          </span>
+          <span class="hint">
+            仅当你在 popup 点击「解析本页资源」且这里开启时才转发；默认关闭，只在本机内存传递。
+          </span>
+        </label>
+
+        <!-- 首次开启 Cookie 转发时的轻量确认卡（非系统对话框） -->
+        <div id="cookie-confirm" class="confirm-card" role="dialog" aria-labelledby="cookie-confirm-title" hidden>
+          <h3 id="cookie-confirm-title">允许 RDM 使用本页登录态？</h3>
+          <p>
+            Cookie 只会在浏览器 → 本机 RDM 进程内存中传递，不上传、不写日志/磁盘。
+            仅对需要登录的下载生效，可随时在设置中关闭。
+          </p>
+          <div class="confirm-actions">
+            <button id="cookie-allow-once" class="btn" type="button">仅本次允许</button>
+            <button id="cookie-allow-always" class="btn primary" type="button">始终允许</button>
+            <button id="cookie-cancel" class="btn" type="button">取消</button>
+          </div>
+        </div>
+
+        <details class="permissions">
+          <summary>权限说明</summary>
+          <ul class="permission-list">
+            <li><code>downloads</code>：取消并清理被接管的浏览器原生下载。</li>
+            <li><code>webRequest</code>：只读观察请求/响应头（Referer、Cookie、Content-Length），MV3 下不能阻塞请求。</li>
+            <li><code>cookies</code>：仅在你开启时透传登录态，只在本机进程间传递。</li>
+            <li><code>nativeMessaging</code>：与本机 RDM 原生宿主通信，不联网。</li>
+            <li><code>scripting</code>：仅在用户主动动作时读取当前标签页链接/选中文本或注入一条交接提示。</li>
+            <li><code>storage</code> / <code>contextMenus</code> / <code>alarms</code>：保存设置与最近活动、右键菜单、状态轮询。</li>
+          </ul>
+          <p class="hint">
+            不收集浏览记录、不上传任何数据；页面注入默认关闭，Cookie 默认不转发。
+          </p>
+        </details>
+      </section>
+
+      <!-- 连接诊断（折叠） -->
+      <details id="diagnostics" class="card diagnostics">
+        <summary class="group-title">连接诊断</summary>
+        <div class="diag-grid">
+          <span class="diag-label">原生宿主</span><span id="diag-host" class="diag-value">—</span>
+          <span class="diag-label">RDM 桌面端</span><span id="diag-gui" class="diag-value">—</span>
+          <span class="diag-label">最近检测</span><span id="diag-checked" class="diag-value">—</span>
+          <span class="diag-label">最近错误</span><span id="diag-error" class="diag-value">—</span>
+          <span class="diag-label">扩展版本</span><span id="diag-version" class="diag-value">—</span>
+        </div>
+
+        <div class="diag-actions">
+          <button id="diag-test" class="btn" type="button">测试连接</button>
+          <button id="diag-copy" class="btn" type="button">复制诊断信息</button>
+        </div>
+
+        <div id="install-firefox" class="command-block">
+          <p class="command-title">安装 Firefox 原生宿主</p>
+          <pre id="firefox-command" class="command-text"></pre>
+          <button id="copy-firefox-command" class="btn copy-command" type="button" data-command-target="firefox-command">
+            复制命令
+          </button>
+          <p id="firefox-note" class="hint"></p>
+        </div>
+        <div id="install-chrome" class="command-block" hidden>
+          <p class="command-title">安装 Chrome 原生宿主（实验性）</p>
+          <pre id="chrome-build-command" class="command-text"></pre>
+          <pre id="chrome-command" class="command-text"></pre>
+          <button id="copy-chrome-command" class="btn copy-command" type="button" data-command-target="chrome-command">
+            复制命令
+          </button>
+          <p id="chrome-note" class="hint"></p>
+        </div>
+
+        <p class="command-title">可粘贴的诊断文本</p>
+        <pre id="diagnostic-text" class="command-text"></pre>
+        <p id="help-hint" class="hint">
+          遇到问题：先复制诊断信息，再重新安装宿主并重启浏览器。扩展版本与连接诊断均在本设置页查看。
+        </p>
+      </details>
+
+      <!-- 关于 -->
+      <section class="card about" aria-labelledby="group-about">
+        <div class="card-head">
+          <h2 id="group-about" class="group-title">关于</h2>
+        </div>
+        <p class="about-line">
+          <span>RDM 浏览器接管</span>
+          <span id="about-version" class="meta-chip">—</span>
+          <span id="about-browser" class="meta-chip">—</span>
+        </p>
+        <p class="hint">
+          RDM 是纯 Rust 多线程下载器；扩展只负责把下载交给桌面端，连接数、动态线程规划、分类与
+          SHA-256 校验由桌面端统一管理。
+        </p>
+        <p class="hint">
+          开源许可与使用文档见仓库 README 与 docs/extension-protocol.md；扩展不包含远程依赖或外部 CDN。
+        </p>
+      </section>
+
+      <p id="save-toast" class="save-toast" role="status" aria-live="polite"></p>
     </main>
 
     <script src="lib/pure.js"></script>

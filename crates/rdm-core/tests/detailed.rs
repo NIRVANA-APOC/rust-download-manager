@@ -272,8 +272,14 @@ async fn download_with_meta_skips_the_probe() {
 
     let stats = server.stats();
     assert_eq!(stats.head_requests, 0, "download_with_meta must not probe");
-    assert_eq!(stats.get_requests, 4, "one ranged GET per chunk");
-    assert_eq!(stats.requests, 4);
+    // Adjacent chunks may be coalesced into one Range request (RTT saving), so
+    // the exact request count is not a contract; the bytes are.
+    assert!(stats.get_requests >= 1);
+    assert_eq!(
+        stats.body_bytes_sent, total,
+        "coalesced ranges must cover the file exactly once"
+    );
+    assert_eq!(stats.responses_206, stats.get_requests);
     assert!(stats.methods.iter().all(|method| method == "GET"));
 
     // Baseline comparison: the plain `download()` performs its own HEAD probe.
@@ -286,8 +292,11 @@ async fn download_with_meta_skips_the_probe() {
     assert_payload_eq(&plain.path, &expected, "plain download");
     let plain_stats = server.stats();
     assert_eq!(plain_stats.head_requests, 1, "download() probes once");
-    assert_eq!(plain_stats.get_requests, 4);
-    assert_eq!(plain_stats.requests, 5);
+    assert_eq!(
+        plain_stats.get_requests, stats.get_requests,
+        "same request shape must produce the same number of ranged GETs"
+    );
+    assert_eq!(plain_stats.requests, plain_stats.get_requests + 1);
     assert_eq!(
         plain_stats.methods.first().map(String::as_str),
         Some("HEAD")
@@ -509,6 +518,7 @@ async fn single_stream_sends_exactly_one_rangeless_get_with_all_events() {
 #[tokio::test]
 async fn connections_equals_one_without_single_stream_still_uses_ranges() {
     // Regression guard: `connections = 1` is *not* a single-request promise.
+    // Adjacent chunks may still be coalesced into one Range request.
     let total = 1024 * 1024u64;
     let chunk_size = 256 * 1024u64;
     let server = TestServer::start(Config::new(total)).await.unwrap();
@@ -523,9 +533,15 @@ async fn connections_equals_one_without_single_stream_still_uses_ranges() {
     assert_payload_eq(&summary.path, &server.content(), "one-connection payload");
 
     let stats = server.stats();
-    assert_eq!(stats.get_requests, 4, "one Range GET per chunk");
-    assert_eq!(stats.range_headers.len(), 4);
-    assert_eq!(stats.responses_206, 4, "chunked mode really used ranges");
+    assert!(
+        stats.get_requests >= 1,
+        "one-connection chunked mode still uses ranged GETs"
+    );
+    assert_eq!(stats.responses_206, stats.get_requests);
+    assert_eq!(
+        stats.body_bytes_sent, total,
+        "coalesced ranges must cover the file exactly once"
+    );
     assert_eq!(summary.connections, 1);
     assert!(summary.range_supported);
 

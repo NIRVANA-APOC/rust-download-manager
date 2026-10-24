@@ -5,7 +5,10 @@
 //! * [`client`] — minimal `chat/completions` client that never leaks the API key.
 //! * [`html`] — dependency-free HTML link/text scanner.
 //! * [`parse`] — URL → downloadable resources (fetch + LLM + heuristic fallback).
-//! * [`classify`] — save-directory classification (extension rules + optional AI).
+//! * [`classify`] — save-directory classification (deterministic extension rules,
+//!   no AI; configurable [`classify::CategoryRule`] list).
+//! * [`usage`] — token accounting (`usage` from the provider, estimated fallback).
+//! * [`providers`] — LLM provider presets, model price catalog and cost estimates.
 //! * [`store`] — parse cache (`<state>/ai/parse-cache.json`).
 //!
 //! The authoritative interface contract is `docs/design-next-features.md` §3.
@@ -15,11 +18,16 @@ pub mod client;
 pub mod config;
 pub mod html;
 pub mod parse;
+pub mod providers;
 pub mod store;
+pub mod usage;
 
 pub use classify::{
-    category_for, classify, classify_local, classify_with_ai, list_subdirs, sanitize_dir_name,
-    ClassifyInput, ClassifyOutcome, CATEGORY_OTHER,
+    category_for, category_for_with_rules, classify_local_with_rules, default_category_rules,
+    ensure_file_extension, extension_for_content_type, is_known_extension, list_subdirs,
+    sanitize_category_rules, sanitize_dir_name, sanitize_file_name, CategoryRule, ClassifyInput,
+    ClassifyOutcome, CATEGORY_KINDS, CATEGORY_OTHER, MAX_DIR_NAME_CHARS,
+    MAX_EXTENSIONS_PER_CATEGORY, MAX_EXTENSION_CHARS, MAX_FILE_NAME_CHARS,
 };
 pub use client::{AiClient, AiError, ChatMessage, ChatRole};
 pub use config::AiConfig;
@@ -29,7 +37,13 @@ pub use parse::{
     FAILURE_INVALID_URL, FAILURE_LOGIN_REQUIRED, FAILURE_NETWORK_ERROR, FAILURE_NOT_FOUND,
     FAILURE_NO_RESOURCES, FAILURE_RATE_LIMITED, FAILURE_SERVER_ERROR, FAILURE_TIMEOUT,
 };
+pub use providers::{
+    deepseek_is_off_peak, deepseek_peak_note_zh, estimate_cost, find_model, preset, price_label_zh,
+    CostEstimate, Currency, ModelPrice, ProviderKind, ProviderPreset, PRICE_CATALOG_DATE,
+    USD_TO_CNY,
+};
 pub use store::{CachedParse, ParseCache, ParseSession};
+pub use usage::{estimate_text_tokens, TokenUsage};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,7 +102,7 @@ pub(crate) fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::R
 /// markdown ```json fences``` and surrounding prose.
 ///
 /// Public since v0.4: `rdm-resolve` parses JsonAction replies with the same
-/// tolerant extractor the classify/parse paths use.
+/// tolerant extractor the parse path uses.
 pub fn extract_json_object(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     let body = if let Some(rest) = trimmed.strip_prefix("```") {

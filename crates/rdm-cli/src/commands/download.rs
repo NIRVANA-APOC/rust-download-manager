@@ -579,6 +579,8 @@ impl DownloadArgs {
             limit,
             sha256,
             single_stream,
+            http2,
+            mirror,
             idempotency_key: _,
             quiet: _,
             net,
@@ -590,12 +592,30 @@ impl DownloadArgs {
         request.chunk_size = chunk_size;
         request.speed_limit_bps = limit;
         request.single_stream = single_stream;
+        request.prefer_http2 = http2;
+        validate_mirrors(&mirror)?;
+        request.mirrors = mirror;
         if let Some(expected) = sha256 {
             validate_sha256(&expected)?;
             request.expected_sha256 = Some(expected);
         }
         Ok(request)
     }
+}
+
+/// Mirrors must be absolute http(s) URLs; the engine additionally drops
+/// malformed entries, but the CLI should fail early and loudly.
+pub fn validate_mirrors(mirrors: &[String]) -> Result<(), String> {
+    if mirrors.len() > 16 {
+        return Err("at most 16 --mirror URLs are supported".to_string());
+    }
+    for mirror in mirrors {
+        let trimmed = mirror.trim();
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            return Err(format!("--mirror must be an http(s) URL, got {mirror:?}"));
+        }
+    }
+    Ok(())
 }
 
 /// Build the engine request from URL + shared network options (also used by

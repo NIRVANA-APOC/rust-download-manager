@@ -55,6 +55,9 @@ fn unreachable_ai_config() -> AiConfig {
         model: "scripted-model".to_owned(),
         api_key: API_KEY.to_owned(),
         timeout_secs: 1,
+        // Loopback mock: not a bundled provider (no preset/no prices).
+        provider: None,
+        ..AiConfig::default()
     }
 }
 

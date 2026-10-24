@@ -63,6 +63,10 @@ struct BatchTask {
     #[serde(default)]
     single_stream: Option<bool>,
     #[serde(default)]
+    prefer_http2: Option<bool>,
+    #[serde(default)]
+    mirrors: Vec<String>,
+    #[serde(default)]
     chunk_size: Option<u64>,
     #[serde(default)]
     expected_sha256: Option<String>,
@@ -383,6 +387,8 @@ impl BatchTask {
             connections,
             dynamic_connections,
             single_stream,
+            prefer_http2,
+            mirrors,
             chunk_size,
             expected_sha256,
             speed_limit_bps,
@@ -406,6 +412,11 @@ impl BatchTask {
         if let Some(single) = single_stream {
             request.single_stream = single;
         }
+        if let Some(prefer) = prefer_http2 {
+            request.prefer_http2 = prefer;
+        }
+        super::download::validate_mirrors(&mirrors)?;
+        request.mirrors = mirrors;
         request.chunk_size = chunk_size;
         request.expected_sha256 = expected_sha256;
         request.speed_limit_bps = speed_limit_bps;

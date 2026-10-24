@@ -47,6 +47,7 @@ fn report_fixture(source_url: &str, created_ms: u64) -> ParseReport {
         notes: vec!["cached note".to_owned()],
         ai_used: false,
         model: None,
+        usage: rdm_ai::TokenUsage::default(),
         created_ms,
         cache_hit: false,
         failure_kind: None,
@@ -211,6 +212,23 @@ async fn html_page_with_ai_uses_llm_resources() {
     assert_eq!(report.resources[0].kind, "video");
     assert_eq!(report.resources[0].size_bytes, Some(111));
     assert_eq!(report.notes, vec!["该站需要 Referer".to_owned()]);
+    // The mock provider sends no `usage` object, so the report carries a
+    // clearly-marked estimate for the one model call — never a fake exact 0.
+    assert!(
+        report.usage.calls >= 1,
+        "successful LLM parse must report its model call: {:?}",
+        report.usage
+    );
+    assert!(
+        report.usage.estimated,
+        "missing provider usage must be marked estimated: {:?}",
+        report.usage
+    );
+    assert!(
+        report.usage.total_tokens > 0,
+        "estimated usage must be non-zero: {:?}",
+        report.usage
+    );
 
     let post = server
         .requests()

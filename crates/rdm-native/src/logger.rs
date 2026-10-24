@@ -6,7 +6,7 @@
 //! stderr, which Firefox forwards to the browser console — that is usually how
 //! users discover a native host that refuses to start.
 //!
-//! Never log secret material here: callers redact URLs (`url_util::redact_url`)
+//! Never log secret material here: callers redact URLs (`url_util::redact_url_for_log`)
 //! and log only cookie *counts/lengths*, never cookie values.
 
 use std::fs::{self, File, OpenOptions};

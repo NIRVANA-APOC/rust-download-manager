@@ -1,23 +1,18 @@
 /*!
  * popup UI 回归测试（node:test + node:vm + 手写最小 DOM/browser stub）。
  *
- * 背景：本机浏览器（Chrome/Edge headless）在 DSH 文件沙箱下会因 crashpad/mojo
- * 命名管道被拒而无法启动，真实视觉验收做不了。popup 的关键 UI 行为
- * （「正在下载」进度区/线程数/不可用提示、AI 卡紧凑结构、增量轮询/清理）
- * 的唯一自动化证据就是本文件：
+ * 覆盖 M4 重做后的关键行为：
+ *   - 420px 结构与「唯一主按钮」；
+ *   - 主按钮随 tab 上下文/连接状态变化的文案与点击行为；
+ *   - 状态条只在异常时出现；
+ *   - 「正在下载」最多 3 条（进度/速度/溢出）；
+ *   - 「最近活动」最多 5 条、清空 + 撤销；
+ *   - 开关乐观更新失败回滚、防重复提交、unload 清理。
  *
- *   - 用 node:vm 在独立 context 里加载真实 `lib/pure.js` + `popup.js`，
- *     不复制业务逻辑，测的就是扩展实际执行的脚本；
- *   - DOM / browser / 定时器全部手写 stub，不引入 npm 依赖；
- *   - popup.html 的元素 id 从真实文件用正则提取，避免测试与 HTML 漂移；
- *   - 伪定时器：setInterval 记录回调与 id，测试手动触发；clearInterval 记录清理。
+ * 用 node:vm 加载真实 `lib/pure.js` + `popup.js`，不复制业务逻辑；
+ * DOM / browser / 定时器全部手写 stub，不引入 npm 依赖。
  *
- * 运行（受限沙箱里 `node --test <dir>` 会因 test runner spawn 子进程被拒 EPERM，
- * 用 --test-isolation=none + 显式文件等价运行）：
- *   node --test --test-isolation=none \
- *     extension/firefox/test/pure.test.js \
- *     extension/firefox/test/background.test.js \
- *     extension/firefox/test/popup.test.js
+ * 运行：node --test extension/firefox/test/
  */
 "use strict";
 
@@ -27,48 +22,56 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-// 宿主侧引用一次：读取 popup.js 依赖的纯函数；也用于断言未知 state 的降级。
 const pure = require("../lib/pure.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const POPUP_HTML = fs.readFileSync(path.join(ROOT, "popup.html"), "utf8");
+const POPUP_CSS = fs.readFileSync(path.join(ROOT, "popup.css"), "utf8");
+const TOKENS_CSS = fs.readFileSync(path.join(ROOT, "lib", "tokens.css"), "utf8");
 const PURE_JS = fs.readFileSync(path.join(ROOT, "lib", "pure.js"), "utf8");
 const POPUP_JS = fs.readFileSync(path.join(ROOT, "popup.js"), "utf8");
 
-/** popup.html 里真实存在的元素 id（popup.js 用 getElementById 找这些节点）。 */
 const HTML_IDS = [...POPUP_HTML.matchAll(/id="([^"]+)"/g)].map((match) => match[1]);
 
-/** popup.js 必须能取到的 id；HTML 漂移时这里先失败，给出清晰原因。 */
 const REQUIRED_IDS = [
   "enabled",
-  "version",
-  "host-dot",
-  "host-text",
-  "gui-dot",
-  "gui-text",
-  "detail",
-  "refresh",
-  "options",
-  "clear",
-  "recent-list",
-  "host-name",
-  "ai-parse",
-  "ai-credentials",
-  "ai-result",
+  "settings",
+  "ready",
+  "ready-dot",
+  "ready-text",
+  "chrome-badge",
+  "banner",
+  "banner-icon",
+  "banner-text",
+  "banner-action",
+  "primary",
+  "primary-text",
+  "primary-info",
+  "primary-result",
   "active-section",
   "active-head",
   "active-title",
-  "active-summary",
+  "active-speed",
+  "active-open",
   "active-list",
   "active-more",
   "active-hint",
+  "recent-title",
+  "recent-clear",
+  "recent-list",
+  "recent-empty",
+  "undo-toast",
+  "undo-text",
+  "undo-action",
 ];
 
 const MiB = 1024 * 1024;
-const STATUS_POLL_MS = 1000;
+const POLL_MS = 1000;
+const RESULT_TTL_MS = 2500;
+const UNDO_TTL_MS = 5000;
 
 // ---------------------------------------------------------------------------
-// 最小 DOM stub（只实现 popup.js / 本测试用到的能力）
+// 最小 DOM stub
 // ---------------------------------------------------------------------------
 
 class ClassList {
@@ -103,6 +106,8 @@ class El {
     this.hidden = false;
     this.checked = false;
     this.disabled = false;
+    this.title = "";
+    this.type = "";
     this.classList = new ClassList();
     this._className = "";
     this._text = "";
@@ -120,7 +125,6 @@ class El {
   }
   set textContent(value) {
     this._text = value === null || value === undefined ? "" : String(value);
-    // 与真实 DOM 一致：给容器赋 textContent 会清空子节点（renderRecent 依赖）。
     this.children = [];
   }
   appendChild(child) {
@@ -143,26 +147,18 @@ class El {
   addEventListener(type, fn) {
     (this._listeners[type] || (this._listeners[type] = [])).push(fn);
   }
-  dispatch(type) {
-    for (const fn of this._listeners[type] || []) fn();
-  }
-  querySelectorAll(selector) {
-    // 只支持 refreshAges() 用到的 [data-at] 选择器。
-    const out = [];
-    const walk = (node) => {
-      for (const child of node.children || []) {
-        if (selector === "[data-at]" && child.dataset.at !== undefined) out.push(child);
-        walk(child);
-      }
-    };
-    walk(this);
-    return out;
+  dispatch(type, event) {
+    for (const fn of this._listeners[type] || []) fn(event || {});
   }
 }
 
 // ---------------------------------------------------------------------------
-// 测试数据与 harness
+// 默认快照与 harness
 // ---------------------------------------------------------------------------
+
+function settings(overrides) {
+  return pure.normalizeSettings(overrides || {});
+}
 
 function recentEntry(overrides) {
   return Object.assign(
@@ -171,42 +167,55 @@ function recentEntry(overrides) {
       fileName: "a.iso",
       url: "https://example.com/a.iso",
       status: "handed",
-      detail: "已交给 RDM（dl_a）",
+      detail: "已交给 RDM",
       downloadId: "dl_a",
     },
     overrides || {}
   );
 }
 
-/** 3 条最近转交记录（2 handed + 1 queued）；它们不应再出现每行进度条。 */
-function stateWithRecent() {
+function baseState(overrides) {
+  const opts = overrides || {};
   return {
     ok: true,
-    settings: { enabled: true, aiIncludeCredentials: false },
-    status: { host: "ok", gui: true, detail: "" },
-    recent: [
-      recentEntry({ fileName: "a.iso", downloadId: "dl_a" }),
-      recentEntry({
-        fileName: "b.iso",
-        url: "https://example.com/b.iso",
-        downloadId: "dl_b",
-        status: "handed",
-      }),
-      recentEntry({
-        fileName: "c.iso",
-        url: "https://example.com/c.iso",
-        status: "queued",
-        downloadId: "",
-        detail: "RDM GUI 未运行，已排队",
-      }),
-    ],
-    extensionVersion: "0.1.0",
+    settings: settings(opts.settings),
+    status: Object.assign({ host: "ok", gui: true, detail: "", checkedAt: Date.now() }, opts.status || {}),
+    recent: opts.recent || [],
+    extensionVersion: "0.2.0",
     nativeHost: "com.rdm.download",
+    browser: opts.browser || "firefox",
+    activity: null,
   };
 }
 
-function emptyStatus() {
-  return { ok: true, guiRunning: true, active: 0, globalSpeedBps: 0, downloads: [] };
+function tabContext(overrides) {
+  return Object.assign(
+    {
+      ok: true,
+      tabId: 7,
+      url: "https://example.com/page",
+      title: "Example Page",
+      fileName: "",
+      sizeBytes: -1,
+      selectedUrls: [],
+      isHttp: true,
+    },
+    overrides || {}
+  );
+}
+
+function emptyActivity(overrides) {
+  return Object.assign(
+    {
+      ok: true,
+      guiRunning: true,
+      active: 0,
+      globalSpeedBps: 0,
+      downloads: [],
+      recent: [],
+    },
+    overrides || {}
+  );
 }
 
 function download(overrides) {
@@ -227,47 +236,83 @@ function download(overrides) {
   );
 }
 
-function statusWith(downloads, overrides) {
-  const list = downloads || [];
-  return Object.assign(
-    {
-      ok: true,
-      guiRunning: true,
-      active: list.length,
-      globalSpeedBps: 0,
-      downloads: list,
-    },
-    overrides || {}
-  );
-}
-
-/**
- * 在独立 vm context 里加载真实 pure.js + popup.js。
- * 返回 harness：元素表、监听器表、伪定时器、浏览器调用记录与驱动方法。
- */
 function createHarness(options) {
   const opts = options && typeof options === "object" ? options : {};
   const els = {};
   for (const id of HTML_IDS) els[id] = new El("div");
 
-  const listeners = Object.create(null);
+  const lifecycleListeners = { unload: [], pagehide: [] };
   const intervals = new Map();
   const intervalHistory = [];
-  const clearedTimerIds = [];
+  const timeouts = new Map();
+  const timeoutHistory = [];
   let nextTimerId = 1;
 
   const harness = {
     els,
-    listeners,
+    lifecycleListeners,
     intervals,
     intervalHistory,
-    clearedTimerIds,
+    timeouts,
+    timeoutHistory,
     sentMessages: [],
-    statusCalls: 0,
-    // 测试可在运行中替换这些响应。
-    state: opts.state || stateWithRecent(),
-    status: opts.status || emptyStatus(),
-    aiParseHandler: null,
+    clipboard: [],
+    tabCreates: [],
+    optionsPageOpens: 0,
+    state: opts.state || baseState(),
+    tabContext: opts.tabContext || tabContext(),
+    // 真实 background 的 getActivity 会带上最近活动与真实 guiRunning；
+    // 默认让 stub 与初始 getState 快照保持一致，避免测试被 1s 轮询覆盖。
+    activity:
+      opts.activity ||
+      emptyActivity({
+        guiRunning: !opts.state || !opts.state.status || opts.state.status.gui !== false,
+        recent: (opts.state && opts.state.recent) || [],
+      }),
+  };
+
+  const defaultHandlers = {
+    getState: () => harness.state,
+    getTabContext: () => harness.tabContext,
+    testConnection: () => Object.assign({}, harness.state, { latencyMs: 20 }),
+    getActivity: () => harness.activity,
+    handoff: () => Promise.resolve({ ok: true, message: "已交给 RDM", results: [] }),
+    aiParse: () =>
+      Promise.resolve({ ok: true, message: "已发送到 RDM，解析结果在桌面端打开" }),
+    setSettings: (message) => {
+      harness.state = Object.assign({}, harness.state, {
+        settings: settings(Object.assign({}, harness.state.settings, message.settings)),
+      });
+      return Promise.resolve(harness.state);
+    },
+    clearRecent: () => {
+      harness.clearedRecent = harness.state.recent;
+      harness.state = Object.assign({}, harness.state, { recent: [] });
+      harness.activity = Object.assign({}, harness.activity, { recent: [] });
+      return Promise.resolve(Object.assign({}, harness.state, { undone: false }));
+    },
+    restoreRecent: () => {
+      const restored = harness.clearedRecent || [];
+      harness.state = Object.assign({}, harness.state, { recent: restored });
+      harness.activity = Object.assign({}, harness.activity, { recent: restored });
+      return Promise.resolve(Object.assign({}, harness.state, { undone: true }));
+    },
+    openRdm: () =>
+      Promise.resolve({
+        ok: false,
+        code: "activate_unsupported",
+        message: "当前宿主不支持从浏览器唤起 RDM，请在桌面端任务栏打开",
+      }),
+  };
+
+  for (const key of Object.keys(defaultHandlers)) {
+    harness[key] = opts[key] || defaultHandlers[key];
+  }
+
+  harness.handleMessage = (message) => {
+    const handler = harness[message.type];
+    if (typeof handler === "function") return handler(message);
+    return Promise.resolve({ ok: false, error: "unknown_message_type" });
   };
 
   const document = {
@@ -277,7 +322,16 @@ function createHarness(options) {
 
   const window = {
     addEventListener: (type, fn) => {
-      (listeners[type] || (listeners[type] = [])).push(fn);
+      (lifecycleListeners[type] || (lifecycleListeners[type] = [])).push(fn);
+    },
+  };
+
+  const navigator = {
+    clipboard: {
+      writeText: (text) => {
+        harness.clipboard.push(text);
+        return Promise.resolve();
+      },
     },
   };
 
@@ -285,27 +339,30 @@ function createHarness(options) {
     runtime: {
       sendMessage: (message) => {
         harness.sentMessages.push(message);
-        if (!message || typeof message !== "object") return Promise.resolve({ ok: false });
-        if (message.type === "status") {
-          harness.statusCalls += 1;
-          return Promise.resolve(harness.status);
-        }
-        if (message.type === "aiParse") {
-          if (harness.aiParseHandler) return harness.aiParseHandler(message);
-          return Promise.resolve({ ok: true, message: "已发送到 RDM" });
-        }
-        return Promise.resolve(harness.state);
+        return Promise.resolve()
+          .then(() => harness.handleMessage(message))
+          .catch((err) => ({ ok: false, error: String(err) }));
       },
-      openOptionsPage: () => Promise.resolve(),
+      openOptionsPage: () => {
+        harness.optionsPageOpens += 1;
+        return Promise.resolve();
+      },
+      getURL: (relative) => "moz-extension://test/" + relative,
+    },
+    tabs: {
+      create: (createOptions) => {
+        harness.tabCreates.push(createOptions);
+        return Promise.resolve();
+      },
     },
   };
 
   const sandbox = {
     document,
     window,
+    navigator,
     browser,
     console,
-    // pure.js 的 URL/TextEncoder 只在非 popup 路径用到，但提供后更接近浏览器环境。
     URL,
     TextEncoder,
     setInterval: (fn, ms) => {
@@ -316,8 +373,19 @@ function createHarness(options) {
       return id;
     },
     clearInterval: (id) => {
-      clearedTimerIds.push(id);
       intervals.delete(id);
+    },
+    setTimeout: (fn, ms) => {
+      const id = nextTimerId++;
+      const entry = { id, fn, ms, cleared: false };
+      timeouts.set(id, entry);
+      timeoutHistory.push(entry);
+      return id;
+    },
+    clearTimeout: (id) => {
+      const entry = timeouts.get(id);
+      if (entry) entry.cleared = true;
+      timeouts.delete(id);
     },
   };
 
@@ -325,512 +393,499 @@ function createHarness(options) {
   vm.runInContext(PURE_JS, context, { filename: path.join(ROOT, "lib", "pure.js") });
   vm.runInContext(POPUP_JS, context, { filename: path.join(ROOT, "popup.js") });
 
-  /** 手动触发所有 ms 匹配的伪 interval（popup 的 age/status 都是 1000ms）。 */
   harness.fireIntervals = (ms) => {
     for (const entry of Array.from(intervals.values())) {
       if (ms === undefined || entry.ms === ms) entry.fn();
     }
   };
-
-  /** 模拟"已 clearInterval 的定时器迟到触发"（清理后不应再有副作用）。 */
   harness.fireStaleIntervals = () => {
     for (const entry of intervalHistory) entry.fn();
   };
-
-  /** 排空 vm context 里的 Promise 链（真实 setTimeout 让出事件循环）。 */
+  harness.fireTimeouts = (ms) => {
+    const due = [];
+    for (const entry of Array.from(timeouts.values())) {
+      if (!entry.cleared && (ms === undefined || entry.ms === ms)) due.push(entry);
+    }
+    for (const entry of due) {
+      timeouts.delete(entry.id);
+      entry.fn();
+    }
+  };
   harness.settle = async () => {
-    for (let i = 0; i < 10; i += 1) {
+    for (let index = 0; index < 12; index += 1) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   };
-
   harness.click = (id) => {
     const element = els[id];
     assert.ok(element, "缺少元素 #" + id);
     element.dispatch("click");
   };
-
+  harness.change = (id) => {
+    const element = els[id];
+    assert.ok(element, "缺少元素 #" + id);
+    element.dispatch("change");
+  };
+  harness.lifecycle = (type) => {
+    for (const fn of lifecycleListeners[type] || []) fn();
+  };
   return harness;
 }
 
-async function bootHarness(options) {
+async function boot(options) {
   const harness = createHarness(options);
-  await harness.settle(); // 等 init(): loadState + detect + 立即 status 轮询
+  await harness.settle();
   return harness;
 }
 
-/** 最近转交的第 index 项（top/meta/[detail]）。 */
-function recentItem(harness, index) {
-  const item = harness.els["recent-list"].children[index];
-  assert.ok(item, "最近列表缺少第 " + index + " 项");
-  return item;
+function recentNames(harness) {
+  return harness.els["recent-list"].children.map(
+    (row) => row.children[1] && row.children[1].textContent
+  );
 }
 
-/** 「正在下载」区节点集合。 */
-function activeEls(harness) {
-  return {
-    section: harness.els["active-section"],
-    head: harness.els["active-head"],
-    title: harness.els["active-title"],
-    summary: harness.els["active-summary"],
-    list: harness.els["active-list"],
-    more: harness.els["active-more"],
-    hint: harness.els["active-hint"],
-  };
-}
-
-/** 「正在下载」第 index 行节点。 */
-function activeRow(harness, index) {
-  const row = harness.els["active-list"].children[index];
-  assert.ok(row, "缺少第 " + index + " 条 active 行");
-  const top = row.children[0];
-  return {
-    row,
-    name: top.children[0],
-    badge: top.children[1],
-    bar: row.children[1],
-    fill: row.children[1].children[0],
-    text: row.children[2],
-  };
+function activeRows(harness) {
+  return harness.els["active-list"].children;
 }
 
 // ---------------------------------------------------------------------------
-// 1) popup.html 结构：AI 卡紧凑 + 「正在下载」区位于状态卡与 AI 卡之间
+// 1) 结构与尺寸约束
 // ---------------------------------------------------------------------------
 
-test("popup.html：AI 卡紧凑，且「正在下载」区位于状态卡之后、AI 卡之前", () => {
+test("popup.html：420px、tokens.css、唯一主按钮、设置入口只在头部齿轮", () => {
   for (const id of REQUIRED_IDS) {
-    assert.ok(HTML_IDS.includes(id), "popup.html 缺少 popup.js 需要的 id: #" + id);
+    assert.ok(HTML_IDS.includes(id), "popup.html 缺少 id: #" + id);
   }
-
-  // AI 卡保持紧凑：标题/凭证/小按钮同属 .ai-head，无旧的两行长说明。
-  const head = /<div class="ai-head">([\s\S]*?)<\/div>/.exec(POPUP_HTML);
-  assert.ok(head, "popup.html 必须存在 .ai-head 容器");
-  const block = head[1];
-  for (const id of ["ai-title", "ai-credentials", "ai-parse"]) {
-    assert.ok(block.includes('id="' + id + '"'), "#" + id + " 必须位于 .ai-head 同一行容器内");
-  }
-  assert.equal(POPUP_HTML.includes("ai-hint"), false, "旧的 .ai-hint 长说明必须移除");
-  assert.match(block, /title="[^"]*Cookie[^"]*"/, "Cookie 长说明应放进 title tooltip");
-  assert.match(block, /id="ai-parse"[^>]*btn-sm/, "「解析此页」应是 btn-sm 小按钮");
-  assert.match(
-    POPUP_HTML,
-    /id="ai-result"[^>]*role="status"[^>]*aria-live="polite"/,
-    "结果行必须保留 role=status + aria-live"
-  );
-
-  // 新进度区的位置：status card < active-section < ai-card。
-  const statusCardIndex = POPUP_HTML.indexOf('<section class="card">');
-  const activeIndex = POPUP_HTML.indexOf('id="active-section"');
-  const aiCardIndex = POPUP_HTML.indexOf('class="card ai-card"');
-  assert.ok(statusCardIndex >= 0 && activeIndex > statusCardIndex, "「正在下载」必须在状态卡之后");
-  assert.ok(aiCardIndex > activeIndex, "「正在下载」必须在 AI 卡之前");
-
-  // 进度区基本结构。
-  assert.match(POPUP_HTML, /id="active-title">正在下载</);
-  assert.match(
-    POPUP_HTML,
-    /id="active-hint"[^>]*role="status"[^>]*aria-live="polite"/,
-    "不可用提示应是 aria-live 状态行"
-  );
-
-  // 加载顺序：纯函数模块先于 popup.js。
+  assert.ok(POPUP_HTML.includes('href="lib/tokens.css"'), "popup 必须引用共享 tokens.css");
+  assert.ok(TOKENS_CSS.includes("--popup-width: 420px"), "tokens.css 必须定义 420px popup 宽度");
+  assert.ok(POPUP_CSS.includes("var(--popup-width)"), "popup.css 必须使用 token 宽度");
   assert.ok(
     POPUP_HTML.indexOf("lib/pure.js") < POPUP_HTML.indexOf("popup.js"),
     "lib/pure.js 必须先于 popup.js 加载"
   );
+  const primaryButtons = [...POPUP_HTML.matchAll(/class="primary"/g)];
+  assert.equal(primaryButtons.length, 1, "首屏只能有一个蓝色主按钮");
+  assert.match(POPUP_HTML, /id="primary"[^>]*class="primary"/);
+  // 2026-10-22 冗余移除：页脚整块（设置/帮助/版本号）不再存在；设置只保留头部齿轮。
+  assert.ok(HTML_IDS.includes("settings"), "头部齿轮 #settings 必须保留");
+  assert.equal(HTML_IDS.some((id) => id.startsWith("foot-")), false, "popup 不应再有页脚元素");
+  assert.equal(HTML_IDS.includes("version"), false, "版本号只在 options 页展示");
+  assert.equal(POPUP_HTML.includes('class="foot"'), false, "popup 不应再有页脚容器");
+  assert.equal(POPUP_JS.includes("foot-settings"), false, "popup.js 不应残留页脚设置监听");
+  assert.equal(POPUP_JS.includes("foot-help"), false, "popup.js 不应残留页脚帮助监听");
+  assert.equal(POPUP_JS.includes('getElementById("version")'), false, "popup.js 不应残留版本节点");
+  // 术语：不再出现「AI 解析」作为按钮/文案。
+  assert.equal(POPUP_HTML.includes("AI 解析"), false);
+  assert.equal(POPUP_JS.includes("AI 解析"), false);
+  // 正常状态条默认隐藏；正常只有弱化「已就绪」。
+  assert.match(POPUP_HTML, /id="banner"[^>]*hidden/);
+  assert.match(POPUP_CSS, /--hit-target/, "点击目标尺寸应通过 token 约束");
+});
+
+test("设置入口：点击头部齿轮打开 options 页（页脚移除后唯一入口）", async () => {
+  const harness = await boot();
+  harness.click("settings");
+  await harness.settle();
+  assert.equal(harness.optionsPageOpens, 1, "头部齿轮必须调用 browser.runtime.openOptionsPage");
 });
 
 // ---------------------------------------------------------------------------
-// 2) 初始渲染：最近转交不再有进度条；「正在下载」默认隐藏
+// 2) 主按钮上下文
 // ---------------------------------------------------------------------------
 
-test("初始渲染：最近转交 3 项无进度条，「正在下载」区默认隐藏", async () => {
-  const harness = await bootHarness({ state: stateWithRecent(), status: emptyStatus() });
-  const list = harness.els["recent-list"];
-  assert.equal(list.children.length, 3, "2 条 handed + 1 条 queued 应渲染 3 项");
-  for (let index = 0; index < 3; index += 1) {
-    const item = recentItem(harness, index);
-    assert.equal(item.children.length, 3, "最近转交项只应有 top/meta/detail（无进度条）");
-    assert.equal(item.classList.contains("item-progress"), false);
-    assert.equal(
-      item.children.some((child) => (child.className || "").includes("progress")),
-      false,
-      "最近转交行不得再渲染进度条（避免与「正在下载」重复）"
-    );
-  }
-  assert.equal(harness.els["recent-list"].children[0].children[0].children[1].className, "badge handed");
-
-  const active = activeEls(harness);
-  assert.equal(active.section.hidden, true, "无 active 下载时整段隐藏");
-  assert.equal(active.head.hidden, true);
-  assert.equal(active.list.hidden, true);
-  assert.equal(active.hint.hidden, true);
-
-  // 设置同步：开关与 Cookie 复选框来自 getState.settings。
-  assert.equal(harness.els["enabled"].checked, true);
-  assert.equal(harness.els["ai-credentials"].checked, false);
-});
-
-// ---------------------------------------------------------------------------
-// 3) 轮询渲染：downloading（含线程数/速度）与 paused
-// ---------------------------------------------------------------------------
-
-test("轮询渲染：下载中 50% + 线程 4/8，paused 行「已暂停 · 线程 0/8」", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith([
-    download({
-      id: "dl_a",
+test("主按钮：文件链接 →「用 RDM 下载此文件」，点击发送 handoff", async () => {
+  const harness = await boot({
+    tabContext: tabContext({
+      url: "https://example.com/files/a.iso",
       fileName: "a.iso",
-      state: "downloading",
-      downloaded: 50,
-      total: 100,
-      speedBps: 20,
-      connections: 8,
-      activeConnections: 4,
-      targetConnections: 8,
+      sizeBytes: 2 * MiB,
     }),
-    download({
-      id: "dl_b",
-      fileName: "b.iso",
-      state: "paused",
-      downloaded: 30,
-      total: 100,
-      speedBps: 0,
-      connections: 8,
-      activeConnections: 0,
-      targetConnections: 8,
-    }),
-  ]);
-  harness.fireIntervals(STATUS_POLL_MS);
+  });
+  assert.equal(harness.els["primary-text"].textContent, "用 RDM 下载此文件");
+  assert.equal(harness.els["primary-info"].textContent, "a.iso · 2.0 MiB · example.com");
+  assert.equal(harness.els["primary"].disabled, false);
+  assert.equal(harness.els["ready-text"].textContent, "已就绪");
+  assert.equal(harness.els["banner"].hidden, true);
+
+  harness.click("primary");
   await harness.settle();
+  const handoff = harness.sentMessages.find((message) => message.type === "handoff");
+  assert.ok(handoff, "必须发送 handoff");
+  assert.deepEqual(Array.from(handoff.urls), ["https://example.com/files/a.iso"]);
+  assert.equal(handoff.fileName, "a.iso");
+  assert.equal(handoff.forceLaunch, false);
+  assert.equal(harness.els["primary-result"].textContent, "已交给 RDM");
+  assert.equal(harness.els["primary-result"].className, "primary-result ok");
+});
 
-  const active = activeEls(harness);
-  assert.equal(active.section.hidden, false);
-  assert.equal(active.head.hidden, false);
-  assert.equal(active.title.textContent, "正在下载 2");
-  assert.equal(active.summary.textContent, "总速度 20 B/s");
-  assert.equal(active.more.hidden, true);
-  assert.equal(active.hint.hidden, true);
+test("主按钮：普通页面 →「解析本页资源」，点击发送 aiParse", async () => {
+  const harness = await boot({ tabContext: tabContext() });
+  assert.equal(harness.els["primary-text"].textContent, "解析本页资源");
+  harness.click("primary");
+  await harness.settle();
+  const parse = harness.sentMessages.find((message) => message.type === "aiParse");
+  assert.ok(parse, "必须发送 aiParse");
+  assert.equal(parse.forceLaunch, false);
+  assert.match(harness.els["primary-result"].textContent, /已发送到 RDM/);
+});
 
-  const first = activeRow(harness, 0);
-  assert.equal(first.row.hidden, false);
-  assert.equal(first.row.classList.contains("state-downloading"), true);
-  assert.equal(first.name.textContent, "a.iso");
-  assert.equal(first.badge.textContent, "下载中");
-  assert.equal(first.fill.style.width, "50%");
-  assert.equal(first.bar.getAttribute("aria-valuenow"), "50");
-  assert.equal(first.bar.classList.contains("indeterminate"), false);
-  assert.equal(first.text.textContent, "50% · 50 B / 100 B · 20 B/s · 线程 4/8");
+test("主按钮：选中 1/多个链接 → 对应文案与批量 handoff", async () => {
+  const single = await boot({
+    tabContext: tabContext({ selectedUrls: ["https://cdn.example.com/a.iso"] }),
+  });
+  assert.equal(single.els["primary-text"].textContent, "用 RDM 下载选中的链接");
 
-  const second = activeRow(harness, 1);
-  assert.equal(second.row.classList.contains("state-paused"), true);
-  assert.equal(second.badge.textContent, "已暂停");
-  assert.equal(second.bar.className, "progress state-paused");
-  assert.equal(second.text.textContent, "已暂停 · 线程 0/8");
+  const multiple = await boot({
+    tabContext: tabContext({
+      selectedUrls: ["https://cdn.example.com/a.iso", "https://cdn.example.com/b.zip"],
+    }),
+  });
+  assert.equal(multiple.els["primary-text"].textContent, "下载选中的 2 个链接");
+  multiple.click("primary");
+  await multiple.settle();
+  const handoff = multiple.sentMessages.find((message) => message.type === "handoff");
+  assert.deepEqual(Array.from(handoff.urls), [
+    "https://cdn.example.com/a.iso",
+    "https://cdn.example.com/b.zip",
+  ]);
+});
 
-  // 最近转交不受影响（仍 3 项、无进度条）。
-  assert.equal(harness.els["recent-list"].children.length, 3);
+test("主按钮：宿主未安装 →「安装浏览器接管」，点击复制 Firefox 安装命令", async () => {
+  const harness = await boot({
+    state: baseState({ status: { host: "missing", gui: false } }),
+    tabContext: tabContext({ url: "https://example.com/a.iso" }),
+  });
+  assert.equal(harness.els["primary-text"].textContent, "安装浏览器接管");
+  assert.equal(harness.els["banner"].hidden, false);
+  assert.equal(harness.els["banner"].className, "banner danger");
+  assert.match(harness.els["banner-text"].textContent, /浏览器接管尚未安装/);
+  assert.equal(harness.els["banner-action"].textContent, "复制安装命令");
+  harness.click("primary");
+  await harness.settle();
+  assert.equal(harness.clipboard.length, 1);
+  assert.match(harness.clipboard[0], /install-firefox-host\.ps1/);
+  assert.equal(harness.els["primary-result"].textContent, "已复制安装命令");
+});
+
+test("主按钮：接管关闭 →「开启下载接管」，点击保存开关", async () => {
+  const harness = await boot({
+    state: baseState({ settings: { enabled: false } }),
+    tabContext: tabContext({ url: "https://example.com/a.iso" }),
+  });
+  assert.equal(harness.els["primary-text"].textContent, "开启下载接管");
+  assert.equal(harness.els["banner"].className, "banner info");
+  harness.click("primary");
+  await harness.settle();
+  const saved = harness.sentMessages.find(
+    (message) => message.type === "setSettings" && message.settings.enabled === true
+  );
+  assert.ok(saved, "点击后应保存 enabled=true");
+  assert.equal(harness.els["enabled"].checked, true);
+});
+
+test("主按钮：GUI 未运行 + 自动启动关闭 →「启动 RDM 并...」并 forceLaunch", async () => {
+  const harness = await boot({
+    state: baseState({
+      settings: { autoStartGui: false },
+      status: { host: "ok", gui: false },
+    }),
+    tabContext: tabContext({ url: "https://example.com/download/a.iso" }),
+  });
+  assert.equal(harness.els["primary-text"].textContent, "启动 RDM 并下载此文件");
+  assert.equal(harness.els["banner"].className, "banner warn");
+  assert.match(harness.els["banner-text"].textContent, /RDM 未运行/);
+  harness.click("primary");
+  await harness.settle();
+  const handoff = harness.sentMessages.find((message) => message.type === "handoff");
+  assert.equal(handoff.forceLaunch, true);
+});
+
+test("主按钮：GUI 未运行 + 自动启动开启 → 保持上下文动作，状态条给「启动 RDM」", async () => {
+  const harness = await boot({
+    state: baseState({ status: { host: "ok", gui: false } }),
+    tabContext: tabContext(),
+  });
+  assert.equal(harness.els["primary-text"].textContent, "解析本页资源");
+  assert.equal(harness.els["banner-action"].textContent, "启动 RDM");
+  harness.click("banner-action");
+  await harness.settle();
+  const parse = harness.sentMessages.find((message) => message.type === "aiParse");
+  assert.ok(parse);
+  assert.equal(parse.forceLaunch, true, "状态条「启动 RDM」应显式请求启动 GUI");
+});
+
+test("主按钮：非 http 页面禁用且提示不支持", async () => {
+  const harness = await boot({
+    tabContext: tabContext({ url: "about:addons", isHttp: false }),
+  });
+  assert.equal(harness.els["primary-text"].textContent, "当前页面不支持");
+  assert.equal(harness.els["primary"].disabled, true);
 });
 
 // ---------------------------------------------------------------------------
-// 4) total=null：不确定态
+// 3) 连接异常 / 状态条
 // ---------------------------------------------------------------------------
 
-test("total=null：进度条 indeterminate、无 aria-valuenow、文案不含百分比", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith([
-    download({
-      id: "dl_a",
-      state: "downloading",
-      downloaded: 30 * MiB,
-      total: null,
-      speedBps: 10 * MiB,
-      activeConnections: 2,
-      targetConnections: 8,
-    }),
-  ]);
-  harness.fireIntervals(STATUS_POLL_MS);
+test("状态条：宿主连接异常 → danger + 重新检测（点击会重试连接）", async () => {
+  let calls = 0;
+  const harness = await boot({
+    state: baseState({ status: { host: "error", gui: false } }),
+    testConnection: () => {
+      calls += 1;
+      // 首次（popup 打开时的自动检测）仍失败；点击「重新检测」后恢复。
+      if (calls === 1) {
+        return Promise.resolve(baseState({ status: { host: "error", gui: false } }));
+      }
+      return Promise.resolve(baseState({ status: { host: "ok", gui: true } }));
+    },
+  });
+  assert.equal(harness.els["banner"].className, "banner danger");
+  assert.equal(harness.els["banner-action"].textContent, "重新检测");
+  harness.activity = emptyActivity({ guiRunning: true, recent: [] });
+  const before = calls;
+  harness.click("banner-action");
   await harness.settle();
+  assert.ok(calls > before, "重新检测必须重新调用 testConnection");
+  assert.equal(harness.els["banner"].hidden, true, "恢复后状态条消失");
+  assert.equal(harness.els["ready-text"].textContent, "已就绪");
+});
 
-  const row = activeRow(harness, 0);
-  assert.equal(row.bar.classList.contains("indeterminate"), true);
-  assert.equal(row.bar.hasAttribute("aria-valuenow"), false);
-  assert.equal(row.fill.style.width, "");
-  assert.equal(row.text.textContent, "已下载 30 MiB · 10 MiB/s · 线程 2/8");
-  assert.equal(row.text.textContent.includes("%"), false, "未知总量不显示百分比");
+test("Chrome 构建显示实验性标签", async () => {
+  const harness = await boot({ state: baseState({ browser: "chrome" }) });
+  assert.equal(harness.els["chrome-badge"].hidden, false);
 });
 
 // ---------------------------------------------------------------------------
-// 5) 无 active → 整段隐藏
+// 4) 正在下载
 // ---------------------------------------------------------------------------
 
-test("无 active 下载时整段隐藏（即使之前有进度）", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith([
-    download({ id: "dl_a", state: "downloading", downloaded: 10, total: 100 }),
-  ]);
-  harness.fireIntervals(STATUS_POLL_MS);
-  await harness.settle();
-  assert.equal(activeEls(harness).section.hidden, false);
+test("正在下载：最多 3 条 + 头部总数/总速度 + 溢出提示", async () => {
+  const harness = await boot({ activity: emptyActivity() });
+  assert.equal(harness.els["active-section"].hidden, true, "无任务时整段隐藏");
 
-  harness.status = statusWith([
-    download({ id: "dl_a", state: "completed", downloaded: 100, total: 100 }),
-  ]);
-  harness.fireIntervals(STATUS_POLL_MS);
+  harness.activity = emptyActivity({
+    active: 5,
+    globalSpeedBps: 10 * MiB,
+    downloads: [
+      download({ id: "1", fileName: "a.iso", state: "downloading", downloaded: 50, total: 100, speedBps: MiB }),
+      download({ id: "2", fileName: "b.mp4", state: "paused", downloaded: 15, total: 100 }),
+      download({ id: "3", fileName: "c.zip", state: "downloading", downloaded: 62, total: 100 }),
+      download({ id: "4", fileName: "d.bin", state: "downloading", downloaded: 10, total: 100 }),
+      download({ id: "5", fileName: "e.bin", state: "downloading", downloaded: 10, total: 100 }),
+    ],
+  });
+  harness.fireIntervals(POLL_MS);
   await harness.settle();
-  const active = activeEls(harness);
-  assert.equal(active.section.hidden, true, "完成的下载不计入「正在下载」");
-  assert.equal(active.list.hidden, true);
-  assert.equal(active.hint.hidden, true);
+
+  assert.equal(harness.els["active-section"].hidden, false);
+  assert.equal(harness.els["active-title"].textContent, "正在下载 5");
+  assert.match(harness.els["active-speed"].textContent, /总速度 10 MiB\/s/);
+  const rows = activeRows(harness);
+  assert.equal(rows.length, 3, "最多渲染 3 行");
+  assert.equal(rows[0].hidden, false);
+  assert.equal(rows[0].className, "active-item state-downloading");
+  assert.equal(rows[1].className, "active-item state-paused");
+  assert.equal(rows[2].children[0].children[1].textContent, "下载中");
+  assert.equal(rows[0].children[1].children[0].style.width, "50%");
+  assert.match(rows[0].children[2].textContent, /50%/);
+  assert.match(rows[0].children[2].textContent, /1\.0 MiB\/s/);
+  assert.equal(harness.els["active-more"].hidden, false);
+  assert.equal(harness.els["active-more"].textContent, "还有 2 个 · 打开 RDM");
+
+  // 回落到 1 条：多余行隐藏、溢出消失。
+  harness.activity = emptyActivity({
+    downloads: [download({ id: "1", fileName: "a.iso", downloaded: 80, total: 100 })],
+  });
+  harness.fireIntervals(POLL_MS);
+  await harness.settle();
+  assert.equal(harness.els["active-title"].textContent, "正在下载 1");
+  assert.equal(harness.els["active-more"].hidden, true);
+  assert.equal(activeRows(harness)[1].hidden, true);
+  assert.equal(activeRows(harness)[2].hidden, true);
 });
 
-// ---------------------------------------------------------------------------
-// 6) 旧宿主（host_outdated）可操作提示
-// ---------------------------------------------------------------------------
-
-test("host_outdated：显示「请重新运行 install-firefox-host.ps1 并重启浏览器」", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = {
+test("正在下载：进度读取失败显示可操作提示（版本过旧）", async () => {
+  const harness = await boot();
+  harness.activity = {
     ok: false,
     guiRunning: false,
-    downloads: [],
     active: 0,
     globalSpeedBps: 0,
-    error: "invalid_request：unknown message type",
+    downloads: [],
     code: "host_outdated",
+    error: "invalid_request",
   };
-  harness.fireIntervals(STATUS_POLL_MS);
+  harness.fireIntervals(POLL_MS);
   await harness.settle();
-
-  const active = activeEls(harness);
-  assert.equal(active.section.hidden, false, "失败时应在同一位置显示提示");
-  assert.equal(active.head.hidden, true);
-  assert.equal(active.list.hidden, true);
-  assert.equal(active.hint.hidden, false);
-  assert.match(active.hint.textContent, /版本过旧/);
-  assert.match(active.hint.textContent, /scripts\/install-firefox-host\.ps1/);
-  assert.match(active.hint.textContent, /重启浏览器/);
-  assert.equal(active.hint.dataset.code, "host_outdated");
+  assert.equal(harness.els["active-section"].hidden, false);
+  assert.equal(harness.els["active-list"].hidden, true);
+  assert.match(harness.els["active-hint"].textContent, /版本过旧/);
+  assert.equal(harness.els["active-hint"].dataset.code, "host_outdated");
 });
 
 // ---------------------------------------------------------------------------
-// 7) timeout / host_unavailable 提示
+// 5) 最近活动 + 清空撤销
 // ---------------------------------------------------------------------------
 
-test("timeout / host_unavailable：显示「原生宿主无响应，请重启浏览器后重试」", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  for (const code of ["timeout", "host_unavailable"]) {
-    harness.status = {
-      ok: false,
-      guiRunning: false,
-      downloads: [],
-      active: 0,
-      globalSpeedBps: 0,
-      error: code,
-      code,
-    };
-    harness.fireIntervals(STATUS_POLL_MS);
-    await harness.settle();
-    const active = activeEls(harness);
-    assert.equal(active.section.hidden, false, code + " 应显示提示");
-    assert.equal(active.hint.hidden, false);
-    assert.match(active.hint.textContent, /原生宿主无响应/);
-    assert.match(active.hint.textContent, /重启浏览器后重试/);
-    assert.equal(active.hint.dataset.code, code);
-  }
-});
+function stateWithRecent() {
+  const now = Date.now();
+  return baseState({
+    recent: [
+      recentEntry({ at: now - 60000, fileName: "1.iso", status: "handed" }),
+      recentEntry({ at: now - 50000, fileName: "2.iso", status: "queued" }),
+      recentEntry({ at: now - 40000, fileName: "3.iso", status: "ai" }),
+      recentEntry({ at: now - 30000, fileName: "4.iso", status: "duplicate" }),
+      recentEntry({ at: now - 20000, fileName: "5.iso", status: "fallback" }),
+      recentEntry({ at: now - 10000, fileName: "6.iso", status: "error" }),
+      recentEntry({ at: now - 5000, fileName: "7.iso", status: "handed" }),
+    ],
+  });
+}
 
-// ---------------------------------------------------------------------------
-// 8) GUI 未运行提示（ok 响应但 guiRunning=false）
-// ---------------------------------------------------------------------------
-
-test("guiRunning=false：显示「RDM GUI 未运行：下载会先排队」提示", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = {
-    ok: true,
-    guiRunning: false,
-    active: 0,
-    globalSpeedBps: 0,
-    downloads: [],
-  };
-  harness.fireIntervals(STATUS_POLL_MS);
-  await harness.settle();
-
-  const active = activeEls(harness);
-  assert.equal(active.section.hidden, false);
-  assert.equal(active.head.hidden, true);
-  assert.equal(active.hint.hidden, false);
-  assert.match(active.hint.textContent, /RDM GUI 未运行/);
-  assert.match(active.hint.textContent, /启动后这里显示进度/);
-  assert.equal(active.hint.dataset.code, "gui");
-});
-
-// ---------------------------------------------------------------------------
-// 9) 溢出：最多 3 条 + 「还有 N 个…」
-// ---------------------------------------------------------------------------
-
-test("超过 3 条 active：只渲染 3 行并显示「还有 2 个…」", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith(
-    [1, 2, 3, 4, 5].map((index) =>
-      download({
-        id: "dl_" + index,
-        fileName: index + ".iso",
-        state: index % 2 === 0 ? "paused" : "downloading",
-        downloaded: 10,
-        total: 100,
-      })
-    )
+test("最近活动：最多 5 条、状态词符合契约、空态提示", async () => {
+  const harness = await boot({ state: stateWithRecent() });
+  const names = recentNames(harness);
+  assert.deepEqual(names, ["7.iso", "6.iso", "5.iso", "4.iso", "3.iso"]);
+  const statuses = harness.els["recent-list"].children.map(
+    (row) => row.children[2].textContent
   );
-  harness.fireIntervals(STATUS_POLL_MS);
-  await harness.settle();
+  assert.deepEqual(statuses, ["已转交", "失败", "失败", "已在 RDM 中", "已解析"]);
+  assert.equal(harness.els["recent-empty"].hidden, true);
 
-  const active = activeEls(harness);
-  assert.equal(active.title.textContent, "正在下载 5");
-  assert.equal(active.list.children.length, 3, "最多展示 3 行");
-  assert.equal(active.list.children[0].hidden, false);
-  assert.equal(active.more.hidden, false);
-  assert.equal(active.more.textContent, "还有 2 个…");
+  const empty = await boot({ state: baseState({ recent: [] }) });
+  assert.equal(empty.els["recent-empty"].hidden, false);
+  assert.equal(empty.els["recent-list"].children.length, 0);
+  assert.equal(empty.els["recent-clear"].disabled, true);
+});
 
-  // 回落到 1 条：多余行隐藏、溢出提示消失（节点仍在，供增量复用）。
-  harness.status = statusWith([download({ id: "dl_1", state: "downloading" })]);
-  harness.fireIntervals(STATUS_POLL_MS);
+test("最近活动清空 → toast 撤销 → 恢复列表", async () => {
+  const harness = await boot({ state: stateWithRecent() });
+  harness.click("recent-clear");
   await harness.settle();
-  assert.equal(active.more.hidden, true);
-  assert.equal(active.more.textContent, "");
-  assert.equal(active.title.textContent, "正在下载 1");
-  assert.equal(active.list.children[1].hidden, true);
-  assert.equal(active.list.children[2].hidden, true);
+  assert.ok(
+    harness.sentMessages.some((message) => message.type === "clearRecent"),
+    "必须发送 clearRecent"
+  );
+  assert.equal(harness.els["recent-list"].children.length, 0);
+  assert.equal(harness.els["recent-empty"].hidden, false);
+  assert.equal(harness.els["undo-toast"].hidden, false);
+
+  harness.click("undo-action");
+  await harness.settle();
+  assert.ok(
+    harness.sentMessages.some((message) => message.type === "restoreRecent"),
+    "撤销必须发送 restoreRecent"
+  );
+  assert.equal(harness.els["recent-list"].children.length, 5, "撤销后恢复 5 条展示");
+  assert.equal(harness.els["undo-toast"].hidden, true);
+
+  // 5s 后 toast 自动消失（独立快照，避免被撤销逻辑干扰）。
+  const autoHide = await boot({ state: stateWithRecent() });
+  autoHide.click("recent-clear");
+  await autoHide.settle();
+  assert.equal(autoHide.els["undo-toast"].hidden, false);
+  autoHide.fireTimeouts(UNDO_TTL_MS);
+  assert.equal(autoHide.els["undo-toast"].hidden, true);
 });
 
 // ---------------------------------------------------------------------------
-// 10) 增量更新：只改 DOM，不重建「正在下载」/「最近转交」
+// 6) 开关 / 防重复 / openRdm / 清理
 // ---------------------------------------------------------------------------
 
-test("连续轮询增量更新：active 行与最近转交的节点引用都不变", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith([
-    download({ id: "dl_a", state: "downloading", downloaded: 10, total: 100 }),
-  ]);
-  harness.fireIntervals(STATUS_POLL_MS);
+test("接管开关：乐观更新失败后回滚并提示", async () => {
+  const harness = await boot({
+    state: baseState(),
+    setSettings: () => Promise.resolve({ ok: false, error: "storage unavailable" }),
+  });
+  assert.equal(harness.els["enabled"].checked, true);
+  harness.els["enabled"].checked = false;
+  harness.change("enabled");
   await harness.settle();
-
-  const activeList = harness.els["active-list"];
-  const activeNodes = Array.from(activeList.children);
-  const recentNodes = Array.from(harness.els["recent-list"].children);
-  const firstRow = activeRow(harness, 0);
-  const textBefore = firstRow.text.textContent;
-  assert.equal(firstRow.fill.style.width, "10%");
-
-  harness.status = statusWith([
-    download({ id: "dl_a", state: "downloading", downloaded: 80, total: 100 }),
-  ]);
-  harness.fireIntervals(STATUS_POLL_MS);
-  await harness.settle();
-
-  assert.equal(activeList.children.length, activeNodes.length, "轮询不应增删 active 行");
-  for (let index = 0; index < activeNodes.length; index += 1) {
-    assert.equal(activeList.children[index], activeNodes[index], "active 行节点应复用");
-  }
-  for (let index = 0; index < recentNodes.length; index += 1) {
-    assert.equal(
-      harness.els["recent-list"].children[index],
-      recentNodes[index],
-      "轮询不应重建最近转交列表"
-    );
-  }
-  assert.equal(activeRow(harness, 0).text, firstRow.text);
-  assert.notEqual(firstRow.text.textContent, textBefore);
-  assert.equal(firstRow.fill.style.width, "80%");
+  assert.equal(harness.els["enabled"].checked, true, "失败后必须回滚");
+  assert.equal(harness.els["primary-result"].textContent, "开关未保存，请重试");
+  assert.equal(harness.els["primary-result"].className, "primary-result danger");
 });
 
-// ---------------------------------------------------------------------------
-// 11) unload / pagehide 清理
-// ---------------------------------------------------------------------------
-
-test("unload/pagehide：清理 setInterval，之后迟到触发也不再发 status", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith([download({ id: "dl_a", state: "downloading" })]);
-  harness.fireIntervals(STATUS_POLL_MS);
+test("主按钮防重复：loading 期间连点只发一次请求", async () => {
+  let resolveHandoff = null;
+  const harness = await boot({
+    tabContext: tabContext({ url: "https://example.com/a.iso" }),
+    handoff: () =>
+      new Promise((resolve) => {
+        resolveHandoff = resolve;
+      }),
+  });
+  harness.click("primary");
+  assert.equal(harness.els["primary"].disabled, true, "提交中按钮必须禁用");
+  assert.equal(harness.els["primary-text"].textContent, "正在转交…");
+  harness.click("primary");
+  harness.click("primary");
+  await harness.settle(); // 让 sendMessage → handoff 处理器真正被调用
+  const handoffs = harness.sentMessages.filter((message) => message.type === "handoff");
+  assert.equal(handoffs.length, 1, "连点 3 次只能发送 1 次 handoff");
+  resolveHandoff({ ok: true, message: "已交给 RDM" });
   await harness.settle();
-  assert.equal(activeEls(harness).section.hidden, false);
+  assert.equal(harness.els["primary"].disabled, false);
+});
 
-  assert.ok(harness.intervals.size >= 2, "应有 age/status 两个轮询定时器");
-  const statusBefore = harness.statusCalls;
+test("打开 RDM：宿主不支持时给出人话提示", async () => {
+  const harness = await boot();
+  harness.els["active-section"].hidden = false;
+  harness.click("active-open");
+  await harness.settle();
+  assert.ok(harness.sentMessages.some((message) => message.type === "openRdm"));
+  assert.match(harness.els["primary-result"].textContent, /桌面端任务栏打开/);
+});
 
-  for (const fn of harness.listeners.unload || []) fn();
-  assert.equal(harness.intervals.size, 0, "unload 后不应有活动 interval");
-  assert.ok(harness.clearedTimerIds.length >= 2, "clearInterval 必须清理所有定时器");
-
-  // 模拟已清理的定时器迟到触发：closed 守卫应阻止再次发 status。
+test("unload/pagehide：清理轮询与定时器，迟到触发不再请求", async () => {
+  const harness = await boot();
+  assert.ok(harness.intervals.size >= 2, "应有活动/相对时间两个轮询");
+  const before = harness.sentMessages.filter((message) => message.type === "getActivity").length;
+  harness.lifecycle("unload");
+  assert.equal(harness.intervals.size, 0);
   harness.fireStaleIntervals();
   await harness.settle();
-  assert.equal(harness.statusCalls, statusBefore, "unload 后不得再轮询 status");
+  const after = harness.sentMessages.filter((message) => message.type === "getActivity").length;
+  assert.equal(after, before, "unload 后不得再轮询");
 
-  const pagehide = await bootHarness({ state: stateWithRecent() });
-  for (const fn of pagehide.listeners.pagehide || []) fn();
-  assert.equal(pagehide.intervals.size, 0, "pagehide 后不应有活动 interval");
-  assert.ok(pagehide.clearedTimerIds.length >= 2);
+  const pagehide = await boot();
+  pagehide.lifecycle("pagehide");
+  assert.equal(pagehide.intervals.size, 0);
 });
 
-// ---------------------------------------------------------------------------
-// 12) AI 解析按钮流程（保持紧凑卡不变）
-// ---------------------------------------------------------------------------
-
-test("AI 按钮：执行中禁用/文案，成功 ok、失败 bad，结束后恢复", async () => {
-  const harness = await bootHarness({ state: stateWithRecent() });
-  assert.equal(harness.els["ai-credentials"].checked, false);
-
-  let resolveAiParse = null;
-  harness.aiParseHandler = () =>
-    new Promise((resolve) => {
-      resolveAiParse = resolve;
-    });
-
-  harness.click("ai-parse");
-  // 等待 sendMessage 前同步设置的执行中状态。
-  assert.equal(harness.els["ai-parse"].disabled, true, "执行期间按钮应禁用");
-  assert.equal(harness.els["ai-parse"].textContent, "解析中…");
-  assert.equal(harness.els["ai-result"].className, "ai-result busy");
-
-  const sent = harness.sentMessages.filter((message) => message.type === "aiParse").pop();
-  assert.ok(sent, "点击后必须发送 aiParse");
-  assert.equal(sent.type, "aiParse");
-  assert.equal(sent.includeCredentials, false, "未勾选 Cookie 时 includeCredentials=false");
-
-  resolveAiParse({ ok: true, message: "已发送到 RDM（#12），解析结果在桌面端 AI 栏查看" });
+test("最近活动条目点击会尝试打开 RDM（不崩溃）", async () => {
+  const harness = await boot({ state: stateWithRecent() });
+  const row = harness.els["recent-list"].children[0];
+  row.dispatch("click");
   await harness.settle();
-  assert.equal(harness.els["ai-parse"].disabled, false);
-  assert.equal(harness.els["ai-parse"].textContent, "解析此页");
-  assert.equal(harness.els["ai-result"].className, "ai-result ok");
-  assert.match(harness.els["ai-result"].textContent, /已发送到 RDM/);
-
-  // 失败路径：class=bad，按钮仍恢复。
-  harness.aiParseHandler = () =>
-    Promise.resolve({ ok: false, message: "AI 解析未发送：RDM 未运行" });
-  harness.click("ai-parse");
-  await harness.settle();
-  assert.equal(harness.els["ai-result"].className, "ai-result bad");
-  assert.match(harness.els["ai-result"].textContent, /未发送/);
-  assert.equal(harness.els["ai-parse"].disabled, false);
-  assert.equal(harness.els["ai-parse"].textContent, "解析此页");
+  assert.ok(harness.sentMessages.some((message) => message.type === "openRdm"));
 });
 
-// ---------------------------------------------------------------------------
-// 13) 未知 state（契约外）→ 静默隐藏，不显示错误进度条
-// ---------------------------------------------------------------------------
-
-test("未知 state（契约外）：normalizeDownload 丢弃，进度区静默隐藏", async () => {
-  assert.equal(pure.normalizeDownload({ id: "dl_a", state: "unknown" }), null);
-
-  const harness = await bootHarness({ state: stateWithRecent() });
-  harness.status = statusWith([download({ id: "dl_a", state: "unknown" })]);
-  harness.fireIntervals(STATUS_POLL_MS);
+test("成功后立即触发一次活动刷新（getActivity）", async () => {
+  const harness = await boot({
+    tabContext: tabContext({ url: "https://example.com/a.iso" }),
+  });
+  const before = harness.sentMessages.filter((message) => message.type === "getActivity").length;
+  harness.click("primary");
   await harness.settle();
+  const after = harness.sentMessages.filter((message) => message.type === "getActivity").length;
+  assert.ok(after > before, "转交成功后应刷新活动下载");
+});
 
-  const active = activeEls(harness);
-  assert.equal(active.section.hidden, true);
-  assert.equal(active.hint.hidden, true);
-  assert.equal(active.list.children.length, 0, "不应为坏数据创建进度行");
+test("正在下载：宿主未安装时活动区不重复报错（状态条已说明）", async () => {
+  const harness = await boot({
+    state: baseState({ status: { host: "missing", gui: false } }),
+    activity: {
+      ok: false,
+      guiRunning: false,
+      active: 0,
+      globalSpeedBps: 0,
+      downloads: [],
+      code: "host_unavailable",
+      error: "native messaging host not found",
+    },
+  });
+  assert.equal(harness.els["active-section"].hidden, true);
+  assert.equal(harness.els["banner"].hidden, false);
+  assert.match(harness.els["banner-text"].textContent, /浏览器接管尚未安装/);
 });

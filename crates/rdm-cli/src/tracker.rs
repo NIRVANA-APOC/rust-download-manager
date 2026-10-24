@@ -339,6 +339,7 @@ mod tests {
             resumed_chunks: 0,
             range_supported: true,
             http_version: Some("HTTP/1.1".to_string()),
+            controller: None,
         };
         tracker.apply_completed(&summary);
         assert_eq!(tracker.record.state, TaskState::Completed);
