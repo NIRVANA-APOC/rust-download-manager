@@ -6,8 +6,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, relative, AnyElement, App, ClickEvent, Hsla, IntoElement, ParentElement, SharedString,
-    Styled, Window,
+    canvas, div, fill, point, px, relative, size, AnyElement, App, ClickEvent, Hsla, IntoElement,
+    ParentElement, SharedString, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::v_flex;
@@ -308,6 +308,124 @@ pub enum Severity {
     Success,
     Warning,
     Danger,
+}
+
+/// 速度迷你曲线（canvas 柱状，自适应画布宽度）。
+///
+/// 新版下载中枢行、旧版界面行与详情面板共用。绘制区域**严格限制**在
+/// `width × height` 内：历史采样多时同步收缩柱宽与间隙，而不是把每根柱子
+/// 都撑到至少 1px 再按 1px 间隙排布——历史 bug 里 60 个采样需要
+/// `60 * 1 + 59 * 1 = 119px`，72px 的画布会把曲线画到右侧「下载中」状态徽章上
+/// （见 2026-10-24 用户截图：曲线溢出覆盖「下载中」Pill）。
+pub fn sparkline(history: Vec<f64>, color: Hsla, width: f32, height: f32) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| paint_sparkline(&history, bounds, window, color),
+    )
+    .w(px(width))
+    .h(px(height))
+    .into_any_element()
+}
+
+/// 在 canvas 边界内绘制速度柱状曲线（右边界逐柱裁剪，容忍浮点累计误差）。
+fn paint_sparkline(
+    history: &[f64],
+    bounds: gpui::Bounds<gpui::Pixels>,
+    window: &mut Window,
+    color: Hsla,
+) {
+    if history.is_empty() {
+        return;
+    }
+    let width: f32 = bounds.size.width.into();
+    let height: f32 = bounds.size.height.into();
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let origin_x: f32 = bounds.origin.x.into();
+    let origin_y: f32 = bounds.origin.y.into();
+    let end_x = origin_x + width;
+    let max = history.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let (gap, bar_width) = sparkline_bar_layout(width, history.len());
+    for (index, value) in history.iter().enumerate() {
+        let x = origin_x + index as f32 * (bar_width + gap);
+        if x >= end_x {
+            continue;
+        }
+        let clamped_width = (end_x - x).min(bar_width);
+        if clamped_width <= 0.0 {
+            continue;
+        }
+        let bar_height = (height * (*value as f32 / max as f32)).clamp(1.0, height);
+        window.paint_quad(fill(
+            gpui::Bounds::new(
+                point(px(x), px(origin_y + height - bar_height)),
+                size(px(clamped_width), px(bar_height)),
+            ),
+            color,
+        ));
+    }
+}
+
+/// 柱状曲线布局：返回 `(间隙, 柱宽)`，并保证
+/// `count * 柱宽 + (count - 1) * 间隙 <= width`。
+///
+/// 间隙最多 1px 且最多占画布宽度的 25%，样本数越多间隙越小；柱宽由剩余
+/// 宽度均分，从而让 60 个采样也能排进 72px 的迷你曲线画布。
+pub fn sparkline_bar_layout(width: f32, count: usize) -> (f32, f32) {
+    let width = width.max(0.0);
+    if count == 0 || width <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let count_f = count as f32;
+    let gap = if count > 1 {
+        (width * 0.25 / (count_f - 1.0)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let bar_width = ((width - gap * (count_f - 1.0)) / count_f).max(0.0);
+    (gap, bar_width)
+}
+
+#[cfg(test)]
+mod sparkline_layout_tests {
+    use super::sparkline_bar_layout;
+
+    /// 回归：60 个采样（每分钟累计满历史）必须完整排进 72px 行内迷你曲线，
+    /// 不允许超出画布（历史 bug：1px 柱宽 + 1px 间隙画成 119px，溢出覆盖状态徽章）。
+    #[test]
+    fn sixty_samples_fit_the_row_sparkline_width() {
+        let (gap, bar_width) = sparkline_bar_layout(72.0, 60);
+        let painted = 60.0 * bar_width + 59.0 * gap;
+        assert!(
+            painted <= 72.0 + 0.01,
+            "60 个采样绘制宽度 {painted}px 超出 72px 画布（柱宽 {bar_width}px，间隙 {gap}px）"
+        );
+    }
+
+    /// 任意样本数/画布宽度下，布局总宽都不超过画布宽度。
+    #[test]
+    fn layout_never_exceeds_canvas_width() {
+        for width in [1.0_f32, 10.0, 48.0, 72.0, 120.0] {
+            for count in 1..=200_usize {
+                let (gap, bar_width) = sparkline_bar_layout(width, count);
+                assert!(gap >= 0.0 && bar_width >= 0.0, "负尺寸：count={count}");
+                let painted = count as f32 * bar_width + (count - 1) as f32 * gap;
+                assert!(
+                    painted <= width + 0.01,
+                    "count={count} width={width}: painted={painted}"
+                );
+            }
+        }
+    }
+
+    /// 罕见样本数下柱状图仍可绘制，不会全部塌缩为 0。
+    #[test]
+    fn single_sample_fills_the_whole_width() {
+        let (gap, bar_width) = sparkline_bar_layout(72.0, 1);
+        assert_eq!(gap, 0.0);
+        assert!((bar_width - 72.0).abs() < f32::EPSILON);
+    }
 }
 
 /// 把长文件名截断成「前 N…后 M」并保留扩展名（04 §4.2）。

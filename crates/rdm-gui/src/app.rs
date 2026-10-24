@@ -1913,36 +1913,14 @@ impl RdmApp {
             ));
         }
 
-        let history: Vec<f64> = item.speed_history.iter().copied().collect();
-        let sparkline_color = progress_color;
-        let sparkline = canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                if history.is_empty() {
-                    return;
-                }
-                let max = history.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-                let count = history.len() as f32;
-                let gap = 1.0_f32;
-                let width: f32 = bounds.size.width.into();
-                let height: f32 = bounds.size.height.into();
-                let origin_x: f32 = bounds.origin.x.into();
-                let origin_y: f32 = bounds.origin.y.into();
-                let bar_width = ((width - gap * (count - 1.0)) / count).max(1.0);
-                for (i, value) in history.iter().enumerate() {
-                    let bar_height = (height * (*value as f32 / max as f32)).max(1.0);
-                    let x = origin_x + i as f32 * (bar_width + gap);
-                    let y = origin_y + height - bar_height;
-                    window.paint_quad(fill(
-                        Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height))),
-                        sparkline_color,
-                    ));
-                }
-            },
-        )
-        .w(px(72.))
-        .h(px(18.))
-        .into_any_element();
+        // 行内速度迷你曲线：交给共享 widget，绘制区域限制在 72×18 画布内
+        // （历史 bug：60 采样按 1px 柱宽 + 1px 间隙画成 119px，溢出覆盖右侧徽章）。
+        let sparkline = crate::ui::widgets::sparkline(
+            item.speed_history.iter().copied().collect(),
+            progress_color.into(),
+            72.0,
+            18.0,
+        );
 
         div()
             .flex()

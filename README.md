@@ -3,7 +3,7 @@
 纯 Rust 实现的多连接下载器：下载引擎 + **GPUI** 桌面端 + Firefox / Chrome 下载接管扩展
 + **CLI / MCP** agent 接口 + 可验证的链接解析运行时。不套壳 aria2、不依赖 Electron。
 
-![新版 RDM 安装版 GUI 真实运行截图（Windows 11，2026-10-23，下载中枢主窗口）](assets/readme/rdm-gui-new.png)
+![新版 RDM 安装版 GUI 真实运行截图（Windows 11，2026-10-24，下载中枢主窗口；下载中任务行显示修复后的速度曲线）](assets/readme/rdm-gui-new.png)
 
 > 截图来自实际安装版 `rdm-gui.exe` 的真实运行窗口（非设计稿/旧版本截图）。
 

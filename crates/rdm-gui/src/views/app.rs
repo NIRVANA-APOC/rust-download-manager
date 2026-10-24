@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, point, px, size, AnyElement, App, Bounds, ClickEvent, Context, ElementId,
-    Entity, Focusable, Hsla, IntoElement, MouseButton, ParentElement, Render, ScrollHandle, Styled,
-    Subscription, Window,
+    div, px, size, AnyElement, App, ClickEvent, Context, ElementId, Entity, Focusable, Hsla,
+    IntoElement, MouseButton, ParentElement, Render, ScrollHandle, Styled, Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
@@ -49,8 +48,8 @@ use crate::ui::icons::RdmIcon;
 use crate::ui::theme::{self, tokens, ThemeTokens};
 use crate::ui::widgets::{
     divider, ellipsize_file_name, empty_state, icon_button, info_banner, meta_text, mono_text,
-    nav_item, progress_bar, progress_bar_colored, section_label, soft_tag, status_dot, status_pill,
-    status_text, Severity,
+    nav_item, progress_bar, progress_bar_colored, section_label, soft_tag, sparkline, status_dot,
+    status_pill, status_text, Severity,
 };
 use crate::views::actions::{
     ActivateFocused, ClearCompleted, ClearSearch, ClearSelection, CloseLayer, CloseSettings,
@@ -7077,37 +7076,11 @@ pub(crate) fn filter_and_sort(
     indexes
 }
 
-/// 速度迷你曲线（canvas 柱状，最近 60 个采样；与旧版行内曲线同一实现思路）。
+/// 速度迷你曲线（canvas 柱状，最近 60 个采样；绘制限制在 72×height 画布内，
+/// 采样满历史时不会溢出覆盖右侧状态徽章，详见 [`sparkline`]）。
 fn render_sparkline(item: &DownloadItem, color: Hsla, height: f32) -> AnyElement {
     let history: Vec<f64> = item.speed_history.iter().copied().collect();
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            if history.is_empty() {
-                return;
-            }
-            let max = history.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-            let count = history.len() as f32;
-            let gap = 1.0_f32;
-            let width: f32 = bounds.size.width.into();
-            let h: f32 = bounds.size.height.into();
-            let origin_x: f32 = bounds.origin.x.into();
-            let origin_y: f32 = bounds.origin.y.into();
-            let bar_width = ((width - gap * (count - 1.0)) / count).max(1.0);
-            for (i, value) in history.iter().enumerate() {
-                let bar_height = (h * (*value as f32 / max as f32)).max(1.0);
-                let x = origin_x + i as f32 * (bar_width + gap);
-                let y = origin_y + h - bar_height;
-                window.paint_quad(fill(
-                    Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height))),
-                    color,
-                ));
-            }
-        },
-    )
-    .w(px(72.0))
-    .h(px(height))
-    .into_any_element()
+    sparkline(history, color, 72.0, height)
 }
 
 /// 相对时间（任务创建时间 → 「x 分钟前」）；避免引入 chrono 依赖。
