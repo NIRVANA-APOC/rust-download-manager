@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     安装 RDM Chrome 原生消息宿主（当前用户，无需管理员权限）。
@@ -6,12 +6,16 @@
 .DESCRIPTION
     1. 定位（或使用 -Build 构建）rdm-native.exe，复制到
        %LOCALAPPDATA%\RDM\rdm-native.exe（有 rdm-gui.exe 时一并复制，便于自动启动）；
-    2. 生成/更新 %LOCALAPPDATA%\RDM\com.rdm.download.json：
+    2. 生成/更新独立的 Chrome/Edge 宿主 manifest
+       %LOCALAPPDATA%\RDM\com.rdm.download.chrome.json：
        allowed_origins 使用 chrome-extension://<id>/；
-       若该文件同时被 Firefox 使用，会保留已有的 allowed_extensions（反之亦然），
-       因此 Firefox 与 Chrome 可以共用同一个宿主 manifest；
+       **不再与 Firefox 共用** manifest 文件：Firefox 的 native manifest schema
+       不允许未知字段，混写 allowed_origins 会让 Firefox connectNative 报
+       "No such native application"（Firefox 158.0.1 实测）。
+       Firefox 使用独立的 com.rdm.download.json（见 install-firefox-host.ps1）；
     3. 注册 HKCU\Software\Google\Chrome\NativeMessagingHosts\com.rdm.download
-       默认值为 manifest 绝对路径。
+       与 HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.rdm.download
+       默认值为 Chrome/Edge manifest 的绝对路径。
 
     Chrome 扩展 ID 的获取：
       * 未打包加载（dist\rdm-chrome）时，ID 由扩展目录路径派生；在
@@ -69,8 +73,9 @@ $HostName = "com.rdm.download"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $InstallDir = Join-Path $env:LOCALAPPDATA "RDM"
 $InstalledExe = Join-Path $InstallDir "rdm-native.exe"
-$ManifestPath = Join-Path $InstallDir "$HostName.json"
+$ManifestPath = Join-Path $InstallDir "$HostName.chrome.json"
 $RegistryKey = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
+$EdgeRegistryKey = "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$HostName"
 $ChromeExtensionManifest = Join-Path $RepoRoot "extension\chrome\manifest.json"
 
 function Write-Step($Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
@@ -272,58 +277,51 @@ try {
         }
     }
 
-    # 与 Firefox 共用同一个宿主 manifest 文件：尽量同时保留 allowed_origins
-    # 与 allowed_extensions，避免后装的浏览器覆盖先装的配置。
+    # Chrome/Edge 使用独立 manifest：Firefox 的 native manifest schema 不允许
+    # 未知字段，不允许把 allowed_origins 混进 Firefox 的 manifest（会让 Firefox
+    # connectNative 报 "No such native application"）。Firefox 的 manifest 由
+    # install-firefox-host.ps1 维护（com.rdm.download.json），本脚本不触碰它。
     $origins = New-Object System.Collections.Generic.List[string]
     $origins.Add("chrome-extension://$resolvedExtensionId/")
-    $extensions = New-Object System.Collections.Generic.List[string]
     if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
         try {
             $existing = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
             foreach ($origin in @($existing.allowed_origins | Where-Object { $_ })) {
                 if (-not $origins.Contains([string]$origin)) { $origins.Add([string]$origin) }
             }
-            foreach ($extension in @($existing.allowed_extensions | Where-Object { $_ })) {
-                if (-not $extensions.Contains([string]$extension)) { $extensions.Add([string]$extension) }
-            }
         } catch {
-            Write-Warn2 "已有宿主 manifest 无法解析，将重新写入：$($_.Exception.Message)"
+            Write-Warn2 "已有 Chrome/Edge 宿主 manifest 无法解析，将重新写入：$($_.Exception.Message)"
         }
     }
     $manifest = [ordered]@{
         name            = $HostName
-        description     = "RDM native messaging host"
+        description     = "RDM native messaging host (Chrome/Edge)"
         path            = $InstalledExe
         type            = "stdio"
         allowed_origins = @($origins)
     }
-    if ($extensions.Count -gt 0) {
-        $manifest.allowed_extensions = @($extensions)
-        Write-Ok "保留 Firefox allowed_extensions：$($extensions -join ', ')"
-    }
     if ($DryRun) {
-        Write-Ok "DryRun：将写入宿主 manifest：$ManifestPath"
+        Write-Ok "DryRun：将写入 Chrome/Edge 宿主 manifest：$ManifestPath"
         Write-Ok "DryRun：allowed_origins = $($origins -join ', ')"
-        if ($extensions.Count -gt 0) {
-            Write-Ok "DryRun：保留 allowed_extensions = $($extensions -join ', ')"
-        }
-        Write-Ok "DryRun：将注册 $RegistryKey"
+        Write-Ok "DryRun：将注册 $RegistryKey 与 $EdgeRegistryKey"
     } else {
         $manifestJson = $manifest | ConvertTo-Json -Depth 5
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($ManifestPath, $manifestJson, $utf8NoBom)
-        Write-Ok "已写入宿主 manifest：$ManifestPath"
+        Write-Ok "已写入 Chrome/Edge 宿主 manifest：$ManifestPath"
 
-        if (-not (Test-Path -LiteralPath $RegistryKey)) {
-            New-Item -Path $RegistryKey -Force | Out-Null
+        foreach ($key in @($RegistryKey, $EdgeRegistryKey)) {
+            if (-not (Test-Path -LiteralPath $key)) {
+                New-Item -Path $key -Force | Out-Null
+            }
+            Set-Item -Path $key -Value $ManifestPath
+            $registered = (Get-Item -LiteralPath $key).GetValue("")
+            if ($registered -ne $ManifestPath) {
+                throw "注册表写入校验失败：$key 期望 $ManifestPath，实际 $registered"
+            }
+            Write-Ok "已注册：$key"
+            Write-Ok "          默认值 = $registered"
         }
-        Set-Item -Path $RegistryKey -Value $ManifestPath
-        $registered = (Get-Item -LiteralPath $RegistryKey).GetValue("")
-        if ($registered -ne $ManifestPath) {
-            throw "注册表写入校验失败：期望 $ManifestPath，实际 $registered"
-        }
-        Write-Ok "已注册：$RegistryKey"
-        Write-Ok "          默认值 = $registered"
 
         Write-Step "冒烟检查原生宿主"
         $versionOutput = & $InstalledExe --version 2>&1
@@ -359,8 +357,9 @@ try {
 
 卸载（手动）：
   Remove-Item -LiteralPath "$RegistryKey" -Recurse -Force
+  Remove-Item -LiteralPath "$EdgeRegistryKey" -Recurse -Force
   Remove-Item -LiteralPath "$ManifestPath" -Force
-  # 同时使用 Firefox 宿主时请勿删除 rdm-native.exe / allowed_extensions
+  # 同时使用 Firefox 宿主时请勿删除 rdm-native.exe 或 com.rdm.download.json
 "@
 } catch {
     Write-Host ""

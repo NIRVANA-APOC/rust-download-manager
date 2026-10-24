@@ -215,23 +215,50 @@ try {
         }
     }
 
-    # 写原生宿主 manifest（路径必须是绝对路径；ConvertTo-Json 负责反斜杠转义）。
+    # 写 Firefox 原生宿主 manifest（路径必须是绝对路径；ConvertTo-Json 负责反斜杠转义）。
+    #
+    # 重要：Firefox 用扩展 schema 校验 native manifest，**不允许未知字段**
+    # （Firefox 158.0.1 实测：manifest 里出现 Chrome 的 `allowed_origins` 会让 Firefox
+    # 报 "Unexpected property ... allowed_origins"，connectNative 表现为
+    # "No such native application"）。因此 Firefox 与 Chrome/Edge 必须使用两个独立
+    # manifest 文件：Firefox 只用 allowed_extensions（本文件），Chrome/Edge 用
+    # allowed_origins（com.rdm.download.chrome.json，见 install-chrome-host.ps1）。
     $manifest = [ordered]@{
         name               = $HostName
-        description        = "RDM native messaging host"
+        description        = "RDM native messaging host (Firefox)"
         path               = $InstalledExe
         type               = "stdio"
         allowed_extensions = @($ExtensionId)
     }
-    # Firefox 与 Chrome 共用同一个宿主 manifest 文件：保留 Chrome 安装脚本写入的
-    # allowed_origins，避免重装 Firefox 宿主后 Chrome 扩展失去权限。
+    # 迁移旧版共用 manifest：若历史文件里带 allowed_origins（v0.18.0 安装器写入），
+    # 先把它迁到独立的 Chrome/Edge manifest，避免 Firefox 继续解析失败。
+    $chromeManifestPath = Join-Path $InstallDir "$HostName.chrome.json"
     if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
         try {
             $existing = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $origins = @($existing.allowed_origins | Where-Object { $_ })
             if ($origins.Count -gt 0) {
-                $manifest.allowed_origins = $origins
-                Write-Ok "保留 Chrome allowed_origins：$($origins -join ', ')"
+                $chromeManifest = [ordered]@{
+                    name            = $HostName
+                    description     = "RDM native messaging host (Chrome/Edge)"
+                    path            = $InstalledExe
+                    type            = "stdio"
+                    allowed_origins = $origins
+                }
+                $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                [System.IO.File]::WriteAllText($chromeManifestPath, ($chromeManifest | ConvertTo-Json -Depth 5), $utf8NoBom)
+                Write-Ok "已将旧 manifest 的 Chrome allowed_origins 迁移到：$chromeManifestPath"
+                foreach ($chromeKey in @(
+                    "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName",
+                    "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$HostName"
+                )) {
+                    if (-not (Test-Path -LiteralPath $chromeKey)) { New-Item -Path $chromeKey -Force | Out-Null }
+                    Set-Item -Path $chromeKey -Value $chromeManifestPath
+                }
+                Write-Ok "已把 Chrome/Edge 注册表改指向独立 manifest"
+                $backupPath = "$ManifestPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+                Copy-Item -LiteralPath $ManifestPath -Destination $backupPath -Force
+                Write-Ok "旧 manifest 已备份：$backupPath"
             }
         } catch {
             Write-Warn2 "已有宿主 manifest 无法解析，将重新写入：$($_.Exception.Message)"
@@ -240,7 +267,7 @@ try {
     $manifestJson = $manifest | ConvertTo-Json -Depth 5
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($ManifestPath, $manifestJson, $utf8NoBom)
-    Write-Ok "已写入宿主 manifest：$ManifestPath"
+    Write-Ok "已写入 Firefox 宿主 manifest：$ManifestPath"
 
     # 注册表：Firefox 只读取 manifest 的绝对路径。
     if (-not (Test-Path -LiteralPath $RegistryKey)) {
